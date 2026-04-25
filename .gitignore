@@ -3,6 +3,15 @@ dist/
 params/
 debug/
 *.bak
+
+# Qwen3-Next validation harness artifacts
+reference_outputs*.pt
+*.parity.log
+stage*.log
+bench_*.log
+gguf_download.log
+mlc_q4_convert.log
+.envrc.local
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
