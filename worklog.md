@@ -1,6 +1,6 @@
 # Qwen3-Next Worklog
 
-Running, date-stamped log for the Qwen3.5-0.8B → Qwen3.6-35B-A3B effort. Newest entries on top. Technical reference lives in [qwen3_next.md](./qwen3_next.md); execution plan in [.claude/plans/ok-we-re-going-to-squishy-harbor.md](.claude/plans/ok-we-re-going-to-squishy-harbor.md). **Phase 2 (perf) plan: TBD — drafted next session.**
+Running, date-stamped log for the Qwen3.5-0.8B → Qwen3.6-35B-A3B effort. Newest entries on top. Technical reference lives in [qwen3_next.md](./qwen3_next.md); correctness-phase plan in [.claude/plans/ok-we-re-going-to-squishy-harbor.md](.claude/plans/ok-we-re-going-to-squishy-harbor.md); **perf-phase plan in [.claude/plans/phase2-perf.md](.claude/plans/phase2-perf.md).**
 
 Format: one entry per work session. Keep it terse — what was done, what was learned, what's next.
 
@@ -8,7 +8,9 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ## 🔖 SESSION HANDOFF — pick up here next time
 
-**Where we are:** Correctness phase complete (Stages 0–6 shipped 2026-04-25). **Phase 2 is now perf optimization** — first benchmark vs llama.cpp Q4_K_S on the same 35B-A3B model showed **MLC q4f16_1 is 2.43× SLOWER at decode (85.5 vs 207.7 tps)** on Blackwell sm_120. Prefill measurement was inconclusive (`_generate()` yields before GPU prefill completes — re-instrument with engine.metrics() or non-streaming completions.create() before trusting any prefill number). Decode is the load-bearing metric for chat UX, and MLC is currently nowhere near competitive there.
+**Where we are:** Correctness phase complete (Stages 0–6 shipped 2026-04-25). **Phase 2 = perf optimization. Plan locked in [.claude/plans/phase2-perf.md](.claude/plans/phase2-perf.md).** First benchmark vs llama.cpp Q4_K_S on the same 35B-A3B model showed **MLC q4f16_1 is 2.43× SLOWER at decode (85.5 vs 207.7 tps)** on Blackwell sm_120. Prefill measurement was inconclusive (`_generate()` yields before GPU prefill completes — re-instrument with engine.metrics() or non-streaming completions.create() before trusting any prefill number). Decode is the load-bearing metric for chat UX, and MLC is currently nowhere near competitive there. Goal: ≥311 tps on 35B (≥50% over llama.cpp).
+
+**Phase 2 workflow:** dev loop on **Qwen3.5-0.8B q4f16_1** (~2× faster compile/bench cycle, fits on 5090 leaving Blackwell free), 35B as the **acceptance gate** (every fix re-benched there before being declared a win). MoE-specific items (expert dispatch, routing) require 35B directly. **Setup needed before Tier 1 starts:** compile MLC q4f16_1 of 0.8B + download `unsloth/Qwen3.5-0.8B-GGUF` Q4_K_S + bench both. ~15 min total. See [phase2-perf.md §Setup](.claude/plans/phase2-perf.md).
 
 **Suspected decode bottlenecks, ranked by likely impact:**
 1. **No fused dequant+matmul for q4f16_1.** llama.cpp's `mul_mat_q` reads Q4 weights once and dequant-multiplies in a single pass; MLC's q4f16_1 dequantizes to fp16 first then matmuls, doubling memory bandwidth on a memory-bound MoE decode. **Likely the dominant 2× factor.**
