@@ -8,6 +8,28 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ## 🔖 SESSION HANDOFF — pick up here next time
 
+### TL;DR for next session (2026-04-25 EOD)
+- **Q4 correctness FIXED** (commit `b56756ac`). `q4f16_g16e` is the working build for Qwen3.5/Next.
+- **At correct output, MLC now beats llama.cpp Q4_K_S by 1.073–1.084×** on Orin AGX MAXN.
+- **All cheap perf knobs swept** (commit `37e00dab`). Cudagraph, cutlass+ft flags, smaller context, embedding-quant — biggest move was confirming embed-quant is the right default (saves 14% via lm_head bandwidth).
+- **Bandwidth utilization is 24% of LPDDR5 peak** — ~4× theoretical headroom remains, locked behind kernel work.
+- **Next session starts with kernel surgery.** Top-EV item is the **GDN TIR kernel rewrite** ([qwen35_model.py::create_gated_delta_net_func](python/mlc_llm/model/qwen35/qwen35_model.py#L219)) — currently 12.5% block occupancy on 18/24 layers. Approach decision needed first: split-K vs multi-thread-per-column vs warp-cooperative state load. See "Phase 2 path forward" section below for ranked next items.
+- **Reproduce the working build:**
+  ```bash
+  source .envrc.local
+  SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
+  python -m mlc_llm convert_weight $SNAP --quantization q4f16_g16e -o dist/qwen3_5-0.8B-q4f16_g16e
+  python -m mlc_llm gen_config   $SNAP --quantization q4f16_g16e --conv-template qwen3_5 -o dist/qwen3_5-0.8B-q4f16_g16e
+  python -m mlc_llm compile dist/qwen3_5-0.8B-q4f16_g16e --device cuda \
+    --opt "flashinfer=0;cudagraph=1;cutlass=1;faster_transformer=1" \
+    -o dist/qwen3_5-0.8B-q4f16_g16e/lib.so
+  python bench_mlc.py --model-dir dist/qwen3_5-0.8B-q4f16_g16e --device cuda:0 --pp 128 --tg 512 --runs 3
+  # Expect tg_tps ≈ 115. Baseline to beat for any kernel-tuning change.
+  ```
+- **Before any compile**: `sudo nvpmodel -m 0 && sudo jetson_clocks` (MAXN, locked clocks). Numbers from a thermal-throttled run are worse than no numbers.
+
+---
+
 **Where we are:** Phase 2 perf on **Orin AGX** (sm_87, 64 GB LPDDR5, ~204 GB/s). The 2026-04-25 evening session **fixed the Q4 correctness bug**. Root cause: the default MLC `q4f16_1` config uses `group_size=32`, which is too coarse for this hybrid GDN architecture — the recurrent state in the linear-attention layers compounds the per-weight quantization noise across 24 layers, garbling factual recall while leaving grammar intact. **Lowering `group_size` to 16 restores correct output** at minimal storage / perf cost. New configs registered: `q4f16_g16e` (linears + embed at int4 g=16) is the working Q4 build for Qwen3.5/Next. Apples-to-apples (both producing correct text):
 
 | Stack | Quant | Decode tg128 (tps) | tg512 (tps) | Output coherent? |
