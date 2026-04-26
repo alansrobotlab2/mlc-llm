@@ -6,14 +6,46 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-25 — Phase 2C T1 landed: vectorized rnn_state copy kernels (+18.6% TG=128)
+
+**Done**
+- Profiled q4f16_g16e decode with `nsys` (now installed via apt as `nsight-systems-2024.5.4`). Per-fwd kernel time = 7.95 ms. Captured to [profile_qwen35_decode.nsys-rep](profile_qwen35_decode.nsys-rep), [profile_kern_sum.csv](profile_kern_sum.csv). Harness at [profile_decode.py](profile_decode.py).
+- **Profile invalidated the prior handoff's premise.** `gdn_func_kernel` is **only 4.3%** of kernel time, not the bottleneck. The handoff misread "12.5% block occupancy" as "biggest opportunity" — but at 0.34 ms/fwd, even a 4× rewrite saves 3% wall-clock. **68% of decode is dequant+matmul kernels running at 30–40% of LPDDR5 peak.**
+- Real top-bin breakdown per fwd: MLP dequant+matmul 25.3%, lm_head 21.6%, GDN dequant+matmul 18.0%, **GDN state I/O (rnn_state_get/set) 14.6%**, gdn_func 4.3%, attn 5.6%, norms 3.5%, other 7.1%. See [profile_kern_sum.csv](profile_kern_sum.csv).
+- **Landed T1: vectorized `rnn_state_get/set` PrimFuncs** ([python/mlc_llm/nn/rnn_state.py](python/mlc_llm/nn/rnn_state.py)). The default `dlight.gpu.Fallback` was splitting these copies into 256 blocks × 1024 threads × 1 fp32-per-thread (4 bytes/thread) → ncu confirmed 19% of LPDDR5 peak BW, only 1 block/SM resident. Replaced with `s_tir.Schedule` that fuses outer loops, splits inner by vec_width (4 fp32 / 8 fp16 = 16 bytes/thread), binds (block × 256 threads), `T.vectorize` on inner. Falls back unchanged if the innermost extent isn't a multiple of vec_width — safe for RWKV5/6 reuse.
+- **`rnn_state_get_0` (GDN recurrent state, 1 MB/call): 34.5 μs → 10.9 μs = 3.16×.** `rnn_state_set_0` 17.0 → 7.8 μs = 2.18×. Conv state get/set similar magnitude. Combined state I/O dropped from 14.6% → 5.7% of kernel time.
+- **Headline tps wins:** TG=128: **109.51 → 129.89 (+18.6%) = 1.273× llama.cpp Q4_K_S.** TG=512: 115.13 → 124.45 (+8.1%) = 1.172× llama.cpp. (Larger gain at smaller TG because the state-copy fraction is invariant per token but the relative overhead is bigger.) Bench artifacts: [bench_q4g16e_summary.txt](bench_q4g16e_summary.txt). 5-prompt smoke matches q0f16 baseline.
+- Investigated then rejected **q4f16_ft at g=16** (the originally-suggested T1). CUTLASS `FineGrainedScaleZeroIterator` hard-bakes `group_size / 64` into row-offset arithmetic ([fine_grained_scale_zero_iterator.h:159](3rdparty/tvm/3rdparty/cutlass_fpA_intB_gemm/cutlass_extensions/include/cutlass_extensions/transform/threadblock/fine_grained_scale_zero_iterator.h#L159)). Patching the assert at `ft_quantization.py:68` doesn't help — would need iterator surgery (1–2 days). Re-evaluate as Tier-3 after structural wins.
+
+**Plan for next moves** ([.claude/plans/phase2c-perf-after-profile.md](.claude/plans/phase2c-perf-after-profile.md))
+- T2: lm_head TIR rewrite (currently 1.69 ms at 37% peak BW — biggest single kernel; needs ncu deep-dive on tile shape first).
+- T3: MLP dequant+matmul rewrite (combined 24.6% at 32% peak BW — largest aggregate).
+- T4: engine glue audit (~1 ms/token in StreamSync wait at [gpu_sampler.cc:691](cpp/serve/sampler/gpu_sampler.cc#L691) and unidentified gaps).
+- T5: speculative decoding — the actual lever for the 2.5× target. Kernel work alone caps at ~1.85× per the ladder analysis.
+
+---
+
 ## 🔖 SESSION HANDOFF — pick up here next time
 
-### TL;DR for next session (2026-04-25 EOD)
-- **Q4 correctness FIXED** (commit `b56756ac`). `q4f16_g16e` is the working build for Qwen3.5/Next.
-- **At correct output, MLC now beats llama.cpp Q4_K_S by 1.073–1.084×** on Orin AGX MAXN.
-- **All cheap perf knobs swept** (commit `37e00dab`). Cudagraph, cutlass+ft flags, smaller context, embedding-quant — biggest move was confirming embed-quant is the right default (saves 14% via lm_head bandwidth).
-- **Bandwidth utilization is 24% of LPDDR5 peak** — ~4× theoretical headroom remains, locked behind kernel work.
-- **Next session starts with kernel surgery.** Top-EV item is the **GDN TIR kernel rewrite** ([qwen35_model.py::create_gated_delta_net_func](python/mlc_llm/model/qwen35/qwen35_model.py#L219)) — currently 12.5% block occupancy on 18/24 layers. Approach decision needed first: split-K vs multi-thread-per-column vs warp-cooperative state load. See "Phase 2 path forward" section below for ranked next items.
+### TL;DR for next session (2026-04-25 EOD #2)
+- **Q4 correctness FIXED** (commit `b56756ac`); `q4f16_g16e` is the working build.
+- **MLC now beats llama.cpp Q4_K_S by 1.273× at TG=128** (1.172× at TG=512) after vectorizing `rnn_state` copy kernels. Up from 1.073× / 1.084× pre-this-session.
+- **Real bottleneck breakdown** (from [profile_kern_sum.csv](profile_kern_sum.csv)): MLP dequant+matmul 25%, lm_head 22%, GDN dequant+matmul 18%, state I/O 6% (after fix), gdn_func 5%, attn+norms+other ~24%. Most kernels at 30–45% LPDDR5 peak BW.
+- **Next session starts with T2: lm_head TIR rewrite.** Currently 1.69 ms × 126 calls = 23% of all kernel time, running at 37% of LPDDR5 peak BW (1024×248320 matmul, unusual aspect ratio). Profile next: `sudo -E env PATH=$PATH PYTHONPATH=$PYTHONPATH MLC_LIBRARY_PATH=$MLC_LIBRARY_PATH TVM_LIBRARY_PATH=$TVM_LIBRARY_PATH /usr/local/cuda/bin/ncu --kernel-name 'fused_dequantize_NT_matmul7_kernel' --launch-skip 100 --launch-count 3 --section MemoryWorkloadAnalysis --section LaunchStats --section Occupancy .venv/bin/python profile_decode.py`.
+- **Realistic ladder** (cumulative): T2 lm_head → ~145 tps. T3 MLP → ~165 tps. T4 engine glue → ~185 tps. T5 spec decode → 250+ tps. **The 2.5× target requires T5.** See [.claude/plans/phase2c-perf-after-profile.md](.claude/plans/phase2c-perf-after-profile.md).
+- **Reproduce current best:**
+  ```bash
+  source .envrc.local
+  SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
+  # weights already converted; just recompile if rnn_state.py or any model code changes:
+  python -m mlc_llm compile dist/qwen3_5-0.8B-q4f16_g16e --device cuda \
+    --opt "flashinfer=0;cudagraph=1;cutlass=1;faster_transformer=1" \
+    -o dist/qwen3_5-0.8B-q4f16_g16e/lib.so
+  python bench_mlc.py --model-dir dist/qwen3_5-0.8B-q4f16_g16e --device cuda:0 --pp 128 --tg 128 --runs 3
+  # Expect tg_tps ≈ 130 (TG=128) / 124 (TG=512).
+  ```
+- **Before any compile**: `sudo nvpmodel -m 0 && sudo jetson_clocks` (MAXN, locked clocks).
+- **Profiling tools installed this session**: `nsys` via `apt install nsight-systems-2024.5.4`. `ncu` was already there. To run ncu under sudo, must propagate the venv env vars manually.
 - **Reproduce the working build:**
   ```bash
   source .envrc.local

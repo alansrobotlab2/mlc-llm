@@ -1,0 +1,17 @@
+=== MLC q4f16_g16e + vectorized rnn_state — TG=128 ===
+tg_tps: 129.89 +/- 0.03
+
+=== MLC q4f16_g16e + vectorized rnn_state — TG=512 ===
+tg_tps: 124.45 +/- 0.02
+
+=== llama.cpp Q4_K_S baseline ===
+TG=128: 102.03 (Orin AGX MAXN, locked clocks)
+TG=512: 106.18
+
+Speedup vs llama.cpp Q4_K_S:
+  TG=128: 129.89/102.03 = 1.273x (+27.3%)
+  TG=512: 124.45/106.18 = 1.172x (+17.2%)
+
+Delta vs prior baseline (commit 37e00dab, q4f16_g16e default schedule):
+  TG=128: 109.51 -> 129.89 = +18.6%
+  TG=512: 115.13 -> 124.45 = +8.1%

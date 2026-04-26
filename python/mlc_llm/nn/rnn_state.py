@@ -3,10 +3,50 @@
 from collections.abc import Sequence
 from typing import Union
 
+import tvm
 from tvm import relax as rx
-from tvm import tirx
+from tvm import s_tir, tirx
 from tvm.relax.frontend.nn import Object, Tensor
 from tvm.script import tirx as T
+
+
+def _schedule_state_copy(prim_func: tirx.PrimFunc, dtype: str) -> tirx.PrimFunc:
+    """Bind state-copy PrimFunc loops to (block, thread) with a vectorized inner.
+
+    The default dlight Fallback splits with 1024 threads/block doing 1 elt each,
+    capping memory throughput around 19% of LPDDR5 peak on Orin AGX (ncu confirmed).
+    This schedule pushes per-thread work to 16 bytes (LDG.128/STG.128) and shrinks
+    block size to 256, which gets multiple in-flight blocks per SM and saturates
+    the wide-load path.
+
+    Falls back to a non-vectorized binding if the innermost extent isn't a
+    multiple of the vector width — guards safely against odd state shapes.
+    """
+    bits = tvm.DataType(dtype).bits
+    if bits not in (16, 32):
+        # exotic dtype — leave to dlight Fallback
+        return prim_func
+    vec_width = 16 // (bits // 8)  # 16 bytes / per-elem bytes  → 4 (fp32), 8 (fp16)
+
+    sch = s_tir.Schedule(prim_func)
+    block = sch.get_sblock("copy")
+    loops = sch.get_loops(block)
+    if len(loops) < 2:
+        return prim_func  # not enough loops to vectorize against
+    inner = loops[-1]
+    inner_extent = sch.get(inner).extent
+    # Need a static, divisible inner extent — fall back if not.
+    if not isinstance(inner_extent, tvm.tirx.IntImm) or int(inner_extent) % vec_width != 0:
+        return prim_func
+
+    inner_outer, inner_vec = sch.split(inner, factors=[None, vec_width])
+    fused = sch.fuse(*loops[:-1], inner_outer)
+    bx, tx = sch.split(fused, factors=[None, 256])
+    sch.bind(bx, "blockIdx.x")
+    sch.bind(tx, "threadIdx.x")
+    sch.vectorize(inner_vec)
+    new_func = sch.mod["main"]
+    return new_func.with_attr("tirx.is_scheduled", 1)
 
 
 class RNNState(Object):
@@ -234,7 +274,8 @@ class RNNState(Object):
 
             return f
 
-        return _func_one_dim() if len(shape) == 1 else _func_high_dim()
+        f = _func_one_dim() if len(shape) == 1 else _func_high_dim()
+        return _schedule_state_copy(f, dtype)
 
     @staticmethod
     def create_set_func(
@@ -334,4 +375,5 @@ class RNNState(Object):
 
             return f
 
-        return _func_one_dim() if len(shape) == 1 else _func_high_dim()
+        f = _func_one_dim() if len(shape) == 1 else _func_high_dim()
+        return _schedule_state_copy(f, dtype)
