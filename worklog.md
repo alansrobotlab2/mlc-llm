@@ -10,15 +10,19 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 **Where we are:** Phase 2 perf on **Orin AGX** (sm_87, 64 GB LPDDR5, ~204 GB/s). The 2026-04-25 evening session **fixed the Q4 correctness bug**. Root cause: the default MLC `q4f16_1` config uses `group_size=32`, which is too coarse for this hybrid GDN architecture — the recurrent state in the linear-attention layers compounds the per-weight quantization noise across 24 layers, garbling factual recall while leaving grammar intact. **Lowering `group_size` to 16 restores correct output** at minimal storage / perf cost. New configs registered: `q4f16_g16e` (linears + embed at int4 g=16) is the working Q4 build for Qwen3.5/Next. Apples-to-apples (both producing correct text):
 
-| Stack | Quant | Decode tg128 (tps) | Output coherent? |
-|---|---|---|---|
-| llama.cpp | Q4_K_S | **102.03 ± 0.42** | ✅ Paris, fluent |
-| MLC | q0f16 (fp16) | **74.19** (σ ≈ 0.05) | ✅ Paris, fluent |
-| MLC | **q4f16_g16e** (NEW; g=16) | **109.51** (σ ≈ 0.20) | ✅ "Paris, and the capital of Germany is Berlin" |
-| MLC | q4f16_1 (g=32) | 110.55 | ❌ "United States/UK" nonsense |
-| MLC | q4f16_2 (g=32, no embed) | (didn't bench) | ❌ same nonsense |
-| MLC | q4f16_0 (KN layout) | (didn't bench) | ❌ all `#` repeats |
-| MLC | q4f16_ft | 118.56 | ❌ fluent but factually wrong ("capital of the world") |
+| Stack | Quant | Decode tg128 (tps) | tg512 (tps) | Output coherent? |
+|---|---|---|---|---|
+| llama.cpp | Q4_K_S | **102.03 ± 0.42** | 106.18 ± 0.09 | ✅ Paris, fluent |
+| MLC | q0f16 (fp16) | **74.19** (σ ≈ 0.05) | — | ✅ Paris, fluent |
+| MLC | **q4f16_g16e** (NEW; g=16, embed-quant) | **109.51** (σ ≈ 0.20) | **115.13** (σ ≈ 0.02) | ✅ "Paris, and the capital of Germany is Berlin" |
+| MLC | q4f16_g16 (g=16, embed fp16) | — | 101.03 | ✅ |
+| MLC | q4f16_1 (g=32) | 110.55 | — | ❌ "United States/UK" nonsense |
+| MLC | q4f16_2 (g=32, no embed) | (didn't bench) | — | ❌ same nonsense |
+| MLC | q4f16_0 (KN layout) | (didn't bench) | — | ❌ all `#` repeats |
+| MLC | q4f16_ft | 118.56 | — | ❌ fluent but factually wrong ("capital of the world") |
+| MLC | q4f16_ft_g64 (NEW; FT + g=64) | (didn't bench) | — | ❌ "100 / 101 / C" — g≥32 still too coarse |
+
+**vs llama.cpp Q4_K_S: MLC q4f16_g16e is 1.073× at tg128, 1.084× at tg512 — both at correct output.**
 
 **Real state vs llama.cpp at correct output**: MLC q4f16_g16e at 109.5 vs llama.cpp Q4_K_S at 102.0 → **MLC is now 1.073× faster** at the correct-output bar. (Old: q0f16 74 vs llama.cpp 102 = llama.cpp 1.37× faster.) Storage: q4f16_g16e is 449 MB params (4.31 bits/param) vs Q4_K_S 485 MB GGUF — about the same. The user's longer-term target of ~1.5× over llama.cpp still requires the Phase 2 wins (CUDA graphs, FlashInfer, GDN tuning) on top of this correctness fix.
 
@@ -90,14 +94,19 @@ for mdir in ['dist/qwen3_5-0.8B-q0f16', 'dist/qwen3_5-0.8B-q4f16_1', 'dist/qwen3
 Note: `MLCEngine(...)` *without* explicit `model_lib=` segfaults on the q4 builds (auto-discovery picks up something stale). Always pass `model_lib=f'{mdir}/lib.so'` explicitly. Also: with `flashinfer-python` installed, fresh compiles must pass `--opt "flashinfer=0;cudagraph=1"` or the runtime crashes at `CreateKVCache` (apache-tvm-ffi 0.1.10 ABI mismatch with our locally-built TVM 0.24.dev0).
 
 **Phase 2 path forward (re-prioritized post-fix):**
-1. ✅ **Q4 correctness fixed.** Path was option (a): smaller group_size (g=16 vs default g=32). Bisect ruled out per-layer-family causes. New configs `q4f16_g16` and `q4f16_g16e` registered in [quantization.py](python/mlc_llm/quantization/quantization.py).
-2. **Bench done at this fix:** q4f16_g16e tg=109.51 vs llama.cpp 102.03 (1.073× faster). Storage 449 MB vs 485 MB GGUF — same ballpark.
-3. **Next perf wins (Tier 2 of [phase2-perf.md](.claude/plans/phase2-perf.md)):**
-   - FlashInfer runtime crash fix (apache-tvm-ffi 0.1.10 ABI mismatch). Currently building with `flashinfer=0`; sm_87 is in upstream prebuilts, so this is free perf if the FFI mismatch is resolved.
-   - Try q4f16_ft path with g=16-equivalent CUTLASS preprocessor settings (FT was +7% on broken model — confirm it's not a separate codegen bug now that the underlying quant is correct).
-   - GDN TIR tune (sm_87) — kernel was correctness-first, never tuned.
-   - CUDA graph audit — may already be covered by `cudagraph=1`; verify with nsys.
-4. **Try `q4f16_g16e` on the 35B-A3B MoE model** to confirm the same fix carries over (separate codebase: `qwen3_5_moe`). Build + smoke-test on Blackwell box.
+1. ✅ **Q4 correctness fixed** (commit `b56756ac`). Path was option (a): smaller group_size (g=16 vs default g=32). Bisect ruled out per-layer-family causes. New configs `q4f16_g16` and `q4f16_g16e` registered in [quantization.py](python/mlc_llm/quantization/quantization.py).
+2. ✅ **Quick perf knobs swept (no big wins left here):**
+   - cudagraph contributes +10% (cg=0 → 99 tps; cg=1 → 109 tps). Already on.
+   - cutlass=1 + faster_transformer=1: +0.85%. Negligible for this model.
+   - context window 256k → 8k: no decode tps change.
+   - **Embedding quant HELPS perf** (q4f16_g16e=115 vs q4f16_g16=101 tps at TG=512 — lm_head matmul is bandwidth-bound on fp16 embed, dequant fusion makes int4-embed faster).
+   - FT path at g=64 (`q4f16_ft_g64`): broken output. Anything ≥32 too coarse for GDN.
+3. **Bandwidth headroom:** at 449 MB × 109 tps = 49 GB/s vs Orin's 204 GB/s peak, we're at **24% of theoretical**. ~4× headroom remaining, but it's locked behind kernel work — none of the simple compile flags or config knobs will get it.
+4. **Top remaining wins, ranked:**
+   - **GDN TIR tune** ([qwen35_model.py::create_gated_delta_net_func](python/mlc_llm/model/qwen35/qwen35_model.py#L219)) — current grid is (batch=1, num_value_heads=16) blocks × 128 threads = 16 blocks. With Orin's 16 SMs × 8 blocks/SM capacity, we're at **12.5% block occupancy** on 18/24 layers. Multi-thread-per-column or split-K rewrite could give 2–3× on GDN, possibly +30–50% on overall decode. **Highest-EV next step.**
+   - **FlashInfer FFI fix** — apache-tvm-ffi 0.1.10 ABI mismatch crashes at CreateKVCache. Both local TVM and pip wheel report 0.1.10 but compiled .cuda.o disagrees with locally-built TVM runtime. Fix path: rebuild flashinfer kernels against our local TVM headers, or switch local TVM to the pip-shipped tvm-ffi build. Free ≥10% on the 6/24 attention layers if we can get flashinfer=1 to load.
+   - **FTQuantize → support g=16/g=32** — patch the CUTLASS preprocessor / `assert self.group_size in [None, 64, 128]` to allow g=16. FT path was 118 tps on broken model (vs 109 g16e); if we can make FT work at g=16, that's +8% from fused dequant+matmul kernel quality alone.
+5. **Try `q4f16_g16e` on the 35B-A3B MoE model** to confirm the same fix carries over (separate codebase: `qwen3_5_moe`). Build + smoke-test on the Blackwell box (won't fit on Orin).
 
 
 **The Blackwell numbers** below (2.43× slower, 85.5 vs 207.7) were on a different machine (`/home/alansrobotlab/...`, sm_120) with the **35B-A3B** model. The 35B model is **out of scope on Orin** (won't fit alongside OS+activations in the 64 GB pool). That older session's diagnostic — that q4f16_1 has no fused dequant+matmul kernel — still likely applies here, but Orin's 8× lower memory bandwidth changes the relative ranking of fixes (graph capture and launch overhead matter more on Ampere). Run `nsys profile` on a decode step against `dist/qwen3_5-0.8B-q4f16_1/lib.so` to confirm before picking the first Tier-2 item.

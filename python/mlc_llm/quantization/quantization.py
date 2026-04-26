@@ -170,6 +170,18 @@ QUANTIZATION: Dict[str, Quantization] = {  # noqa: UP006
         storage_dtype="int8",
         model_dtype="float16",
     ),
+    # FT (CUTLASS fused dequant+matmul) at group_size=64 — finest groups CUTLASS supports.
+    # Fallback for tiny / non-/64-aligned Linears uses GroupQuantize at g=32 (hardcoded
+    # in FTQuantize.fallback_group_quantize). For Qwen3.5/Next those tiny Linears
+    # (in_proj_a/b, out=16) hit the fallback but the bisect showed they're not load-bearing.
+    "q4f16_ft_g64": FTQuantize(
+        name="q4f16_ft_g64",
+        kind="ft-quant",
+        quantize_dtype="int4",
+        storage_dtype="int8",
+        model_dtype="float16",
+        group_size=64,
+    ),
     "e5m2_e5m2_f16": PerTensorQuantize(
         name="e5m2_e5m2_f16",
         kind="per-tensor-quant",
