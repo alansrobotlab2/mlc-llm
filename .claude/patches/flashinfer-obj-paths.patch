@@ -1,0 +1,29 @@
+diff --git a/python/tvm/relax/backend/cuda/flashinfer.py b/python/tvm/relax/backend/cuda/flashinfer.py
+index a6e1fd9..f6e4f58 100644
+--- a/python/tvm/relax/backend/cuda/flashinfer.py
++++ b/python/tvm/relax/backend/cuda/flashinfer.py
+@@ -49,9 +49,22 @@ def _rename_exported_func_names(source_paths: list[Path], prefix: str):
+ 
+ 
+ def _load_flashinfer_modules(object_files: list[Path]) -> list[tvm.runtime.Module]:
++    # Workaround for flashinfer >=0.6.x: get_object_paths() returns short names
++    # like "<dir>/batch_prefill_paged_kernel_mask_0.cuda.o" but ninja actually
++    # produces "<dir>/<dir.name>_batch_prefill_paged_kernel_mask_0.cuda.o".
++    resolved = []
++    for obj_path in object_files:
++        if obj_path.exists():
++            resolved.append(obj_path)
++            continue
++        prefixed = obj_path.parent / f"{obj_path.parent.name}_{obj_path.name}"
++        if prefixed.exists():
++            resolved.append(prefixed)
++            continue
++        raise FileNotFoundError(f"FlashInfer object missing: {obj_path} (also tried {prefixed})")
+     return [
+-        tvm.runtime.load_static_library(str(obj_path.absolute()), func_names=[])
+-        for obj_path in object_files
++        tvm.runtime.load_static_library(str(p.absolute()), func_names=[])
++        for p in resolved
+     ]
+ 
+ 

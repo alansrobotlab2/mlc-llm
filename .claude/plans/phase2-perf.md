@@ -1,156 +1,130 @@
-# Plan: Phase 2 — Decode Perf for Qwen3.6-35B-A3B on MLC-LLM
+# Plan: Phase 2 — Decode Perf for Qwen3.5-0.8B on Orin AGX
 
 ## Context
 
-Correctness phase (Stages 0–6 in [worklog.md](../../worklog.md)) shipped 2026-04-25. Both the dense Qwen3.5-0.8B path and the MoE Qwen3.6-35B-A3B path produce token-level parity with HF transformers fp16 reference (50/50 on 0.8B; 4/5 prompts at 50/50 + 1/5 at 33/50 with a single fp16-noise-floor flip on 35B).
+Correctness phase (Stages 0–6 in [worklog.md](../../worklog.md)) shipped 2026-04-25 on a separate Blackwell sm_120 dev box. The actual deployment target is **Orin AGX** (sm_87 Ampere, 64 GB LPDDR5 unified memory at ~204 GB/s). The Phase 2 plan now targets that hardware.
 
-The opening Phase-2 benchmark — MLC q4f16_1 vs `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_S` through llama.cpp on Blackwell sm_120, single-batch — produced this:
+The dense Qwen3.5-0.8B path passes 50/50 greedy parity with HF fp16; the MoE Qwen3.6-35B-A3B path passes 4/5 prompts at 50/50 + 1/5 at 33/50 (single fp16-noise-floor flip). Both correctness baselines were established on the prior box; the same MLC source tree is reused here.
 
-| Stack | Decode tg128 (tps) | Prefill pp512 (tps) |
+**Why a fresh plan:** the Blackwell plan compared against `unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_S` on a 1.7 TB/s discrete GPU. Neither the model nor the perf reasoning transfers. Orin AGX has ~8× less memory bandwidth, ~4× less FLOPs, and can't usefully fit the 35B model alongside the OS + activations.
+
+## Hardware reality
+
+| | Orin AGX (this box) | Blackwell sm_120 (prior plan) |
 |---|---|---|
-| llama.cpp (Q4_K_S, fp16 act) | **207.72 ± 1.84** | 7322.27 ± 95.81 |
-| MLC (q4f16_1) | 85.45 (median) | 40,819 (**measurement broken**) |
+| Compute capability | sm_87 (Ampere) | sm_120 (Blackwell) |
+| Memory | 64 GB **unified** LPDDR5, ~204 GB/s peak | 32 GB GDDR7, ~1700 GB/s |
+| Tensor cores | 64, fp16/bf16/int8 (no fp8/fp4) | 5th-gen, fp4/fp8 native |
+| Power envelope | 15W / 30W / 50W / MAXN (~60W) | unconstrained |
+| FlashInfer cache | sm_87 in upstream prebuilts | sm_120 was missing |
+| 35B-A3B as target? | **No** — won't fit usefully | yes, was the gate |
 
-**llama.cpp wins decode 2.43×** at the metric that drives chat UX. The MLC prefill number is unreliable — `engine._generate()` yields the first delta before GPU prefill is actually finished, so the 40k tps figure reflects asynchrony in the streaming path, not throughput. Re-instrument before trusting any prefill comparison.
-
-This plan exists to close the decode gap and beat llama.cpp by ≥50%.
+**Implication:** decode on Orin is even more memory-bandwidth-bound than on Blackwell. Fused dequant work matters *more*, but the absolute target tps will be much lower. CUDA-graph capture and per-step launch overhead matter *more* (Ampere's per-launch cost is a larger share of a smaller per-step budget).
 
 ## Goal
 
-**Single load-bearing target:** decode `tg128` tokens/sec for 35B-A3B, q4-class, single batch, Blackwell sm_120, no concurrency.
+**Single load-bearing target:** decode `tg128` tps for **Qwen3.5-0.8B q4f16_1**, single batch, sm_87, MAXN power, fan locked. Acceptance gate: same model in **llama.cpp + Q4_K_S GGUF**, same conditions.
 
-- **Current:** 85.5 tps
-- **Bar to beat (parity):** 207.7 tps (llama.cpp Q4_K_S)
-- **Goal (≥50% over llama.cpp):** **≥311 tps**, i.e. **3.6× the current MLC number**
+- **Bar to beat (parity):** llama.cpp Q4_K_S decode tps on Orin AGX (TBD — measure in Phase 2A).
+- **Goal:** beat llama.cpp decode by **≥30%**. (Smaller margin than the Blackwell ask: the headroom on Orin is real but the BW ceiling is hard.)
 
-A 3.6× improvement is large but not implausible — the decode path is memory-bound and the suspected dominant bottleneck (no fused dequant+matmul) directly doubles HBM traffic per weight. Closing that one item alone could halve the gap.
+35B-A3B is **out of scope on Orin**. If we later want a larger acceptance gate, the candidate is a 4–7B dense model (Qwen3-4B or Qwen3.5-3B) — pick after 0.8B work plateaus.
 
-## Workflow: 0.8B dev loop, 35B acceptance gate
+## Phase 2A — Setup + baseline (gating)
 
-The previous phase used 35B as the primary target. Phase 2 inverts that:
+Nothing in Phase 2B starts until A is green and bench numbers are committed.
 
-- **Dev loop = Qwen3.5-0.8B q4f16_1.** Each compile is ~30 sec, each bench cycle is ~1–2 min, fits on the 5090 (cuda:1) with Blackwell free for parallel work. ~2× faster iteration than 35B.
-- **Acceptance gate = Qwen3.6-35B-A3B q4f16_1.** Every Tier-1/2 fix that passes the 0.8B loop must be re-benched on 35B before being declared a win. The 0.8B numbers are directional, not load-bearing.
+### A.1 — Lock the box for repeatable benches
+```bash
+sudo nvpmodel -m 0          # MAXN
+sudo jetson_clocks          # pin max GPU/CPU/EMC clocks
+# fan: manual + max via /sys/devices/pwm-fan/* or jtop
+```
+Record these in every bench log header. Numbers from a thermal-throttled run are worse than no numbers.
 
-**Why 0.8B is valid for most items**: fused q4 dequant+matmul, FlashInfer sm_120 cache, CUDA-graph capture, and GDN TIR kernel tuning all hit the same code paths in both models. **Why 35B is still mandatory**: MoE-specific paths (`MixtralExperts` dispatch, routing softmax-topk, expert dispatch overhead) only fire on 35B and can't be measured on 0.8B at all.
+### A.2 — Toolchain
+- **mlc_llm**: no aarch64+sm_87 wheel on PyPI. Either build from source against `3rdparty/tvm`, or use the MLC nightly aarch64 index if it exists. Confirm `nvcc -arch=sm_87` + cuDNN paths.
+- **llama.cpp**: built at `../llama.cpp/build/bin/llama-bench`, configured `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=87`, `GGML_CUDA_FA=ON`. **Note `GGML_CUDA_FA_ALL_QUANTS=OFF`** — verify whether enabling it changes Q4_K_S decode before benching.
+- **Python venv** with torch (already 2.8 + CUDA 12.6 system-wide), transformers (4.51.3), huggingface_hub (0.36.2), and the local `python/` source on `PYTHONPATH`.
 
-**Cardinal risk**: 0.8B's per-step kernel-launch overhead is over-represented (less GPU work per step, same launch count), so a CUDA-graph-capture win measured there will look bigger than it is on 35B. Halve any 0.8B graph-capture gain in your head before getting excited.
+### A.3 — Get models
+- `Qwen/Qwen3.5-0.8B` (HF safetensors, ~1.6 GB fp16) → `~/.cache/huggingface/`
+- `unsloth/Qwen3.5-0.8B-GGUF`, file `Q4_K_S` (~500 MB) → `dist/gguf/`
 
-## Setup (one-time, ~15 min)
+### A.4 — Compile MLC q4f16_1
+```
+SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/<rev>/
+python -m mlc_llm convert_weight "$SNAP" --quantization q4f16_1 -o dist/qwen3_5-0.8B-q4f16_1
+python -m mlc_llm gen_config   "$SNAP" --quantization q4f16_1 --conv-template qwen3_5 -o dist/qwen3_5-0.8B-q4f16_1
+python -m mlc_llm compile dist/qwen3_5-0.8B-q4f16_1 --device cuda -o dist/qwen3_5-0.8B-q4f16_1/lib.so
+```
+Capture compile-time warnings around fused-quant codegen on sm_87, don't ignore.
 
-Before Tier-1 work begins, the dev loop needs its own llama.cpp baseline:
+### A.5 — Fix `bench_mlc.py`'s prefill measurement
+Same bug as the Blackwell plan: `engine._generate()` yields the first delta before GPU prefill completes, so prefill tps is fake. Replace with non-streaming `chat.completions.create(...)` + `usage.prefill_tokens_per_sec` if MLC populates it; otherwise instrument with `cudaEventRecord` around prefill / first-decode-step. **Acceptance:** reported `prefill_tps` × token_count yields a wall-clock that's longer than one decode step.
 
-1. **Compile MLC q4f16_1 build of 0.8B:**
-   ```
-   SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/<rev>/
-   .venv/bin/python -m mlc_llm convert_weight "$SNAP" --quantization q4f16_1 -o dist/qwen3_5-0.8B-q4f16_1
-   .venv/bin/python -m mlc_llm gen_config   "$SNAP" --quantization q4f16_1 --conv-template qwen3_5 -o dist/qwen3_5-0.8B-q4f16_1
-   .venv/bin/python -m mlc_llm compile dist/qwen3_5-0.8B-q4f16_1 --device cuda -o dist/qwen3_5-0.8B-q4f16_1/lib.so
-   ```
-2. **Download `unsloth/Qwen3.5-0.8B-GGUF` Q4_K_S** (~500 MB) → `dist/gguf/`.
-3. **Bench both stacks at matched conditions** — same `pp` and `tg` values used for the 35B run (pp=512, tg=128, runs=5). Save logs as `bench_llamacpp_0.8B.log` and `bench_mlc_q4_0.8B.log`. These are the regression baseline for every subsequent fix.
+### A.6 — Baseline bench (5 runs each, 60s warmup, MAXN+jetson_clocks)
+- llama.cpp: `llama-bench -m Qwen3.5-0.8B-Q4_K_S.gguf -p 512 -n 128 -r 5`
+- MLC: `bench_mlc.py` against `dist/qwen3_5-0.8B-q4f16_1/`, same `pp=512, tg=128, runs=5`
+- Capture for both: decode tps (median + stdev), prefill tps, peak resident memory (`tegrastats`), peak GPU power.
 
-## Phase 2A — Measurement (Tier 1, gating)
+Save logs as `bench_llamacpp_0.8B_orin.log`, `bench_mlc_q4_0.8B_orin.log`. **These are the regression baseline for every fix that follows.**
 
-**Nothing in Tier 2 is allowed to start until Tier 1 lands.** Optimizing without a clean profile is guessing.
+## Phase 2B — Profile-driven Tier-1 (ranked, profile supersedes)
 
-### A.1 — Fix the bench harness's prefill measurement
+Run `nsys profile --gpu-metrics-devices all` against one decode step. Bin time into:
 
-The current `bench_mlc.py` derives prefill tps from `time-to-first-delta` from `engine._generate()`. This races GPU completion. Replace with one of:
+1. Dense MLP `gate_up_proj` / `down_proj` GEMM (and the dequant cost feeding it)
+2. Full-attention QKV + paged-KV access (FlashInfer or TIR fallback — verify which on sm_87)
+3. GatedDeltaNet TIR kernel (18/24 layers in 0.8B)
+4. Per-step launch overhead
 
-- **Option (a):** non-streaming `engine.completions.create(...)` returns a `usage` object; check whether MLC populates `usage.prefill_tokens_per_sec` / `usage.decode_tokens_per_sec` or equivalent.
-- **Option (b):** read `engine.metrics()` (if exposed) before and after the request to derive timings from cumulative counters.
-- **Option (c):** instrument inside the engine — wrap a single `prefill` + `decode` call in `cudaEventRecord` and read elapsed-time directly. Most effort, most accurate.
+Whichever ranks #1 gets fixed first. Below is the *suspected* order; the profile reorders it.
 
-Pick (a) first; if the protocol doesn't expose timings, fall back to (b), then (c). Acceptance: harness reports a `prefill_tps` whose 1/value is greater than a single decode step time. A prefill that "completes" faster than one decode step means measurement is still wrong.
+### B.1 — Fused dequant + matmul for q4f16_1 (suspected #1)
+llama.cpp's `mul_mat_q` reads Q4_K once and fuses dequant into the matmul tile; MLC's q4f16_1 dequantizes to fp16 then matmuls, doubling LPDDR5 traffic. On a 204 GB/s ceiling, that's the dominant cost.
 
-### A.2 — Profile a decode step on 0.8B
+Two paths:
+- **B.1a — Try `q4f16_ft` (or AWQ, GPTQ) if MLC carries fused kernels for it on sm_87.** Verify by reading `python/mlc_llm/quantization/` and checking the codegen path. Re-bench before writing any kernel.
+- **B.1b — Fused TIR kernel for q4f16_1.** Tile-load Q4 into shared mem, dequant in-register, matmul in one pass. Targets `gate_up_proj` and `down_proj` first (largest weights, hottest path).
 
-Run `nsys profile` (or `ncu` for kernel-level detail) on a single decode step against `dist/qwen3_5-0.8B-q4f16_1/`. Goal: produce a flame graph or rank-ordered kernel time breakdown so we know which slice of the decode step is the fattest pipe.
+Re-run greedy parity (≥48/50) after any quant-scheme switch — a tps win that breaks parity is worthless.
 
-Categories to bin time into:
+### B.2 — CUDA graph capture for decode
+On Orin, per-step launch overhead is a *larger* fraction of decode wall-clock than on Blackwell. Confirm whether MLC captures the decode graph; if not, enable. Each step is fixed-shape (single token), canonical case for capture.
 
-- Routed-expert GEMM / `MixtralExperts` path (35B only — 0.8B is dense)
-- Dense MLP `gate_up_proj` / `down_proj` GEMM (0.8B's analog)
-- Dequant ops on the q4 weights (suspect #1)
-- Full-attention QKV + paged KV access (FlashInfer fallback path — suspect #2)
-- GatedDeltaNet TIR kernel (suspect #3)
-- Per-step launch overhead / runtime / scheduler
+Acceptance: ≥1.3× decode tps. Re-bench llama.cpp side-by-side — llama.cpp on Orin already uses graph capture for some paths, so part of MLC's gap may be exactly this.
 
-Output: a one-page profile summary in `worklog.md` ranking the top-5 cumulative-time kernels and their share of decode wall-clock. **This profile dictates the order of Tier 2.** Whatever ranks #1 gets fixed first, regardless of where it sits on the suspected list below.
+### B.3 — FlashInfer sm_87
+Verify FlashInfer is actually being used (check compile log for the same cache warning the Blackwell run hit, just with `87f/` instead of `120f/`). sm_87 is in upstream prebuilts so should be a non-issue, but verify. If it's falling back to TIR paged-KV, that's free perf.
 
-### A.3 — Same profile on 35B for cross-check
+## Phase 2C — Speculative (only if 2B leaves a gap)
 
-Once 0.8B profiling is clean, run the same profile on 35B's decode. If the top kernels rank the same way, the 0.8B dev loop is validated. If 35B's #1 is `MixtralExperts` (which doesn't exist in 0.8B), the workflow needs adjustment — probably a quick dedicated pass on routing/dispatch before resuming the 0.8B loop for the rest.
+### C.1 — GatedDeltaNet TIR tune for sm_87
+The kernel at `python/mlc_llm/model/qwen35/qwen35_model.py::create_gated_delta_net_func` was correctness-first, never tuned. On sm_87: split-K, vectorized 16-byte loads, tensor-core fragments where the conv1d / state-update math allows, shared-memory tiling for the recurrent state. High effort — only start if the profile puts GDN in the top 3.
 
-## Phase 2B — Known hot-spots (Tier 2, ranked by suspected impact)
+### C.2 — INT8 weight + fp16 act
+sm_87 has full-rate int8 tensor cores. MLC has W8A16 paths in the quant config. Smaller model footprint → less LPDDR5 pressure. Worth a one-shot try if the W4 fused path doesn't close the gap.
 
-This ranking is informed by the bench result + hardware reasoning, but the profile from A.2 supersedes it. If A.2 says #3 is actually #1, do #3 first.
+### C.3 — Engine knob audit
+`prefill_chunk_size`, `kv_cache_page_size`, `max_total_sequence_length`. Cheap to walk through; low expected return.
 
-### B.1 — Fused dequant + matmul for q4f16_1
-
-**Suspected #1 bottleneck.** llama.cpp's `mul_mat_q` kernels read Q4_K weights once and fuse dequant into the matmul tile. MLC's q4f16_1 path runs `dequant_to_fp16` → `matmul_fp16xfp16`, doubling HBM bandwidth per weight read. On a memory-bound MoE/MLP decode this directly explains a ~2× gap.
-
-Two paths to test:
-
-- **B.1a — Switch to a quantization scheme that already has fused kernels in MLC.** Candidates: `q4f16_ft` (fast type), AWQ, GPTQ. Each has a different dequant layout; verify that one of them is fused at runtime in MLC's current TVM code. Rebuild + bench before writing any kernel.
-- **B.1b — Write a fused TIR kernel for q4f16_1.** The q4f16_1 layout is well-documented in `python/mlc_llm/quantization/group_quantization.py`. The TIR primitive `T.dequantize_fused_matmul(...)` may already exist; if not, write it as a tiled load that decompresses Q4 into shared memory and runs the matmul in one kernel.
-
-Acceptance: 0.8B decode tps improves by ≥50% (memory-bound roofline). Re-bench on 35B.
-
-### B.2 — FlashInfer sm_120 prebuilt
-
-The compile log warns it can't open `~/.cache/flashinfer/0.6.9/120f/cached_ops/...` because the prebuilt binary cache lacks sm_120. MLC falls back to a TIR paged KV cache, slower on every full-attention layer (10/40 on 35B, 6/24 on 0.8B).
-
-Build FlashInfer from source against sm_120, populate the cache, recompile MLC's lib.so. Verify by checking the compile log no longer warns and decode tps moves.
-
-Acceptance: 0.8B decode tps improves by ≥10–20% (only some of the layers benefit, and these are not the dominant cost for the linear-heavy hybrid). Re-bench on 35B.
-
-### B.3 — CUDA graph capture for decode
-
-Verify whether MLC enables CUDA graph capture on the decode-step graph. If not, enable it. Each decode step is a fixed-shape graph (single token) which is the canonical case where graph capture pays off.
-
-Check: search MLC source for `cudaGraph*` API calls or `tvm.target.cuda(graph=True)` / similar. Modify the engine config or compile flag to enable capture.
-
-Acceptance: 0.8B decode tps improves measurably (probably 1.2–1.5×, larger relative gain than on 35B because 0.8B has less GPU work per step and so more relative launch overhead). Re-bench on 35B; halve the 0.8B gain mentally before getting excited.
-
-## Phase 2C — Speculative (Tier 3)
-
-Only touch these if Tier 2 doesn't close the gap.
-
-### C.1 — GatedDeltaNet TIR kernel re-tune
-
-The existing kernel at `python/mlc_llm/model/qwen35/qwen35_model.py::create_gated_delta_net_func` was written for correctness, not perf, and never tuned for sm_120. Affects 18/24 layers on 0.8B and 30/40 on 35B. Profile-driven tuning targets: split-K, tensor-core matmul fragments where math allows, vectorized loads, shared-memory tiling.
-
-This is the highest-effort item — budget multiple days. Don't start unless A.2's profile actually identifies GDN as a top-3 kernel.
-
-### C.2 — Engine knob audit
-
-Walk `mlc-chat-config.json` and engine config: `prefill_chunk_size`, `tensor_parallel_shards`, `kv_cache_page_size`, `attention_sink_size`. Check none are leaving obvious perf on the table.
-
-Cheap to do, low expected return.
-
-### C.3 — Spec decode
-
-MLC supports speculative decoding (`batch_verify` is in `mlc_llm compile`'s temp-buffer estimate). Run a speculator (e.g. a smaller dense model) against the 35B-A3B target. Effective tps for repetitive workloads can be 1.5–2× over greedy on memory-bound paths.
-
-Adds complexity (need a calibrated draft model) but doesn't require touching the perf-critical kernels. Would be worth investigating if Tier 2 stalls.
+### C.4 — Power-mode sweep
+Bench at MAXN, 50W, 30W to characterize the perf/W curve. Useful for the user (Orin is power-constrained in deployment) even if it doesn't move the headline tps.
 
 ## Stop conditions
 
-Phase 2 ends when one of these is true:
-
-- **Win:** 35B decode tps ≥ 311 (≥50% over llama.cpp Q4_K_S baseline).
-- **Diminishing returns:** three consecutive Tier-2/3 items each yielded <10% improvement on 0.8B and the headline 35B number is plateaued. Document the final state and call it.
-- **Architectural ceiling:** profile shows >80% of decode time is in HBM read of weights (already memory-bound roofline) and the q4 quant ratio is fixed. Document the roofline and stop.
+- **Win:** 0.8B decode ≥ 1.3× llama.cpp Q4_K_S baseline on Orin AGX MAXN.
+- **Diminishing returns:** three consecutive Tier-2/3 items each <10% on the headline number.
+- **Roofline ceiling:** profile shows >80% of decode time is LPDDR5 weight reads at >180 GB/s actual (close to the 204 GB/s peak). At that point only quantization gets us further.
 
 ## Re-bench cadence
 
-After any landing fix, run **the full 35B bench** (same conditions as the baseline above) and append the result to `worklog.md`. Don't stack multiple un-validated optimizations — each one needs a clean A/B against the prior baseline so we know which item delivered the gain.
+After every landed fix: full bench against the same conditions, append to `worklog.md` with date + the change that landed. Don't stack un-validated optimizations.
 
-## Risks and known unknowns
+## Risks / known unknowns
 
-- **The 0.8B dev loop assumption.** All Tier-2 items are claimed to "hit the same code paths." Some don't — `MixtralExperts` dispatch and softmax-topk routing only exist on 35B. If profiling reveals expert dispatch is itself a top-3 kernel on 35B, those fixes need the slower iteration loop directly.
-- **Quant scheme switch (B.1a) may regress correctness.** A scheme like AWQ requires a calibration pass; q4f16_1 doesn't. If we switch quant, re-run the 0.8B greedy parity (≥48/50 bar) and the 35B greedy parity before claiming a perf win — a 3× decode tps improvement that breaks token parity is worthless.
-- **FlashInfer sm_120 build can be tricky.** May need patches if upstream doesn't carry sm_120 yet. Budget more if (B.2) appears to take >2 hours.
-- **The user said "drag race" expecting MLC to win 50%.** This plan now targets that explicitly. If we land at "35% faster than llama.cpp," that's still a substantial win but it doesn't meet the original ask. Be honest in the worklog about what shipped vs. what was promised.
+- **mlc_llm wheel on aarch64+sm_87.** May need to build TVM + mlc_llm from source. Budget a half-day if so.
+- **Thermal throttling under sustained bench.** Orin AGX without active cooling will throttle within a minute of full-power decode. Verify with `tegrastats` during long runs.
+- **Unified memory contention.** Anything else running on the box (browser, IDE, other processes) eats into the 204 GB/s shared with the GPU. Bench with a quiet system; document what was running.
+- **0.8B is small enough that some kernels become launch-overhead-bound.** That makes graph capture (B.2) potentially more impactful than fused-dequant (B.1) — the profile in 2A.6 will tell us which.

@@ -8,7 +8,99 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ## 🔖 SESSION HANDOFF — pick up here next time
 
-**Where we are:** Correctness phase complete (Stages 0–6 shipped 2026-04-25). **Phase 2 = perf optimization. Plan locked in [.claude/plans/phase2-perf.md](.claude/plans/phase2-perf.md).** First benchmark vs llama.cpp Q4_K_S on the same 35B-A3B model showed **MLC q4f16_1 is 2.43× SLOWER at decode (85.5 vs 207.7 tps)** on Blackwell sm_120. Prefill measurement was inconclusive (`_generate()` yields before GPU prefill completes — re-instrument with engine.metrics() or non-streaming completions.create() before trusting any prefill number). Decode is the load-bearing metric for chat UX, and MLC is currently nowhere near competitive there. Goal: ≥311 tps on 35B (≥50% over llama.cpp).
+**Where we are:** Phase 2 perf on **Orin AGX** (sm_87, 64 GB LPDDR5, ~204 GB/s). The 2026-04-25 evening session **fixed the Q4 correctness bug**. Root cause: the default MLC `q4f16_1` config uses `group_size=32`, which is too coarse for this hybrid GDN architecture — the recurrent state in the linear-attention layers compounds the per-weight quantization noise across 24 layers, garbling factual recall while leaving grammar intact. **Lowering `group_size` to 16 restores correct output** at minimal storage / perf cost. New configs registered: `q4f16_g16e` (linears + embed at int4 g=16) is the working Q4 build for Qwen3.5/Next. Apples-to-apples (both producing correct text):
+
+| Stack | Quant | Decode tg128 (tps) | Output coherent? |
+|---|---|---|---|
+| llama.cpp | Q4_K_S | **102.03 ± 0.42** | ✅ Paris, fluent |
+| MLC | q0f16 (fp16) | **74.19** (σ ≈ 0.05) | ✅ Paris, fluent |
+| MLC | **q4f16_g16e** (NEW; g=16) | **109.51** (σ ≈ 0.20) | ✅ "Paris, and the capital of Germany is Berlin" |
+| MLC | q4f16_1 (g=32) | 110.55 | ❌ "United States/UK" nonsense |
+| MLC | q4f16_2 (g=32, no embed) | (didn't bench) | ❌ same nonsense |
+| MLC | q4f16_0 (KN layout) | (didn't bench) | ❌ all `#` repeats |
+| MLC | q4f16_ft | 118.56 | ❌ fluent but factually wrong ("capital of the world") |
+
+**Real state vs llama.cpp at correct output**: MLC q4f16_g16e at 109.5 vs llama.cpp Q4_K_S at 102.0 → **MLC is now 1.073× faster** at the correct-output bar. (Old: q0f16 74 vs llama.cpp 102 = llama.cpp 1.37× faster.) Storage: q4f16_g16e is 449 MB params (4.31 bits/param) vs Q4_K_S 485 MB GGUF — about the same. The user's longer-term target of ~1.5× over llama.cpp still requires the Phase 2 wins (CUDA graphs, FlashInfer, GDN tuning) on top of this correctness fix.
+
+**The fix (small):** [python/mlc_llm/quantization/quantization.py](python/mlc_llm/quantization/quantization.py) — added two new GroupQuantize entries `q4f16_g16` (no embed quant) and `q4f16_g16e` (with embed quant), both `group_size=16, int4, NK`. No code changes elsewhere — the existing GroupQuantize Mutator handles the smaller group cleanly. Build with `--quantization q4f16_g16e` (replaces `q4f16_1` in the dist pipeline for this model family).
+
+**What did move during the session (still valid but only on broken Q4 model):**
+- q4f16_ft (CUTLASS fp16xint4 fused) outperforms q4f16_1 by +7.1% (110.55→118.56) — the FT path is real, the bug isn't FT-specific.
+- CUDA graph capture contributes +10.7% (cudagraph=0 → 106.95 tps; cudagraph=1 → 118.37 tps for q4f16_ft).
+- FlashInfer was missing entirely (`pip install flashinfer-python==0.6.9` then JIT-build sm_87 prefill+decode kernels). Patched [tvm/relax/backend/cuda/flashinfer.py:51](3rdparty/tvm/python/tvm/relax/backend/cuda/flashinfer.py#L51) `_load_flashinfer_modules` to handle a flashinfer 0.6.9 path-naming bug (`get_object_paths()` returns short names but ninja produces `<URI>_short.cuda.o`). Then runtime crashes inside `model.cc:882 CreateKVCache` — likely `apache-tvm-ffi 0.1.10` (pulled in by flashinfer install) ABI-mismatched against locally-built TVM 0.24.dev0. Reverted via `--opt flashinfer=0`. **Not on the critical path until Q4 correctness is fixed.**
+- Patched [ft_quantization.py:131](python/mlc_llm/quantization/ft_quantization.py#L131) fallback condition: cutlass FT preprocessor needs both row-byte and col-byte counts ≥32 (=64 elements at int4, =32 at int8). Old check was `out%8`; new check is `(out%64 or in%64)` for int4. Without this, qwen3.5's `in_proj_a`/`in_proj_b` (out=16) hit the assert at `cutlass_preprocessors.cc:254`.
+
+**The Q4 correctness regression — ROOT CAUSE: `group_size=32` is too coarse for this architecture.** Each weight has ~10% relative quantization RMS error per element (normal for int4 g=32) — but in the hybrid GDN backbone the recurrent state at every linear-attention layer multiplies a `gate = exp(-exp(A_log)·softplus(alpha + dt_bias))` term, so per-layer errors compound across 24 layers and ~50 decoded tokens. Bisect (mark subsets `no_quantization=True` via env-var hooks added to qwen35_model.py → re-convert + recompile + re-probe):
+
+| Skipped quant | Probe output |
+|---|---|
+| nothing (q4f16_1 default, g=32) | "the capital of the\nA. United States\nB. United Kingdom" ❌ |
+| GDN small linears (in_proj_a, in_proj_b) | same ❌ |
+| ALL GDN linears | "the capital of the country... United States" ❌ (shifted) |
+| MLP linears | same as default ❌ |
+| Attention linears | same as default ❌ |
+| ALL Linears (only embed quantized) | "the capital of the country... France is the capital of" ❌ (shifted) |
+| q4f16_2 (only Linears quantized, embed fp16) | same as default ❌ |
+| ALL Linears + no embed quant (≈ fp16) | "Paris" ✅ (sanity check — pipeline works) |
+| **`q4f16_g16` (NK, g=16, no embed)** | **"Paris" ✅** |
+| **`q4f16_g16e` (NK, g=16, embed quant too)** | **"Paris, and the capital of Germany is Berlin" ✅** |
+
+The bug is **not** in any specific layer family — it's the cumulative noise budget. Halving the group size (32 → 16) doubles the scale resolution per group, dropping per-weight RMS error enough that the recurrent state stays on-distribution.
+
+llama.cpp's Q4_K_S uses 256-element super-blocks with per-16-element sub-block scales **and** asymmetric (per-block min) quantization, which is why it works at ~Q4 with this model where MLC's symmetric g=32 fails.
+
+PR #3449 (Oct 2025, the qwen35 module) only ever validated q0f16 in this codebase. The 0.8B Stage-4 parity (50/50) was on q0f16 too. Q4 was never tested. This was a real latent bug, surfaced **and fixed** in this session.
+
+**Multi-prompt sanity (q4f16_g16e vs q0f16):** capital of France ✓ "Paris", 2+2 ✓ "4", Pacific Ocean ✓ "world's largest ocean (140M km²)", once-upon-a-time ✓ coherent story; both share the base-model errors (largest-planet → "Sun" / "Earth"; `def fibonacci(n):` → empty) — q4f16_g16e is **at parity with q0f16 on this prompt set**.
+
+**Patches in working tree (NOT committed; capture before submodule update):**
+- `python/mlc_llm/quantization/quantization.py` — adds `q4f16_g16` and `q4f16_g16e` (both NK, int4, g=16). The fix.
+- `python/mlc_llm/quantization/ft_quantization.py` — main repo, safe.
+- `python/mlc_llm/model/qwen35/qwen35_model.py` — adds `QWEN35_NO_QUANT{,_MLP,_ATTN}` env-var hooks for future bisects (inert when env vars unset).
+- `3rdparty/tvm/python/tvm/relax/backend/cuda/flashinfer.py` — **inside submodule on detached HEAD**. Dumped to [.claude/patches/flashinfer-obj-paths.patch](.claude/patches/flashinfer-obj-paths.patch) so it survives a `git submodule update`. Re-apply with `cd 3rdparty/tvm && git apply ../../.claude/patches/flashinfer-obj-paths.patch`.
+
+**Bench artifacts (Orin AGX MAXN, jetson_clocks locked) saved this session:**
+- [bench_mlc_q4g16e_0.8B_orin.log](bench_mlc_q4g16e_0.8B_orin.log) — **q4f16_g16e (CORRECT), tg=109.51** ← new baseline
+- [bench_mlc_q0f16_0.8B_orin.log](bench_mlc_q0f16_0.8B_orin.log) — q0f16 (correct), tg=74.19
+- [bench_mlc_q4_0.8B_orin.log](bench_mlc_q4_0.8B_orin.log) — q4f16_1 (BROKEN), tg=110.55
+- [bench_mlc_q4ft_0.8B_orin.log](bench_mlc_q4ft_0.8B_orin.log) — q4f16_ft + cudagraph + TIR-paged (BROKEN), tg=118.85
+- [bench_mlc_q4ft_fi_0.8B_orin.log](bench_mlc_q4ft_fi_0.8B_orin.log) — q4f16_ft + FlashInfer attempt (CRASHED at CreateKVCache)
+- [bench_mlc_q4ft_nfi_0.8B_orin.log](bench_mlc_q4ft_nfi_0.8B_orin.log) — q4f16_ft + cudagraph=1 + flashinfer=0 (BROKEN), tg=118.37
+- [bench_llamacpp_0.8B_orin.log](bench_llamacpp_0.8B_orin.log) — llama.cpp Q4_K_S (correct), tg=102.03
+
+**Reproduction smoke test (the one-liner — now passes on q4f16_g16e):**
+```bash
+source .envrc.local && python -c "
+from mlc_llm import MLCEngine
+from mlc_llm.protocol.generation_config import GenerationConfig
+for mdir in ['dist/qwen3_5-0.8B-q0f16', 'dist/qwen3_5-0.8B-q4f16_1', 'dist/qwen3_5-0.8B-q4f16_g16e']:
+    e = MLCEngine(model=mdir, model_lib=f'{mdir}/lib.so', mode='interactive', device='cuda:0')
+    gc = GenerationConfig(temperature=0.0, top_p=1.0, max_tokens=20)
+    out = []
+    for d in e._generate('The capital of France is', gc, request_id='probe'):
+        for i in d:
+            if i.delta_text: out.append(i.delta_text)
+    print(f'{mdir}: {repr(\"\".join(out))}')
+    e.terminate()
+"
+# q0f16:        ' Paris.\nThe capital of France is Paris...'                                    ✅
+# q4f16_1:      ' the capital of the\nA. United States\nB. United Kingdom\n...'                 ❌
+# q4f16_g16e:   ' Paris, and the capital of Germany is Berlin.\nThe capital of France is Paris' ✅
+```
+Note: `MLCEngine(...)` *without* explicit `model_lib=` segfaults on the q4 builds (auto-discovery picks up something stale). Always pass `model_lib=f'{mdir}/lib.so'` explicitly. Also: with `flashinfer-python` installed, fresh compiles must pass `--opt "flashinfer=0;cudagraph=1"` or the runtime crashes at `CreateKVCache` (apache-tvm-ffi 0.1.10 ABI mismatch with our locally-built TVM 0.24.dev0).
+
+**Phase 2 path forward (re-prioritized post-fix):**
+1. ✅ **Q4 correctness fixed.** Path was option (a): smaller group_size (g=16 vs default g=32). Bisect ruled out per-layer-family causes. New configs `q4f16_g16` and `q4f16_g16e` registered in [quantization.py](python/mlc_llm/quantization/quantization.py).
+2. **Bench done at this fix:** q4f16_g16e tg=109.51 vs llama.cpp 102.03 (1.073× faster). Storage 449 MB vs 485 MB GGUF — same ballpark.
+3. **Next perf wins (Tier 2 of [phase2-perf.md](.claude/plans/phase2-perf.md)):**
+   - FlashInfer runtime crash fix (apache-tvm-ffi 0.1.10 ABI mismatch). Currently building with `flashinfer=0`; sm_87 is in upstream prebuilts, so this is free perf if the FFI mismatch is resolved.
+   - Try q4f16_ft path with g=16-equivalent CUTLASS preprocessor settings (FT was +7% on broken model — confirm it's not a separate codegen bug now that the underlying quant is correct).
+   - GDN TIR tune (sm_87) — kernel was correctness-first, never tuned.
+   - CUDA graph audit — may already be covered by `cudagraph=1`; verify with nsys.
+4. **Try `q4f16_g16e` on the 35B-A3B MoE model** to confirm the same fix carries over (separate codebase: `qwen3_5_moe`). Build + smoke-test on Blackwell box.
+
+
+**The Blackwell numbers** below (2.43× slower, 85.5 vs 207.7) were on a different machine (`/home/alansrobotlab/...`, sm_120) with the **35B-A3B** model. The 35B model is **out of scope on Orin** (won't fit alongside OS+activations in the 64 GB pool). That older session's diagnostic — that q4f16_1 has no fused dequant+matmul kernel — still likely applies here, but Orin's 8× lower memory bandwidth changes the relative ranking of fixes (graph capture and launch overhead matter more on Ampere). Run `nsys profile` on a decode step against `dist/qwen3_5-0.8B-q4f16_1/lib.so` to confirm before picking the first Tier-2 item.
 
 **Phase 2 workflow:** dev loop on **Qwen3.5-0.8B q4f16_1** (~2× faster compile/bench cycle, fits on 5090 leaving Blackwell free), 35B as the **acceptance gate** (every fix re-benched there before being declared a win). MoE-specific items (expert dispatch, routing) require 35B directly. **Setup needed before Tier 1 starts:** compile MLC q4f16_1 of 0.8B + download `unsloth/Qwen3.5-0.8B-GGUF` Q4_K_S + bench both. ~15 min total. See [phase2-perf.md §Setup](.claude/plans/phase2-perf.md).
 
@@ -20,21 +112,52 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 Items 1–3 are all known optimization headroom, not architectural limits. Phase 2 plan will draft a tiered attack and re-benchmark after each fix.
 
-**Bench artifacts** (don't delete; they're the baseline to beat):
-- [bench_llamacpp.log](bench_llamacpp.log) — llama-bench Q4_K_S, pp512=7322 tg128=207.72 tps
-- [bench_mlc_q4.log](bench_mlc_q4.log) — MLC q4f16_1, tg=85.45 tps (prefill measurement unreliable)
-- [bench_mlc.py](bench_mlc.py) — MLC bench harness; needs ttft instrumentation fix before re-running
-- [dist/gguf/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf](dist/gguf/) — 20.9 GB Unsloth GGUF
-- [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/) — MLC build, 18.6 GB params
-- [/home/alansrobotlab/Projects/llama.cpp/](file:///home/alansrobotlab/Projects/llama.cpp/) — sibling clone, built with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`. `build/bin/llama-bench` is the canonical comparison tool.
+**Bench artifacts on Orin AGX** (the new baseline to beat):
+- [bench_llamacpp_0.8B_orin.log](bench_llamacpp_0.8B_orin.log) — llama-bench Q4_K_S, pp512=4097.68 tg128=102.03 tps
+- [bench_mlc_q4_0.8B_orin.log](bench_mlc_q4_0.8B_orin.log) — MLC q4f16_1, tg=110.55 (decode reliable; ttft bug still inflates pp number)
+- [bench_mlc.py](bench_mlc.py) — MLC bench harness; ttft fix is **Tier-1 task A.5** in [phase2-perf.md](.claude/plans/phase2-perf.md)
+- [dist/gguf/Qwen3.5-0.8B-Q4_K_S.gguf](dist/gguf/) — 474 MB Unsloth GGUF
+- [dist/qwen3_5-0.8B-q4f16_1/](dist/qwen3_5-0.8B-q4f16_1/) — MLC build, 0.4 GB params, 20 MB lib.so
+- [/home/alfie/llama.cpp/](file:///home/alfie/llama.cpp/) — sibling clone, built with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87 -DGGML_CUDA_FA=ON` (FA_ALL_QUANTS=OFF — try toggling on as a Tier-2 sanity check). `build/bin/llama-bench` is the canonical comparison tool.
+
+**Older Blackwell artifacts** (different machine, kept for reference, not on critical path here):
+- llama-bench 35B Q4_K_S, pp512=7322 tg128=207.72 tps
+- MLC q4f16_1 35B, tg=85.45 tps (prefill measurement unreliable)
+- `dist/gguf/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf` (20.9 GB) and `dist/qwen3_6-35B-A3B-q4f16_1/` (18.6 GB) lived under `/home/alansrobotlab/`
 
 If you're picking this up for new model work on the qwen3.5/3.6/Next family, the correctness path is **done** — qwen35 (dense) passes 50/50 on 0.8B, qwen3_5_moe (MoE) passes 4/5 perfect + 1/5 soft-flip on 35B-A3B. Both compiled artifacts live under `dist/`. Correctness-phase carry-over (none on the critical path): wire mRoPE through `create_paged_kv_cache` for multimodal input; add a dedicated `qwen3_5_moe` conv template (we currently reuse `qwen3_5`); instrument MLC logits to confirm its step-34 top-5 cluster matches HF's.
 
-**Env setup (REQUIRED before any mlc_llm command):**
+**Env setup (Orin AGX, REQUIRED before any mlc_llm command):**
 ```bash
 source .envrc.local
-# sets MLC_LIBRARY_PATH=.venv/lib/python3.12/site-packages/mlc_llm  (wheel C++ libs)
-# sets PYTHONPATH=python:$PYTHONPATH                                  (our qwen35 + qwen3_5_moe source)
+# Sets:
+#   PYTHONPATH=python:3rdparty/tvm/python:$PYTHONPATH       (our mlc_llm + locally-built tvm)
+#   TVM_LIBRARY_PATH=3rdparty/tvm/build                     (libtvm.so + libtvm_runtime.so we built)
+#   MLC_LIBRARY_PATH=build                                  (libmlc_llm.so + libmlc_llm_module.so we built)
+#   PATH prepends .venv/bin                                  (uv-managed venv with system-site-packages)
+#   HF_HUB_ENABLE_HF_TRANSFER=1                              (faster downloads)
+sudo nvpmodel -m 0 && sudo jetson_clocks   # MAXN + locked clocks (every fresh boot)
+```
+
+**Build state (Orin AGX, 2026-04-25):**
+- TVM at `3rdparty/tvm/build/` built with `USE_CUDA=ON, USE_THRUST=ON, USE_CUTLASS=ON, USE_CUBLAS=ON, USE_LLVM=/usr/bin/llvm-config-15 --link-shared, USE_CUDNN=OFF, USE_CURAND=OFF, USE_NCCL=OFF`. Static-LLVM linking fails because Ubuntu's llvm-15 ships without `libPolly.a` — must use `--link-shared` (depends on the libLLVM-15.so.1 runtime, which IS apt-installed).
+- mlc_llm cpp at `build/` built against the local TVM via `cmake -DTVM_SOURCE_DIR=3rdparty/tvm -DCMAKE_CUDA_ARCHITECTURES=87 -DUSE_CUDA=ON -DUSE_CUTLASS=ON -DUSE_THRUST=ON ..`.
+- venv at `.venv/` is uv-managed with `--system-site-packages` so the Jetson's torch 2.8 + CUDA 12.6 user-site install passes through. Re-pin `numpy<2` after any `transformers` upgrade — torch 2.8 was compiled against numpy 1.x and will fail to import otherwise. Required PyPI extras: `apache-tvm-ffi` (matches our TVM 0.24.dev0), `transformers>=5.6` (compatible with `huggingface-hub` 1.x), `cmake>=3.24`.
+- Apt deps installed this session: `llvm-15-dev` (for TVM USE_LLVM build).
+
+**Phase 2A baseline benches (Orin AGX MAXN, jetson_clocks locked):**
+```bash
+# llama.cpp Q4_K_S — already built at /home/alfie/llama.cpp/build/bin/llama-bench
+/home/alfie/llama.cpp/build/bin/llama-bench -m dist/gguf/Qwen3.5-0.8B-Q4_K_S.gguf \
+    -p 512 -n 128 -r 3 | tee bench_llamacpp_0.8B_orin.log
+# → pp512 = 4097.68 ± 194.38 tps, tg128 = 102.03 ± 0.42 tps
+
+# MLC q4f16_1
+source .envrc.local && python bench_mlc.py \
+    --model-dir dist/qwen3_5-0.8B-q4f16_1 --device cuda:0 \
+    --pp 512 --tg 128 --runs 3 --warmup 1 | tee bench_mlc_q4_0.8B_orin.log
+# → tg=110.55 (median, σ ≈ 0.2). pp number is fake — bench_mlc.py's TTFT
+#   measurement races GPU prefill completion. Fix is Tier-1 task A.5 in phase2-perf.md.
 ```
 
 **To re-run Stage 6 35B parity** (full pipeline; ~15 min on cuda:0):
@@ -65,22 +188,32 @@ e.terminate()
 "
 ```
 
-**Reproduction sequence** (if dist/ is wiped or weights move):
+**Reproduction sequence on Orin AGX** (if `dist/qwen3_5-0.8B-q4f16_1/` is wiped):
+```bash
+source .envrc.local
+SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
+
+# 1. convert (~20s, ~1.6 GB peak RAM)
+python -m mlc_llm convert_weight "$SNAP" --quantization q4f16_1 \
+    -o dist/qwen3_5-0.8B-q4f16_1
+# → 0.395 GB params (3.88 bits/param), 11 shards
+
+# 2. gen_config (reuses the existing qwen3_5 conv template at python/mlc_llm/conversation_template/qwen3_5.py)
+python -m mlc_llm gen_config "$SNAP" --quantization q4f16_1 --conv-template qwen3_5 \
+    -o dist/qwen3_5-0.8B-q4f16_1
+
+# 3. compile (~80s, generates the 20 MB lib.so for sm_87)
+python -m mlc_llm compile dist/qwen3_5-0.8B-q4f16_1 --device cuda \
+    -o dist/qwen3_5-0.8B-q4f16_1/lib.so
+# Memory: 2.66 GB total at 4K KV (params 0.4 GB + temp buffer 2.07 GB + KV)
+```
+
+**Reproduction sequence (older Blackwell box, 35B-A3B)** — for reference only, not on Orin's path:
 ```bash
 SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0
-
-# 1. convert (~5-6 min, streaming, no GPU; peak RAM 3.7 GB)
-.venv/bin/python -m mlc_llm convert_weight "$SNAP" \
-    --quantization q0f16 -o dist/qwen3_6-35B-A3B-q0f16
-
-# 2. gen_config — reuse qwen3_5 conv template (no qwen3_5_moe template exists)
-.venv/bin/python -m mlc_llm gen_config "$SNAP" \
-    --quantization q0f16 --conv-template qwen3_5 \
-    -o dist/qwen3_6-35B-A3B-q0f16
-
-# 3. compile (~1-2 min for 40 layers × 256 experts on this hardware)
-.venv/bin/python -m mlc_llm compile dist/qwen3_6-35B-A3B-q0f16 \
-    --device cuda -o dist/qwen3_6-35B-A3B-q0f16/lib.so
+.venv/bin/python -m mlc_llm convert_weight "$SNAP" --quantization q0f16 -o dist/qwen3_6-35B-A3B-q0f16
+.venv/bin/python -m mlc_llm gen_config "$SNAP" --quantization q0f16 --conv-template qwen3_5 -o dist/qwen3_6-35B-A3B-q0f16
+.venv/bin/python -m mlc_llm compile dist/qwen3_6-35B-A3B-q0f16 --device cuda -o dist/qwen3_6-35B-A3B-q0f16/lib.so
 ```
 
 **Important CLI quirks discovered this session:**

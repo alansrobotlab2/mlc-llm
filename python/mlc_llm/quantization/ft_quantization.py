@@ -131,13 +131,21 @@ class FTQuantize:
                     if (
                         is_final_fc(name)
                         or node.out_dtype == "float32"
-                        or (self.config.quantize_dtype == "int4" and node.out_features % 8 != 0)
-                        or (self.config.quantize_dtype == "int8" and node.out_features % 4 != 0)
+                        or (
+                            self.config.quantize_dtype == "int4"
+                            and (node.out_features % 64 != 0 or node.in_features % 64 != 0)
+                        )
+                        or (
+                            self.config.quantize_dtype == "int8"
+                            and (node.out_features % 32 != 0 or node.in_features % 32 != 0)
+                        )
                     ):
                         # Under any of the conditions we fall back to GroupQuantize
                         # For `is_final_fc()` see https://github.com/mlc-ai/mlc-llm/issues/1723
                         # If simply skipping lm_head quantization degrades performance
-                        # Other requirements are from CUTLASS
+                        # CUTLASS preprocessor (cutlass_preprocessors.cc:254) requires both
+                        # row- and col-byte counts be a multiple of VECTOR_WIDTH=32: int4 packs
+                        # 2 elts/byte → 64 elts; int8 → 32 elts.
                         logger.info(
                             'Fallback to GroupQuantize for nn.Linear: "%s", '
                             + "weight.shape: %s, out_dtype: %s",

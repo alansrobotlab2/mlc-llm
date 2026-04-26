@@ -5,6 +5,7 @@ Implementation for Qwen3.5 GatedDeltaNet hybrid architecture.
 
 import dataclasses
 import math
+import os
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple  # noqa: UP035
 
@@ -148,6 +149,12 @@ class Qwen35MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
+        skip = os.environ.get("QWEN35_NO_QUANT_MLP", "")
+        if skip:
+            for n in (s.strip() for s in skip.split(",")):
+                if n and hasattr(self, n):
+                    getattr(self, n).no_quantization = True
+
     def forward(self, x: Tensor):
         concat_x1_x2 = self.gate_up_proj(x)
         x1, x2 = op.split(concat_x1_x2, 2, axis=-1)
@@ -181,6 +188,12 @@ class Qwen35Attention(nn.Module):
         )
         self.q_norm = nn.RMSNorm(config.head_dim, -1, config.rms_norm_eps, bias=False)
         self.k_norm = nn.RMSNorm(config.head_dim, -1, config.rms_norm_eps, bias=False)
+
+        skip = os.environ.get("QWEN35_NO_QUANT_ATTN", "")
+        if skip:
+            for n in (s.strip() for s in skip.split(",")):
+                if n and hasattr(self, n):
+                    getattr(self, n).no_quantization = True
 
     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
         d, h_q, h_kv = self.head_dim, self.num_attention_heads, self.num_key_value_heads
@@ -403,6 +416,16 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(
             self.num_value_heads * self.value_head_dim, config.hidden_size, bias=False
         )
+
+        # Bisect hook: env var QWEN35_NO_QUANT=<comma-separated module names> marks
+        # the listed Linear submodules with no_quantization=True so the GroupQuantize/
+        # FTQuantize Mutator skips them. Used for narrowing down q4 correctness bug.
+        # Names: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj.
+        skip = os.environ.get("QWEN35_NO_QUANT", "")
+        if skip:
+            for n in (s.strip() for s in skip.split(",")):
+                if n and hasattr(self, n):
+                    getattr(self, n).no_quantization = True
 
         # Causal depthwise Conv1D kernel
         self.conv1d_weight = nn.Parameter(
