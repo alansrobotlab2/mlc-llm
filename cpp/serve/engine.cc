@@ -458,9 +458,19 @@ class EngineImpl : public Engine {
       model->LoadParams();
       model->SetMaxNumSequence(engine_config->max_num_sequence);
       model->SetPrefillChunkSize(engine_config->prefill_chunk_size);
+      // For hybrid (attention + GDN) models in speculative-decoding mode, the verify
+      // forward writes per-position GDN state into the rnn_state history slots so a
+      // partial accept can be rolled back via PopN(γ+1 - accept_length). This requires
+      // max_history >= γ + 2 (γ+1 verify slots + 1 buffer for the next round's H+1 write).
+      int model_max_history_size = engine_config->max_history_size;
+      if (model->GetMetadata().kv_state_kind == KVStateKind::kHybrid &&
+          engine_config->speculative_mode != SpeculativeMode::kDisable) {
+        int min_required = engine_config->spec_draft_length + 2;
+        model_max_history_size = std::max(model_max_history_size, min_required);
+      }
       model->CreateKVCache(engine_config->kv_cache_page_size, engine_config->max_num_sequence,
                            engine_config->max_total_sequence_length,
-                           engine_config->prefill_chunk_size, engine_config->max_history_size,
+                           engine_config->prefill_chunk_size, model_max_history_size,
                            engine_config->prefix_cache_max_num_recycling_seqs);
       n->model_workspaces_.push_back(
           ModelWorkspace{model->AllocEmbeddingTensor(), model->AllocHiddenStatesTensor()});

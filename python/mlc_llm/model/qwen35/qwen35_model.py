@@ -386,6 +386,165 @@ def create_gated_delta_net_func(
     return gdn_func
 
 
+def create_gated_delta_net_func_with_history(
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    dtype: str,
+):
+    """GatedDeltaNet recurrence that emits per-position state snapshots.
+
+    Same math as `create_gated_delta_net_func` but the state output carries an extra
+    inner `seq_len` axis: `state_out_buf[vb, t, vh, K, V]` is the recurrent state
+    AFTER processing position t. Used by speculative-decoding verify so a partial
+    accept can roll back to any intermediate position via PopN on the RNNState.
+
+    Memory: state_out is `seq_len` larger than the regular kernel. Acceptable for
+    spec verify (seq_len = γ+1, ~5) but NOT for prefill (seq_len up to 1000s),
+    which keeps using the original kernel.
+    """
+    heads_per_group = num_value_heads // num_key_heads
+    K = key_head_dim
+    V = value_head_dim
+
+    @T.prim_func
+    def gdn_func_history(
+        q_handle: T.handle,
+        k_handle: T.handle,
+        v_handle: T.handle,
+        gate_handle: T.handle,
+        beta_handle: T.handle,
+        state_in_handle: T.handle,
+        out_handle: T.handle,
+        state_out_handle: T.handle,
+    ):
+        T.func_attr({"op_pattern": 8, "tirx.noalias": True, "tirx.is_scheduled": 1})
+        batch_size, seq_len = T.int64(), T.int64()
+        q_buf = T.match_buffer(q_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        k_buf = T.match_buffer(k_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        v_buf = T.match_buffer(v_handle, (batch_size, seq_len, num_value_heads, V), dtype=dtype)
+        gate_buf = T.match_buffer(
+            gate_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        beta_buf = T.match_buffer(
+            beta_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        state_in_buf = T.match_buffer(
+            state_in_handle, (batch_size, num_value_heads, K, V), dtype="float32"
+        )
+        out_buf = T.match_buffer(
+            out_handle, (batch_size, seq_len, num_value_heads, V), dtype="float32"
+        )
+        # Per-position state: the recurrence at position t writes its post-state to
+        # state_out_buf[b, t, ...] and reads its pre-state from state_out_buf[b, t-1, ...]
+        # (or state_in_buf for t=0).
+        state_out_buf = T.match_buffer(
+            state_out_handle,
+            (batch_size, seq_len, num_value_heads, K, V),
+            dtype="float32",
+        )
+
+        for b_idx in T.thread_binding(batch_size, thread="blockIdx.y"):
+            for h_idx in T.thread_binding(num_value_heads, thread="blockIdx.x"):
+                for col in T.thread_binding(V, thread="threadIdx.x"):
+                    kh = h_idx // heads_per_group
+
+                    for t in range(seq_len):
+                        # 1. Decay: S[t] = (S[t-1] or S_in) * gate
+                        for row in range(K):
+                            with T.sblock("decay"):
+                                vb = T.axis.spatial(batch_size, b_idx)
+                                vt = T.axis.opaque(seq_len, t)
+                                vh = T.axis.spatial(num_value_heads, h_idx)
+                                vr = T.axis.opaque(K, row)
+                                vc = T.axis.spatial(V, col)
+                                # T.max guards against the OOB index when vt==0; the
+                                # if_then_else picks state_in_buf in that case.
+                                state_out_buf[vb, vt, vh, vr, vc] = T.if_then_else(
+                                    vt == T.int64(0),
+                                    state_in_buf[vb, vh, vr, vc],
+                                    state_out_buf[
+                                        vb,
+                                        T.max(vt - T.int64(1), T.int64(0)),
+                                        vh,
+                                        vr,
+                                        vc,
+                                    ],
+                                ) * gate_buf[vb, vt, vh]
+
+                        # 2. dot(S[t][:, col], k[t, :]) → out_buf
+                        with T.sblock("dot_sk_init"):
+                            vb = T.axis.spatial(batch_size, b_idx)
+                            vt = T.axis.opaque(seq_len, t)
+                            vh = T.axis.spatial(num_value_heads, h_idx)
+                            vc = T.axis.spatial(V, col)
+                            out_buf[vb, vt, vh, vc] = T.float32(0)
+
+                        for row in range(K):
+                            with T.sblock("dot_sk"):
+                                vb = T.axis.spatial(batch_size, b_idx)
+                                vt = T.axis.opaque(seq_len, t)
+                                vr = T.axis.opaque(K, row)
+                                vh = T.axis.spatial(num_value_heads, h_idx)
+                                vc = T.axis.spatial(V, col)
+                                out_buf[vb, vt, vh, vc] = out_buf[
+                                    vb, vt, vh, vc
+                                ] + state_out_buf[vb, vt, vh, vr, vc] * T.cast(
+                                    k_buf[vb, vt, kh, vr], "float32"
+                                )
+
+                        # 3. Delta: S[t] += k * beta * (v - dot_sk)
+                        for row in range(K):
+                            with T.sblock("delta"):
+                                vb = T.axis.spatial(batch_size, b_idx)
+                                vt = T.axis.opaque(seq_len, t)
+                                vr = T.axis.opaque(K, row)
+                                vh = T.axis.spatial(num_value_heads, h_idx)
+                                vc = T.axis.spatial(V, col)
+                                state_out_buf[vb, vt, vh, vr, vc] = state_out_buf[
+                                    vb, vt, vh, vr, vc
+                                ] + T.cast(k_buf[vb, vt, kh, vr], "float32") * beta_buf[
+                                    vb, vt, vh
+                                ] * (
+                                    T.cast(v_buf[vb, vt, vh, vc], "float32")
+                                    - out_buf[vb, vt, vh, vc]
+                                )
+
+                        # 4. out[t] = dot(S_updated[t][:, col], q[t, :])
+                        with T.sblock("out_init"):
+                            vb = T.axis.spatial(batch_size, b_idx)
+                            vt = T.axis.opaque(seq_len, t)
+                            vh = T.axis.spatial(num_value_heads, h_idx)
+                            vc = T.axis.spatial(V, col)
+                            out_buf[vb, vt, vh, vc] = T.float32(0)
+
+                        for row in range(K):
+                            with T.sblock("dot_sq"):
+                                vb = T.axis.spatial(batch_size, b_idx)
+                                vt = T.axis.opaque(seq_len, t)
+                                vr = T.axis.opaque(K, row)
+                                vh = T.axis.spatial(num_value_heads, h_idx)
+                                vc = T.axis.spatial(V, col)
+                                out_buf[vb, vt, vh, vc] = out_buf[
+                                    vb, vt, vh, vc
+                                ] + state_out_buf[vb, vt, vh, vr, vc] * T.cast(
+                                    q_buf[vb, vt, kh, vr], "float32"
+                                )
+
+                        # 5. Apply scale
+                        with T.sblock("scale"):
+                            vb = T.axis.spatial(batch_size, b_idx)
+                            vt = T.axis.opaque(seq_len, t)
+                            vh = T.axis.spatial(num_value_heads, h_idx)
+                            vc = T.axis.spatial(V, col)
+                            out_buf[vb, vt, vh, vc] = out_buf[vb, vt, vh, vc] * T.float32(
+                                1.0 / math.sqrt(K)
+                            )
+
+    return gdn_func_history
+
+
 # ============================================================================
 # GatedDeltaNet Linear Attention Layer
 # ============================================================================
@@ -521,6 +680,146 @@ class Qwen35GatedDeltaNet(nn.Module):
         out_flat = op.reshape(out_normed, (b, s, n_vh * V))
         out_gated = out_flat * op.silu(z)
         return self.out_proj(out_gated), state
+
+    def forward_with_history(
+        self, hidden_states: Tensor, state: RNNState
+    ) -> Tuple[Tensor, RNNState]:  # noqa: UP006
+        """Forward variant that scatters per-position state into RNNState history slots.
+
+        Used by the verify path for speculative decoding so partial accept can roll back
+        the recurrent state to any intermediate position. Mirrors `forward()` step-for-step
+        but the GDN kernel emits a full per-position state history and the conv state is
+        also recorded per position; both are written via `state.set_with_history(...)`.
+        """
+        b, s, _ = hidden_states.shape
+        K = self.key_head_dim
+        V = self.value_head_dim
+        n_kh = self.num_key_heads
+        n_vh = self.num_value_heads
+        layer_idx = self.linear_layer_idx
+
+        qkv = self.in_proj_qkv(hidden_states)
+        z = self.in_proj_z(hidden_states)
+        alpha = self.in_proj_a(hidden_states)
+        beta_raw = self.in_proj_b(hidden_states)
+
+        qkv_dim = qkv.shape[-1]
+        conv_state = state.get(
+            layer_idx,
+            1,
+            (b, self.config.linear_conv_kernel_dim - 1, qkv_dim),
+            self.dtype,
+        )
+
+        # Causal conv1d that also yields the per-position conv state history.
+        qkv, conv_state_history = self._causal_conv1d_with_state_history(qkv, conv_state)
+        # Scatter per-position conv state to history slots. The "current" state at the
+        # end of position t is conv_state_history[:, t, :, :].
+        state = state.set_with_history(layer_idx, 1, conv_state_history)
+
+        qkv = op.silu(qkv)
+
+        q_dim = n_kh * K
+        k_dim = n_kh * K
+        qkv_parts = op.split(qkv, [q_dim, q_dim + k_dim], axis=-1)
+        q = op.reshape(qkv_parts[0], (b, s, n_kh, K))
+        k = op.reshape(qkv_parts[1], (b, s, n_kh, K))
+        v = op.reshape(qkv_parts[2], (b, s, n_vh, V))
+
+        q = self._l2_normalize(q)
+        k = self._l2_normalize(k)
+
+        gate, beta = self._compute_gate_beta(alpha, beta_raw)
+
+        state_in_layer = state.get(layer_idx, 0, (b, n_vh, K, V), "float32")
+
+        # Recurrence kernel that emits the full (b, s, n_vh, K, V) history.
+        out_recurrent, state_history_layer = op.tensor_ir_op(
+            create_gated_delta_net_func_with_history(
+                num_key_heads=n_kh,
+                num_value_heads=n_vh,
+                key_head_dim=K,
+                value_head_dim=V,
+                dtype=self.dtype,
+            ),
+            "gated_delta_net_with_history",
+            [q, k, v, gate, beta, state_in_layer],
+            [
+                Tensor.placeholder([b, s, n_vh, V], "float32"),
+                Tensor.placeholder([b, s, n_vh, K, V], "float32"),
+            ],
+        )
+
+        out_recurrent = op.astype(out_recurrent, self.dtype)
+
+        # Scatter recurrent state per position.
+        state = state.set_with_history(layer_idx, 0, state_history_layer)
+
+        out_normed = self.norm(out_recurrent)
+        out_flat = op.reshape(out_normed, (b, s, n_vh * V))
+        out_gated = out_flat * op.silu(z)
+        return self.out_proj(out_gated), state
+
+    def _causal_conv1d_with_state_history(
+        self, qkv: Tensor, conv_state: Tensor
+    ) -> Tuple[Tensor, Tensor]:  # noqa: UP006
+        """Conv1D variant that also returns the per-position conv state history.
+
+        The conv state at the end of position t is the (kernel_size-1)-element window
+        of inputs ending at position t — i.e. positions [t-ks+2, ..., t] of the combined
+        [old_state, qkv_in] stream.
+        """
+        b, s, d = qkv.shape
+        kernel_size = self.config.linear_conv_kernel_dim
+
+        def _te_update_conv_state_history(old_state: te.Tensor, qkv_in: te.Tensor):
+            ks_minus_1 = old_state.shape[1]
+            seq = qkv_in.shape[1]
+
+            # Per-position conv state history: out[bi, p, ti, di] = combined[bi, p+1+ti, di]
+            # where combined = [old_state, qkv_in] (length ks_m1 + seq).
+            return te.compute(
+                (old_state.shape[0], seq, ks_minus_1, old_state.shape[2]),
+                lambda bi, p, ti, di: tirx.if_then_else(
+                    p + 1 + ti < ks_minus_1,
+                    old_state[bi, p + 1 + ti, di],
+                    qkv_in[bi, p + 1 + ti - ks_minus_1, di],
+                ),
+                name="update_conv_state_history",
+            )
+
+        conv_state_history = op.tensor_expr_op(
+            _te_update_conv_state_history,
+            "update_conv_state_history",
+            [conv_state, qkv],
+        )
+
+        # Depthwise conv (same as the regular path)
+        def _te_depthwise_conv(state: te.Tensor, qkv_in: te.Tensor, weight: te.Tensor):
+            ks_m1 = state.shape[1]
+            seq = qkv_in.shape[1]
+            kk = te.reduce_axis((0, kernel_size), name="kk")
+            return te.compute(
+                (qkv_in.shape[0], seq, qkv_in.shape[2]),
+                lambda bi, si, di: te.sum(
+                    tirx.if_then_else(
+                        si + kk < ks_m1,
+                        state[bi, si + kk, di],
+                        qkv_in[bi, si + kk - ks_m1, di],
+                    )
+                    * weight[di, 0, kk],
+                    axis=kk,
+                ),
+                name="depthwise_conv1d",
+            )
+
+        result = op.tensor_expr_op(
+            _te_depthwise_conv,
+            "depthwise_conv1d",
+            [conv_state, qkv, self.conv1d_weight],
+            attrs={"op_pattern": 8},
+        )
+        return result, conv_state_history
 
     def _causal_conv1d_with_state(self, qkv: Tensor, conv_state: Tensor) -> Tuple[Tensor, Tensor]:  # noqa: UP006
         """Causal Conv1D using a pre-extracted conv_state tensor (for RNNState path)."""
@@ -666,6 +965,24 @@ class Qwen35DecoderLayer(nn.Module):
         hidden_states = self._apply_residual(out, residual=hidden_states)
         return hidden_states, state
 
+    def forward_with_history(
+        self,
+        hidden_states: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        """Verify-path variant that scatters per-position GDN state into history slots."""
+        out = self.input_layernorm(hidden_states)
+        if self.layer_type == "full_attention":
+            out = self.self_attn(out, paged_kv_cache, self.category_id)
+        else:
+            out, state = self.linear_attn.forward_with_history(out, state)
+        hidden_states = self._apply_residual(out, residual=hidden_states)
+        out = self.post_attention_layernorm(hidden_states)
+        out = self.mlp(out)
+        hidden_states = self._apply_residual(out, residual=hidden_states)
+        return hidden_states, state
+
     def _apply_residual(self, out, residual):
         if self.tensor_parallel_shards > 1:
             return op.ccl_allreduce(out, "sum") + residual
@@ -773,6 +1090,20 @@ class Qwen35Model(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
 
+    def forward_with_history(
+        self,
+        inputs: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        hidden_states = inputs
+        for layer_id, layer in enumerate(self.layers):
+            hidden_states, state = layer.forward_with_history(
+                hidden_states, paged_kv_cache, state
+            )
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, state
+
 
 class Qwen35LMHeadModel(nn.Module):
     def __init__(self, config: Qwen35Config):
@@ -845,6 +1176,18 @@ class Qwen35LMHeadModel(nn.Module):
         hidden_states, state = self.model.forward(input_embed, paged_kv_cache, state)
         return hidden_states, paged_kv_cache, state
 
+    def _forward_to_last_hidden_with_history(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        op_ext.configure()
+        hidden_states, state = self.model.forward_with_history(
+            input_embed, paged_kv_cache, state
+        )
+        return hidden_states, paged_kv_cache, state
+
     def get_logits(self, hidden_states: Tensor) -> Tensor:
         op_ext.configure()
         return self._lm_head(hidden_states)
@@ -912,7 +1255,13 @@ class Qwen35LMHeadModel(nn.Module):
         paged_kv_cache: PagedKVCache,
         rnn_state: RNNState,
     ):
-        return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+        # Verify uses the per-position-history GDN forward so partial accept can roll
+        # the recurrent state back to the accepted prefix bit-exactly via PopN.
+        # Pair this with a `set_use_history_mode(True)` call from the engine before
+        # BeginForward so EndForward advances `available_history_num` by `seq_len`.
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
 
     def mtp_decode(
         self,

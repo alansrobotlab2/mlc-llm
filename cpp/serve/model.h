@@ -277,6 +277,23 @@ class ModelObj : public Object {
   virtual bool RollbackRNNStateVerifyAppend(int64_t seq_id, int64_t append_length) = 0;
 
   /*!
+   * \brief Pop the last `num_tokens` slots from the recurrent state ONLY (paged KV cache
+   * is left untouched). Used after `CommitAcceptedTokenTreeNodesToKVCache` on partial
+   * accept in hybrid + spec decode to roll the rnn_state back from H+(γ+1) to
+   * H+(accept_length). Requires the verify forward to have stored per-position state via
+   * `set_use_history_mode(true)`. No-op for non-hybrid models.
+   */
+  virtual void PopNFromRNNStateOnly(int64_t seq_id, int num_tokens) = 0;
+
+  /*!
+   * \brief Arm the rnn_state so the *next* BeginForward is treated as history-bearing
+   * (EndForward advances `available_history_num` by `seq_len`). Must be called before
+   * the verify forward when `set_with_history` is used. The flag self-clears on consumption.
+   * No-op for non-hybrid models.
+   */
+  virtual void SetRNNStateUseHistoryMode(bool use_history) = 0;
+
+  /*!
    * \brief Enabling sliding window for the given sequence.
    * It is a no-op if the model does not support sliding window.
    * \note Given this operation is tied with the underlying KV cache,

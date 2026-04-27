@@ -796,6 +796,10 @@ class ModelImpl : public ModelObj {
     ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple,
                                      token_tree_parent_ptr_tuple);
     if (kind == KVStateKind::kHybrid) {
+      // Arm history-bearing mode: the verify forward writes per-position GDN state
+      // via set_with_history(...), so EndForward must advance available_history_num
+      // by seq_len rather than capping it at 0 for multi-token append.
+      ft_.rnn_state_set_use_history_mode_func_(rnn_state_, true);
       ft_.kv_cache_begin_forward_func_(rnn_state_, seq_ids_tuple, lengths_tuple,
                                        token_tree_parent_ptr_tuple);
     }
@@ -951,6 +955,23 @@ class ModelImpl : public ModelObj {
            "with the rnn_state rollback patch.";
     ft_.rnn_state_rollback_verify_append_func_(rnn_state_, seq_id, append_length);
     return true;
+  }
+
+  void PopNFromRNNStateOnly(int64_t seq_id, int num_tokens) final {
+    if (kind != KVStateKind::kHybrid) {
+      return;
+    }
+    ft_.kv_cache_popn_func_(rnn_state_, seq_id, num_tokens);
+  }
+
+  void SetRNNStateUseHistoryMode(bool use_history) final {
+    if (kind != KVStateKind::kHybrid) {
+      return;
+    }
+    TVM_FFI_ICHECK(ft_.rnn_state_set_use_history_mode_func_.defined())
+        << "Hybrid model requires vm.builtin.rnn_state_set_use_history_mode; rebuild TVM "
+           "with the rnn_state per-position history patch.";
+    ft_.rnn_state_set_use_history_mode_func_(rnn_state_, use_history);
   }
 
   void EnableSlidingWindowForSeq(int64_t seq_id) final {

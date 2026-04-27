@@ -124,6 +124,7 @@ struct FunctionTable {
   Function kv_cache_popn_func_;
   Function kv_cache_commit_accepted_token_tree_nodes_func_;
   Function rnn_state_rollback_verify_append_func_;
+  Function rnn_state_set_use_history_mode_func_;
   Function kv_cache_get_num_available_pages_func_;
   Function kv_cache_get_total_sequence_length_func_;
   Function gpu_multinomial_from_uniform_func_;

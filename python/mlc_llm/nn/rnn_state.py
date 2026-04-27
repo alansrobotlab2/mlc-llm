@@ -94,6 +94,15 @@ class RNNState(Object):
             )
             for id, (shape, dtype) in enumerate(state_infos)
         ]
+        f_sets_with_history = [
+            bb.add_func(
+                RNNState.create_set_with_history_func(
+                    shape, dtype, max_batch_size, max_history, id
+                ),
+                f"rnn_state_set_with_history_{id}",
+            )
+            for id, (shape, dtype) in enumerate(state_infos)
+        ]
 
         ret = RNNState(
             _expr=rx.call_pure_packed(
@@ -103,6 +112,7 @@ class RNNState(Object):
                 max_history,
                 f_gets,
                 f_sets,
+                f_sets_with_history,
                 list(init_values),
                 sinfo_args=[rx.ObjectStructInfo()],
             ),
@@ -177,6 +187,39 @@ class RNNState(Object):
                 )
             ),
             _name="rnn_state_set",
+        )
+
+    def set_with_history(self, layer_id: int, state_id: int, value: Tensor) -> "RNNState":
+        """Scatter per-position state into history slots [H+1..H+seq_len].
+
+        Used by speculative-decoding verify on hybrid (attention + recurrent) models so
+        a partial accept can roll back the recurrent state to any intermediate position
+        via the existing PopN API. Caller must arm the `set_use_history_mode(True)` flag
+        before BeginForward so that EndForward advances `history_slot_id` by `seq_len`
+        rather than by 1.
+
+        Parameters
+        ----------
+        layer_id : int
+            The layer id.
+        state_id : int
+            The state id.
+        value : Tensor
+            The per-position state tensor, with shape `(batch_size, seq_len, *state_size)`.
+        """
+        bb = rx.BlockBuilder.current()
+        return RNNState(
+            _expr=bb.emit(
+                rx.call_pure_packed(
+                    "vm.builtin.rnn_state_set_with_history",
+                    self._expr,
+                    rx.PrimValue(layer_id),
+                    rx.PrimValue(state_id),
+                    value._expr,
+                    sinfo_args=[rx.ObjectStructInfo()],
+                )
+            ),
+            _name="rnn_state_set_with_history",
         )
 
     @staticmethod
@@ -270,6 +313,89 @@ class RNNState(Object):
                                 output,
                                 T.BufferLoad(storage, [seq_id, history_id, *vs]),
                                 [vi, *vs],
+                            )
+
+            return f
+
+        f = _func_one_dim() if len(shape) == 1 else _func_high_dim()
+        return _schedule_state_copy(f, dtype)
+
+    @staticmethod
+    def create_set_with_history_func(
+        shape: Sequence[Union[int, tirx.Var]],
+        dtype: str,
+        max_batch_size: Union[int, tirx.Var],
+        max_history: Union[int, tirx.Var],
+        state_id: int,
+    ) -> tirx.PrimFunc:
+        """Per-position scatter-set kernel.
+
+        Writes `data[i, t, *vs]` to `storage[seq_slot_ids[i],
+        (history_slot_ids[i] + 1 + t) mod max_history, *vs]` for each batch element `i`
+        and inner-seq position `t`. Caller must guarantee `max_history >= seq_len + 1`
+        so writes do not collide.
+        """
+
+        def _func_one_dim():
+            @T.prim_func
+            def f(
+                var_storage: T.handle,
+                var_seq_slot_ids: T.handle,
+                var_history_slot_ids: T.handle,
+                var_data: T.handle,
+            ):
+                batch_size = T.int32(is_size_var=True)
+                seq_len = T.int32(is_size_var=True)
+                T.func_attr({"global_symbol": f"rnn_state_set_with_history_{state_id}"})
+
+                storage = T.match_buffer(
+                    var_storage, (max_batch_size, max_history, shape[0]), dtype
+                )
+                seq_slot_ids = T.match_buffer(var_seq_slot_ids, (batch_size,), "int32")
+                history_slot_ids = T.match_buffer(var_history_slot_ids, (batch_size,), "int32")
+                data = T.match_buffer(var_data, (batch_size, seq_len, shape[0]), dtype)
+
+                for i, t in T.grid(batch_size, seq_len):
+                    for s in range(shape[0]):
+                        with T.sblock("copy"):
+                            vi, vt, vs = T.axis.remap("SSS", [i, t, s])
+                            seq_id: T.int32 = seq_slot_ids[vi]
+                            history_id: T.int32 = (
+                                history_slot_ids[vi] + 1 + vt
+                            ) % T.cast(max_history, "int32")
+                            storage[seq_id, history_id, vs] = data[vi, vt, vs]
+
+            return f
+
+        def _func_high_dim():
+            @T.prim_func
+            def f(
+                var_storage: T.handle,
+                var_seq_slot_ids: T.handle,
+                var_history_slot_ids: T.handle,
+                var_data: T.handle,
+            ):
+                batch_size = T.int32(is_size_var=True)
+                seq_len = T.int32(is_size_var=True)
+                T.func_attr({"global_symbol": f"rnn_state_set_with_history_{state_id}"})
+
+                storage = T.match_buffer(var_storage, (max_batch_size, max_history, *shape), dtype)
+                seq_slot_ids = T.match_buffer(var_seq_slot_ids, (batch_size,), "int32")
+                history_slot_ids = T.match_buffer(var_history_slot_ids, (batch_size,), "int32")
+                data = T.match_buffer(var_data, (batch_size, seq_len, *shape), dtype)
+
+                for i, t in T.grid(batch_size, seq_len):
+                    for s in T.grid(*shape):
+                        with T.sblock("copy"):
+                            vi, vt, *vs = T.axis.remap("S" * (len(shape) + 2), [i, t, *s])
+                            seq_id: T.int32 = seq_slot_ids[vi]
+                            history_id: T.int32 = (
+                                history_slot_ids[vi] + 1 + vt
+                            ) % T.cast(max_history, "int32")
+                            T.buffer_store(
+                                storage,
+                                T.BufferLoad(data, [vi, vt, *vs]),
+                                [seq_id, history_id, *vs],
                             )
 
             return f

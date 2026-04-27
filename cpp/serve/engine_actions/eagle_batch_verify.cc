@@ -165,14 +165,17 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     verify_model_seq_internal_ids.reserve(num_rsentries);
     accepted_token_tree_leaf_nodes.reserve(num_rsentries);
 
-    // Track which sequences need rnn_state rollback + replay (hybrid models, partial accept).
-    // For these we override the leaf index to -1 so that CommitAcceptedTokenTreeNodesToKVCache
-    // fully pops the kv_cache (back to pre-verify); we then replay the accepted prefix below
-    // to advance both kv_cache and rnn_state by exactly accept_length.
-    std::vector<int> hybrid_replay_rsentry_indices;
-    std::vector<int> hybrid_replay_accept_lengths;
-    hybrid_replay_rsentry_indices.reserve(num_rsentries);
-    hybrid_replay_accept_lengths.reserve(num_rsentries);
+    // Hybrid (attention + GDN) verify models record per-position GDN state during the
+    // verify forward (set_with_history). On partial accept we PopN(rollback_length) on
+    // the rnn_state ONLY — the paged kv_cache is rolled back by the standard
+    // CommitAcceptedTokenTreeNodes path below. This restores the recurrent state
+    // bit-exactly to the accepted prefix without any replay forward pass.
+    struct HybridRollback {
+      int64_t verify_seq_id;
+      int rollback_length;
+    };
+    std::vector<HybridRollback> hybrid_rnn_state_pops;
+    hybrid_rnn_state_pops.reserve(num_rsentries);
 
     std::vector<int> last_accepted_hidden_positions;
     last_accepted_hidden_positions.reserve(num_rsentries);
@@ -185,7 +188,6 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
         rsentries[i]->mstates[draft_model_id_]->CommitToken(sample_result);
       }
       // Metrics update
-      // live update the output metrics
       rsentries[i]->rstate->metrics.completion_tokens += accept_length;
       rsentries[i]->rstate->metrics.decode_tokens += accept_length;
       estate->metrics.spec_decode.Update(cum_verify_lengths[i + 1] - cum_verify_lengths[i],
@@ -195,32 +197,17 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       int rollback_length =
           std::max(cum_verify_lengths[i + 1] - cum_verify_lengths[i] - accept_length, 0);
 
-      // Commit accepted tokens to the "verify_model", rollback kv cache
-      // in the "draft_model".
-      // NOTE: when number of small models is more than 1 (in the future),
-      // it is possible to re-compute prefill for the small models.
       int64_t verify_seq_id = rsentries[i]->mstates[verify_model_id_]->internal_id;
       verify_model_seq_internal_ids.push_back(verify_seq_id);
-      // For hybrid (attention + GDN) verify models with a partial accept, the recurrent
-      // state was advanced by the full verify_length and TVM RNNState forbids fine-grained
-      // rollback. We instead fully pop the kv_cache here (leaf=-1) and replay the accepted
-      // prefix afterwards, which re-advances both kv_cache and rnn_state by accept_length.
-      bool hybrid_partial_replay = false;
-      if (rollback_length > 0) {
-        int64_t verify_append_length =
-            static_cast<int64_t>(cum_verify_lengths[i + 1] - cum_verify_lengths[i]);
-        if (models_[verify_model_id_]->RollbackRNNStateVerifyAppend(verify_seq_id,
-                                                                    verify_append_length)) {
-          hybrid_partial_replay = true;
-          hybrid_replay_rsentry_indices.push_back(i);
-          hybrid_replay_accept_lengths.push_back(accept_length);
-        }
-      }
-      accepted_token_tree_leaf_nodes.push_back(hybrid_partial_replay ? -1 : (accept_length - 1));
+      accepted_token_tree_leaf_nodes.push_back(accept_length - 1);
       if (rollback_length > 0) {
         // Draft model rollback minus one because verify uses one more token.
         models_[draft_model_id_]->PopNFromKVCache(
             rsentries[i]->mstates[draft_model_id_]->internal_id, rollback_length - 1);
+        // Schedule rnn_state rollback: pop (verify_length - accept_length) slots so the
+        // rnn_state pointer lands on H+accept_length, matching the kv_cache after Commit.
+        hybrid_rnn_state_pops.push_back(
+            {verify_seq_id, cum_verify_lengths[i + 1] - cum_verify_lengths[i] - accept_length});
       } else {
         fully_accepted_rsentries.push_back(i);
       }
@@ -232,52 +219,8 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     }
     models_[verify_model_id_]->CommitAcceptedTokenTreeNodesToKVCache(
         verify_model_seq_internal_ids, accepted_token_tree_leaf_nodes);
-
-    // Hybrid (kHybrid) replay: re-prefill the accepted prefix to re-advance both kv_cache
-    // (just popped to pre-verify) and rnn_state (just rolled back to pre-verify) by
-    // exactly accept_length. Cost: one extra prefill of sum(accept_length) tokens.
-    if (!hybrid_replay_rsentry_indices.empty()) {
-      std::vector<int32_t> replay_token_ids;
-      std::vector<int64_t> replay_seq_ids;
-      std::vector<int> replay_lengths;
-      int total_replay_tokens = 0;
-      for (int k : hybrid_replay_accept_lengths) total_replay_tokens += k;
-      replay_token_ids.reserve(total_replay_tokens);
-      replay_seq_ids.reserve(hybrid_replay_rsentry_indices.size());
-      replay_lengths.reserve(hybrid_replay_rsentry_indices.size());
-      for (size_t k = 0; k < hybrid_replay_rsentry_indices.size(); ++k) {
-        int i = hybrid_replay_rsentry_indices[k];
-        int accept_length = hybrid_replay_accept_lengths[k];
-        // The first `accept_length` tokens of this seq's verify input are the accepted ones
-        // (chain tree, root = previous-committed token, then drafts in order).
-        for (int j = 0; j < accept_length; ++j) {
-          replay_token_ids.push_back(all_tokens_to_verify[cum_verify_lengths[i] + j]);
-        }
-        replay_seq_ids.push_back(rsentries[i]->mstates[verify_model_id_]->internal_id);
-        replay_lengths.push_back(accept_length);
-      }
-      ObjectRef replay_embeddings = models_[verify_model_id_]->TokenEmbed(
-          {IntTuple{replay_token_ids.begin(), replay_token_ids.end()}});
-      // We discard the returned hidden states; the verify forward already gave us the
-      // hidden states for these accepted tokens (used below for one-step proposal).
-      // For the (very common) accept_length=1 case, use BatchDecodeToLastHidden — the
-      // same compiled function path that target_only mode uses, eliminating fp16
-      // kernel-scheduling drift between verify-of-N and decode-of-1. For accept_length>1
-      // we fall back to verify with a chain token tree.
-      // Use BatchVerifyToLastHidden with a chain token tree: this routes through the same
-      // compiled `batch_verify_to_last_hidden_states` kernel as the original verify forward,
-      // minimizing fp16 kernel-scheduling drift between verify-of-(γ+1) and replay-of-K.
-      // (BatchDecode and BatchPrefill replays were tried and produced more drift, not less,
-      // because the prior round's verify-with-tree-mask differs more from a no-tree decode.)
-      std::vector<int64_t> replay_token_tree_parent_ptr;
-      replay_token_tree_parent_ptr.reserve(total_replay_tokens);
-      for (int len : replay_lengths) {
-        for (int j = 0; j < len; ++j) {
-          replay_token_tree_parent_ptr.push_back(j - 1);
-        }
-      }
-      models_[verify_model_id_]->BatchVerifyToLastHidden(
-          replay_embeddings, replay_seq_ids, replay_lengths, replay_token_tree_parent_ptr);
+    for (const auto& [seq_id, n] : hybrid_rnn_state_pops) {
+      models_[verify_model_id_]->PopNFromRNNStateOnly(seq_id, n);
     }
     if (!fully_accepted_rsentries.empty() &&
         engine_config_->speculative_mode == SpeculativeMode::kEagle) {

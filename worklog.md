@@ -6,6 +6,51 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-27 (night) — Baseline measured: llama.cpp Q4_K_S Qwen3.6-35B-A3B on Orin AGX = **29.4 tps tg128**. Original 2× goal = 59 tps; well within BW ceiling.
+
+`/home/alfie/llama.cpp/build/bin/llama-bench -m dist/gguf/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf -p 512 -n 128 -r 3 -ngl 99` → log at [bench_llamacpp_35B-A3B_orin.log](bench_llamacpp_35B-A3B_orin.log). Decode tg128 = 29.39 ± 0.06; pp512 = 209.02 ± 333 (first-run cold-cache spike, ignore).
+
+llama.cpp's hybrid+MoE CUDA path is much weaker than I assumed in the Q&A earlier this session — 30 of 40 layers are GDN and llama's GDN/Mamba CUDA kernels aren't tuned. The drop pattern: dense Qwen3-0.6B Q4 = 134 tps; hybrid Qwen3.5-0.8B Q4 = 102 tps; hybrid+MoE 35B-A3B Q4 = 29 tps. MLC's own GDN kernel (custom TIR) already beats llama.cpp by 1.30× on dense 0.8B; for hybrid+MoE the gap should widen further. **2× over llama.cpp = 59 tps** is plausible from kernel work alone (BW ceiling at Q4 active 3B ≈ 95 tps practical). Spec decode (if MTP/draft accept rate gets sorted) becomes a multiplier on top, pushing 3–4× llama.cpp.
+
+The MTP-accept-rate-is-0 finding from earlier today is no longer the load-bearing decision for hitting 2×. It's still the path to 3×+, but the headline goal looks reachable from straight kernel + quant work.
+
+---
+
+## 2026-04-27 (night) — Path 1 LANDED: per-position rnn_state history → spec output byte-identical to target_only. Stage 4 correctness ✓. Accept rate is 0% — MTP draft is the next bottleneck.
+
+**Done — full Path 1 plumbing**
+- **TVM RNNState** ([3rdparty/tvm/src/runtime/vm/rnn_state.cc](3rdparty/tvm/src/runtime/vm/rnn_state.cc), [kv_state.h](3rdparty/tvm/src/runtime/vm/kv_state.h), [kv_state.cc](3rdparty/tvm/src/runtime/vm/kv_state.cc)): added `RNNStateObj::SetWithHistory` and `SetUseHistoryMode` virtuals. New scatter-set kernel array `f_sets_with_history_` writes per-position `data[i, t, ...]` to slots `(history_slot_id + 1 + t) mod max_history`. `BeginForward` latches the next-round flag into `cur_use_history_mode_`; `EndForward` checks the latch and advances `history_slot_id += seq_length` / `available_history_num = min(prev + seq_length, max-1)` instead of capping at 0 for multi-token append. `vm.builtin.rnn_state_create` made variadic (6 or 7 args) so RWKV stays back-compat. New builtins: `vm.builtin.rnn_state_set_with_history`, `vm.builtin.rnn_state_set_use_history_mode`.
+- **TVM nn frontend** ([python/mlc_llm/nn/rnn_state.py](python/mlc_llm/nn/rnn_state.py)): added `RNNState.create_set_with_history_func` (TIR scatter, both 1D and high-dim) and `RNNState.set_with_history(layer_id, state_id, value)` wrapper. `RNNState.create()` now also builds and registers `f_sets_with_history` via `bb.add_func`.
+- **GDN kernel** ([qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py)): new `create_gated_delta_net_func_with_history` emits a per-position state output `state_out_buf[b, t, n_vh, K, V]`; the recurrence at `t` reads `state_out_buf[b, t-1]` (or `state_in_buf` at t=0 via `T.if_then_else` + `T.max(vt-1, 0)` clamp) and writes its post-state to `state_out_buf[b, t]`. Added `Qwen35GatedDeltaNet.forward_with_history` that uses the new kernel + new `_causal_conv1d_with_state_history` (per-position conv window); both states scatter via `state.set_with_history(...)`. Threaded `forward_with_history` up through `Qwen35DecoderLayer`, `Qwen35Model`, and `Qwen35LMHeadModel._forward_to_last_hidden_with_history`. `batch_verify_to_last_hidden_states` now routes through the history path.
+- **MLC engine** ([cpp/serve/model.cc](cpp/serve/model.cc), [model.h](cpp/serve/model.h), [function_table.cc](cpp/serve/function_table.cc), [function_table.h](cpp/serve/function_table.h), [engine.cc](cpp/serve/engine.cc), [engine_actions/eagle_batch_verify.cc](cpp/serve/engine_actions/eagle_batch_verify.cc)): `Model::SetRNNStateUseHistoryMode(bool)` and `Model::PopNFromRNNStateOnly(seq_id, n)` virtuals + impls. `BatchVerifyToLastHidden` for kHybrid arms history mode before the BeginForward call. EAGLE verify drops the Path 3 replay logic entirely; on partial accept it commits paged kv_cache via the standard `accepted_token_tree_leaf_nodes[i] = accept_length-1` path AND issues `PopNFromRNNStateOnly(seq_id, γ+1 - accept_length)` after Commit to roll the rnn_state back from H+(γ+1) to H+(accept_length). Engine bumps `max_history_size = max(user, spec_draft_length+2)` for hybrid + spec.
+- Builds: TVM `ninja tvm tvm_runtime` clean, MLC `ninja -j8` clean, `mlc_llm compile dist/qwen3_5-0.8B-q0f16/...` clean.
+
+**Result**
+- Spec smoke at γ=4, max_tokens=128 produces **identical text to target_only** for the test prompt: `"Thinking Process:\n\n1.  **Analyze the Request:** The user is asking for the capital of France. This is a straightforward factual question.\n\n2..."`. The Path 3 degenerate `"1.111111..."` collapse is gone — output stays coherent indefinitely. **Stage 4 correctness met.**
+- Non-spec decode unchanged (regression check via [scripts/target_only_smoke.py](scripts/target_only_smoke.py)) — the new GDN-history kernel is only entered through `batch_verify_to_last_hidden_states`, so prefill/decode paths stay on the original kernel.
+
+**The accept rate is 0% — re-evaluate Phase 3 Stage 3 metric**
+- Spec smoke metrics: `accept_count=[N, 0, 0, 0, 0]` (N = effective decode tokens). Step-0 is the target's own sampled root token (always "accepted"); steps 1..γ are the actual MTP draft predictions, all rejected on every verify round. End-to-end decode tps **17.5** vs target_only **~21** — spec mode is a net loss.
+- Re-reading the prior session's "23.1% step-1 / 33.3% step-2" numbers: those were measured on garbage rnn_state (output was `"is is is is..."`). Garbage logits → near-uniform distribution → spurious accepts. **Stage 3 was never really met** — the MTP draft has been producing target-misaligned predictions all along, and only the Path 1 fix exposes it.
+- Likely root causes (need triage next session):
+  1. **MTP head weights wrong** — loader bug. The 0.8B HF checkpoint has `mtp.fc`, `mtp.norm`, `mtp.pre_fc_norm_*`, `mtp.layers.0.*`. Verify the +1.0 RMSNorm shift is being applied, c_attn fusion order is right, gate_up_proj fusion order is right, and the embedding tensor that the MTP draft uses (`model.language_model.embed_tokens`) actually got copied into the draft artifact's params.
+  2. **Architecture mismatch** — confirm MTP self-attn really is `attn_output_gate=True` head_dim=256 (matches main full-attn), partial_rotary_factor=0.25, etc. Reading [vLLM qwen3_next.py](../vllm/vllm/model_executor/models/qwen3_next.py) MTP path side-by-side with our `Qwen35MTPHead`/`_Qwen35MTPDecoderLayer` is the cheap check.
+  3. **Pre-FC concat order** — HF's `Qwen3_5MoeMTPHead.forward` does `torch.cat([self.pre_fc_norm_hidden(prev_hidden), self.pre_fc_norm_embedding(prev_embed)], dim=-1)`. Our [qwen3_5_mtp_draft_model.py] mirrors that. Verify the *channel order* matches HF's `mtp.fc.weight` rows — getting H/E swapped would silently produce coherent-but-wrong drafts.
+  4. **KV cache layer index for MTP** — main model has `num_attention_layers + mtp_num_hidden_layers` slots; MTP layer 0 uses index `num_attention_layers + 0`. Was set up in the convert/compile path; double-check the runtime read/write.
+
+**Quick context for the fresh session**
+- Spec smoke: `python -u scripts/spec_smoke.py --max-tokens 32 --draft-length 4`. Output is now correct; `accept_rate{step=1..4}` = 0.0 across the board.
+- Target-only control (matched config): `scripts/target_only_smoke_match_spec.py`. Same prompt, same config, ~21 tps decode.
+- The MTP-head-as-self-spec story: the q0f16-mtp-draft artifact at [dist/qwen3_5-0.8B-q0f16-mtp-draft/](dist/qwen3_5-0.8B-q0f16-mtp-draft/) was built earlier this session; the compile is fine but the *predictions* the draft produces don't match what target would sample. Triage list above.
+- Performance numbers this session were q0f16 (no quant) and on Orin AGX cuda:0 — different setup from the dev box (Blackwell + 5090) noted in earlier entries. Single GPU here. Locked clocks, MAXN. For perf comparison vs the q4 baseline (198 tps tg128 bar from `bc61c785`) we'd need to apply Path 1 to the q4f16_g32_asym artifact + recompile + rerun the standard bench script. Not in scope tonight — accept rate at 0% means the perf number would be a regression regardless of quant.
+
+**Next session candidates**
+- A) **Triage MTP draft accept rate.** Side-by-side check of HF `Qwen3_5MoeMTPHead` vs our `Qwen35MTPHead` (architecture + loader). One round of "render the MTP's per-token greedy prediction next to target's greedy prediction" to confirm if drafts are *close* but rejected by the multinomial verify, or *wholly different* (loader/arch bug).
+- B) **External draft path: Qwen2.5-0.5B as draft.** Shares tokenizer with 0.8B (they're both Qwen2 GPT-2-style). Bigger but real-trained spec head; if accept rate is decent we can ditch the MTP path on 0.8B. Risk: 0.5B is dense (no GDN), so we still hit the kHybrid+spec path on the *target* but the draft is straightforward.
+- C) **Apply Path 1 to q4 quant + rebench.** If accept rate gets fixed, this gives the real headline number. Today's run was q0f16 only (we never recompiled q4 with the new model code).
+
+---
+
 ## 2026-04-27 (late) — Path 3 (snapshot-restore) attempted: plumbing works, output diverges by token 7. Root cause identified: fp16 kernel-scheduling drift in GDN forward, not a logical bug. Pivoting to Path 1 next session.
 
 **Done**
