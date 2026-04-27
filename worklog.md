@@ -6,6 +6,53 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-27 (late night) — 35B-A3B compiled + benched on Orin: MLC q4f16_1 is **3× SLOWER** than llama.cpp Q4_K_S at every context. 0.8B regresses at long context. The 2× headline goal needs ~6× from here.
+
+**Done — Path 1 committed, full apples-to-apples bench harness + 0.8B and 35B baselines on Orin**
+- Committed Path 1 spec-decode work in three commits: `e107239` (TVM flashinfer-path workaround), `62f19d5` (TVM RNNState per-position history), `0ca86134` (MLC engine + GDN-history kernel + bumps TVM SHA). Three commits matching the user's "split clean" preference.
+- Built [bench_compare.py](bench_compare.py) — drives `llama-bench` and `bench_mlc.py` at the same pp lengths, emits a single markdown table (model × backend × ctx). Llama-bench side: `-p N` for prefill rate, `-d N -n tg` for decode-at-depth rate. MLC side reuses the 0.8B harness.
+- Extended [bench_mlc.py](bench_mlc.py): comma-separated `--pp` values run inside one engine (saves warmup), `--json-out` writes a parseable summary so the comparator can read it without buffering subprocess stdout. Engine constructed with `EngineConfig(prefix_cache_mode="disable")` — see *gotcha 3* below.
+- Downloaded `Qwen/Qwen3.6-35B-A3B` bf16 (72 GB → 67 GB after dedup, ~10 min). `convert_weight q4f16_1` → 19 GB at 4.345 bits/param (~matches llama.cpp's 19.45 GB Q4_K_S). `gen_config` auto-picked `qwen3_5_moe`. `compile` with `--opt "flashinfer=0;cublas_gemm=1;cudagraph=1;cutlass=1"` (flashinfer mandatory off on Orin) → 61 MB sm_87 lib.so in ~5 min.
+- Recompiled the stale [dist/qwen3_5-0.8B-q4f16_1/lib.so](dist/qwen3_5-0.8B-q4f16_1/lib.so) (last built 25 Apr, predated Path 1 model.cc/qwen35_model.py changes — engine deadlocked on init linking against new symbols).
+
+**Headline numbers — 0.8B vs 35B-A3B, Orin AGX, q4f16_1 vs llama.cpp Q4_K_S**
+
+| ctx | 0.8B llama.cpp tg | 0.8B MLC tg | ratio | 35B llama.cpp tg | 35B MLC tg | ratio |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128  | 108.0 | **131.6** | **1.22×** | 29.6 | 10.1 | 0.34× |
+| 1024 | 106.1 | 105.8 | 1.00× | 29.2 | 9.7  | 0.33× |
+| 4096 | 102.6 | **63.3**  | **0.62×** | 28.5 | 8.4  | 0.29× |
+
+Prefill (pp_tps): MLC trails llama.cpp 4× on 0.8B at all contexts and 3-4× on 35B. Tables in [bench_compare_0.8B_q4f16_1.md](bench_compare_0.8B_q4f16_1.md) and [bench_compare_35B_q4f16_1.md](bench_compare_35B_q4f16_1.md); per-pp JSONs in `qwen3_*_bench.json`.
+
+**The 1.27× tg128 number from the prior worklog stands** — we got 1.22× with this harness, same range. **What was new:** at ctx≥1024 the win evaporates, and at ctx=4096 the 0.8B drops to 0.62× because MLC's full-attn KV path scales much worse with depth than llama.cpp's. **What changes the strategic picture:** the 35B-A3B is 3× *behind* llama.cpp at every context, not ahead. The earlier conjecture ("kernel + quant work alone hits 2×") doesn't survive the actual measurement.
+
+**Likely culprits (next session = profiling)**
+1. **MoE expert dispatch on 35B.** Active params per token = ~3B but throughput is ⅓ of llama.cpp's. Suspects: `moe_matmul.dequantize_gemv` for 256 experts × top-8 routing, scatter-gather overhead per token, no CUDA-graph capture for the MoE block.
+2. **Full-attn KV scaling** (shared issue across both models). The 0.8B regression from 130 → 63 tps as ctx grows 128 → 4096 is purely the 6 full-attn layers — GDN's recurrent state cost is depth-invariant. Whatever's wrong here also applies to 35B's 10/40 full-attn layers.
+3. **Prefill is 4× slower than llama.cpp** at every context. Worth a separate look — prefill is GEMM-bound, so the gap is either tile selection or quant-dequant fusion.
+
+**Three gotchas that ate session time**
+- *Gotcha 1 — stale lib.so deadlocks engine init.* The 0.8B q4f16_1 lib was built before the Path 1 changes; the C++ engine called into symbols the lib didn't export and main+all 30 worker threads sat in `futex_wait_queue_me` indefinitely with no error. **Lesson: any `.so` produced before today's `0ca86134` commit must be rebuilt.** The 35B compile is fine since we built it fresh today.
+- *Gotcha 2 — `subprocess.run(capture_output=True)` deadlocks the MLC engine.* Engine background threads spam log lines; the OS pipe buffer fills (~64 KB), threads block on write, the background loop can't advance, and the parent is waiting on `proc.communicate()`. Same `futex_wait` symptom as gotcha 1, different cause. Fix in [bench_compare.py:run_mlc](bench_compare.py): pass through stdout/stderr live, communicate via JSON file instead.
+- *Gotcha 3 — radix prefix cache crashes hybrid models on the second prefill.* MLC's `MatchPrefixCache` calls `PopNFromKVCache` to truncate to a cached prefix, which calls into rnn_state's `PopN`. After a multi-token prefill, rnn_state's `available_history_num=0` (pre-existing TVM behavior, not Path 1) so any nonzero rollback aborts with `Length of rolling back N exceeds the sequence length`. Bench fix: `EngineConfig(prefix_cache_mode="disable")`. **This is also a real production bug for hybrid models** — any user re-sending the same prefix hits this. Worth a separate fix later.
+
+**Next session — option A: profile the 35B MoE decode kernel**
+- Goal: identify the 1-2 ops that account for the 3× gap. Rough plan:
+  - Run a 60-token decode on 35B with `tegrastats` + `nsys profile` → annotated kernel timeline. Compare time-per-step against llama.cpp's GGML profile (llama-bench has `-v` for per-op breakdown).
+  - First hypothesis to check: `moe_matmul.dequantize_gemv`. If it's >50% of decode time, that's the win.
+  - Second: cudagraph capture across MoE — currently `cudagraph=1` was passed but the MoE block may not be being captured. Check the lowered IR.
+  - Third: KV cache attention kernel at ctx=4096 — the same op that's hurting 0.8B at long ctx is being fed the 10 full-attn layers of 35B too.
+- The 0.8B long-ctx regression (gotcha shared with 35B) is a free side-product; fixing the 35B full-attn KV path will likely move 0.8B@4096 from 63 → ≥100 tps.
+- The 0.8B q4f16_g32_asym artifact still works as a reference for "best symmetric MLC variant" if needed; that quant doesn't apply to 35B-MoE (`GroupQuantizeMixtralExperts` raises `NotImplementedError` for asymmetric).
+
+**Quick context for fresh session**
+- Compiled artifacts on disk: [dist/qwen3_5-0.8B-q4f16_1/](dist/qwen3_5-0.8B-q4f16_1/) (rebuilt today), [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/) (built today). Both run-tested.
+- Bench command: `source .envrc.local && .venv/bin/python -u bench_compare.py --label 35B-A3B --gguf-path dist/gguf/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf --mlc-dir dist/qwen3_6-35B-A3B-q4f16_1 --mlc-label "MLC q4f16_1" --ctx 128,1024,4096`. Takes ~12 min total (35B engine warmup is the slow part).
+- Bar to beat: llama.cpp Q4_K_S 35B = 29 tps tg128. The 2× headline goal is 59 tps. Currently at **10 tps**; need 6× speedup.
+
+---
+
 ## 2026-04-27 (night) — Baseline measured: llama.cpp Q4_K_S Qwen3.6-35B-A3B on Orin AGX = **29.4 tps tg128**. Original 2× goal = 59 tps; well within BW ceiling.
 
 `/home/alfie/llama.cpp/build/bin/llama-bench -m dist/gguf/Qwen3.6-35B-A3B-UD-Q4_K_S.gguf -p 512 -n 128 -r 3 -ngl 99` → log at [bench_llamacpp_35B-A3B_orin.log](bench_llamacpp_35B-A3B_orin.log). Decode tg128 = 29.39 ± 0.06; pp512 = 209.02 ± 333 (first-run cold-cache spike, ignore).

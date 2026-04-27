@@ -25,10 +25,16 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model-dir", required=True)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--pp", type=int, default=512, help="Prompt length in tokens")
+    p.add_argument(
+        "--pp",
+        default="512",
+        help="Prompt length in tokens. Comma-separated to bench multiple contexts in one engine.",
+    )
     p.add_argument("--tg", type=int, default=128, help="Tokens to generate")
     p.add_argument("--runs", type=int, default=3, help="Repetitions (median reported)")
     p.add_argument("--warmup", type=int, default=1)
+    p.add_argument("--label", default="MLC", help="Label for the summary header")
+    p.add_argument("--json-out", help="Optional path to write JSON summary {pp: {pp_tps, tg_tps}}.")
     return p.parse_args()
 
 
@@ -66,6 +72,7 @@ def main() -> None:
     try:
         from mlc_llm import MLCEngine
         from mlc_llm.protocol.generation_config import GenerationConfig
+        from mlc_llm.serve.config import EngineConfig
     except ImportError:
         print("[mlc] cannot import mlc_llm.", file=sys.stderr)
         sys.exit(1)
@@ -82,47 +89,59 @@ def main() -> None:
     print(f"[mlc] Loading tokenizer from {model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
 
+    # Disable radix prefix caching: hybrid GDN models cannot roll back rnn_state
+    # after a multi-token prefill, so the engine's PopN-on-prefix-match path crashes.
     print(f"[mlc] Loading engine: device={args.device} lib={lib_path}")
     engine = MLCEngine(
         model=str(model_dir),
         model_lib=lib_path,
         device=args.device,
         mode="interactive",
+        engine_config=EngineConfig(prefix_cache_mode="disable"),
     )
 
-    prompt, prompt_len = build_prompt(tokenizer, args.pp)
+    pp_values = [int(x) for x in args.pp.split(",") if x.strip()]
     gen_cfg = GenerationConfig(temperature=0.0, top_p=1.0, max_tokens=args.tg)
-    print(f"[mlc] Prompt length {prompt_len} tokens; generating {args.tg} tokens; {args.runs} runs (after {args.warmup} warmup)")
 
-    # Warmup
-    for w in range(args.warmup):
-        ttft, total, ntok = time_run(engine, prompt, gen_cfg, f"warmup-{w}")
-        print(f"[mlc] warmup {w}: ttft={ttft*1000:.1f}ms total={total*1000:.1f}ms tokens={ntok}")
+    summaries: list[tuple[int, float, float]] = []  # (pp, pp_tps_median, tg_tps_median)
 
-    # Measured runs
-    pp_tps_samples = []
-    tg_tps_samples = []
-    total_samples = []
-    for r in range(args.runs):
-        ttft, total, ntok = time_run(engine, prompt, gen_cfg, f"run-{r}")
-        decode_t = total - ttft
-        # n_decode_tokens excludes the first token (which was bundled with prefill)
-        n_decode = max(ntok - 1, 1)
-        pp_tps = prompt_len / ttft if ttft > 0 else float("inf")
-        tg_tps = n_decode / decode_t if decode_t > 0 else float("inf")
-        pp_tps_samples.append(pp_tps)
-        tg_tps_samples.append(tg_tps)
-        total_samples.append(total)
-        print(f"[mlc] run {r}: ttft={ttft*1000:.1f}ms decode={decode_t*1000:.1f}ms tokens={ntok}  "
-              f"pp_tps={pp_tps:.2f}  tg_tps={tg_tps:.2f}")
+    for pp_target in pp_values:
+        prompt, prompt_len = build_prompt(tokenizer, pp_target)
+        print(f"\n[mlc] pp={prompt_len}  tg={args.tg}  runs={args.runs} (warmup={args.warmup})")
+
+        for w in range(args.warmup):
+            ttft, total, ntok = time_run(engine, prompt, gen_cfg, f"warmup-pp{prompt_len}-{w}")
+            print(f"[mlc]   warmup {w}: ttft={ttft*1000:.1f}ms total={total*1000:.1f}ms tokens={ntok}")
+
+        pp_tps_samples = []
+        tg_tps_samples = []
+        for r in range(args.runs):
+            ttft, total, ntok = time_run(engine, prompt, gen_cfg, f"run-pp{prompt_len}-{r}")
+            decode_t = total - ttft
+            n_decode = max(ntok - 1, 1)
+            pp_tps = prompt_len / ttft if ttft > 0 else float("inf")
+            tg_tps = n_decode / decode_t if decode_t > 0 else float("inf")
+            pp_tps_samples.append(pp_tps)
+            tg_tps_samples.append(tg_tps)
+            print(f"[mlc]   run {r}: ttft={ttft*1000:.1f}ms decode={decode_t*1000:.1f}ms "
+                  f"tokens={ntok}  pp_tps={pp_tps:.2f}  tg_tps={tg_tps:.2f}")
+
+        summaries.append((prompt_len, statistics.median(pp_tps_samples), statistics.median(tg_tps_samples)))
 
     engine.terminate()
 
     print()
-    print(f"=== MLC q4f16_1 — pp={args.pp} tg={args.tg} runs={args.runs} ===")
-    print(f"  pp_tps: median={statistics.median(pp_tps_samples):.2f}  min={min(pp_tps_samples):.2f}  max={max(pp_tps_samples):.2f}")
-    print(f"  tg_tps: median={statistics.median(tg_tps_samples):.2f}  min={min(tg_tps_samples):.2f}  max={max(tg_tps_samples):.2f}")
-    print(f"  wall:   median={statistics.median(total_samples)*1000:.1f}ms")
+    print(f"=== {args.label} — tg={args.tg} runs={args.runs} ===")
+    print(f"{'pp':>8}  {'pp_tps':>10}  {'tg_tps':>10}")
+    for pp, pp_tps, tg_tps in summaries:
+        print(f"{pp:>8}  {pp_tps:>10.2f}  {tg_tps:>10.2f}")
+
+    if args.json_out:
+        import json
+        Path(args.json_out).write_text(
+            json.dumps({str(pp): {"pp_tps": pp_tps, "tg_tps": tg_tps}
+                        for pp, pp_tps, tg_tps in summaries}, indent=2)
+        )
 
 
 if __name__ == "__main__":
