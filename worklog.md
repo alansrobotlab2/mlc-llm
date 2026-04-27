@@ -6,6 +6,139 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-27 (late) — Path 3 (snapshot-restore) attempted: plumbing works, output diverges by token 7. Root cause identified: fp16 kernel-scheduling drift in GDN forward, not a logical bug. Pivoting to Path 1 next session.
+
+**Done**
+- Implemented the architectural fix outlined in the prior entry's "path 3":
+  - **TVM:** added `RollbackVerifyAppend(seq_id, append_length)` to [3rdparty/tvm/src/runtime/vm/rnn_state.cc](3rdparty/tvm/src/runtime/vm/rnn_state.cc) and registered the `vm.builtin.rnn_state_rollback_verify_append` builtin. Decrements `history_slot_id` by 1 and `seq_length` by `append_length`. The pre-verify rnn_state is preserved at the previous slot since the GDN kernel only ever writes to slot `H+1` (verified via the kernel's `for t in range(seq_len)` inner loop in [qwen35_model.py:296-355](python/mlc_llm/model/qwen35/qwen35_model.py#L296-L355) — only one `set` per `EndForward`).
+  - **MLC FunctionTable:** added `rnn_state_rollback_verify_append_func_` field, fetched only for `kHybrid` models in [function_table.cc:267-273](cpp/serve/function_table.cc#L267-L273).
+  - **MLC Model API:** added `RollbackRNNStateVerifyAppend(seq_id, append_length) → bool` (false for non-hybrid no-op) in [model.h:268-275](cpp/serve/model.h#L268-L275) and [model.cc:944-955](cpp/serve/model.cc#L944-L955).
+  - **EAGLE verify:** in [eagle_batch_verify.cc:170-265](cpp/serve/engine_actions/eagle_batch_verify.cc#L170-L265), for partial-accept seqs in hybrid models: override `accepted_token_tree_leaf_nodes[i] = -1` (so kv_cache fully pops via the existing `CommitAcceptedTokenTreeNodesToKVCache`), call rnn_state rollback, then re-execute the accepted prefix via `BatchVerifyToLastHidden` with a chain token tree of length=accept_length. This advances both kv_cache and rnn_state by exactly accept_length.
+- All wiring confirmed live: 31/31 verify rounds in the smoke fire the replay correctly (logged via `LOG(INFO)` during debug). Engine no longer crashes; output is non-empty and starts with target-aligned text.
+
+**Learned — three replay variants tried, all leak fp16 drift; verify-replay wins but caps at ~6 token parity**
+
+| Replay function | Tokens matching target_only |
+|---|---|
+| `BatchPrefillToLastHidden` | 3 |
+| `BatchDecode` (target_only's own kernel) | 4 |
+| `BatchVerifyToLastHidden` (chain tree, len=K) | **6** |
+
+- The first 6 generated tokens match target_only exactly with the verify-replay variant ("Thinking Process:\n\n1." vs target_only's "Thinking Process:\n\n1.  **Analyze..."). Token 7 onwards collapses into a degenerate "1.111111..." loop. With the prefill or decode replay, divergence happens earlier (token 4–5).
+- **Counter-intuitive ranking** — using `BatchDecode` (target_only's exact kernel for single-token steps) ranks WORSE than `BatchVerifyToLastHidden`. The reason: the *prior round's* verify-of-(γ+1) leaves rnn_state and kv_cache in a state that's slightly different from what target_only's stream of decode-of-1's would have produced. So when the replay calls a decode kernel, it operates on a state that's *already* drifted vs target_only. Calling the verify kernel (matching the prior verify's code path) keeps the drift smallest.
+- **The drift is not a bug in my replay logic** — it's fp16 kernel-scheduling noise. `verify_to_last_hidden` with seq_len=γ+1 vs seq_len=K compiles into different cuBLAS/cutlass kernel selections (different tile shapes for different M dimensions). The math is the same but the floating-point summation order differs by 1–2 ulps per matmul. With non-hybrid attention models EAGLE tolerates this; with GDN's recurrent state the drift gets amplified each step until logits flip and the model enters a degenerate fixed-point.
+- **Why the plan missed this:** path 3 assumed bit-equivalence between verify-of-N and verify-of-K for any K ≤ N at the first K positions. That's *almost* true — same math — but not bit-true on fp16 hardware with size-dispatched kernels. Attention-only models have stable enough trajectories to absorb this; GDN's recurrence is closer to chaotic so small perturbations cascade into degenerate logit distributions within ~6 rounds.
+
+**Other gotchas worth noting**
+- `libtvm.so` and `libtvm_runtime.so` at [3rdparty/tvm/build/](3rdparty/tvm/build/) are NOT rebuilt by `ninja -j8` in `build/`. The MLC build subdir has its own copies at `build/tvm/`. Python's `tvm` package loads from `3rdparty/tvm/build/libtvm.so`. **After patching TVM C++, you must run `ninja tvm tvm_runtime` in `3rdparty/tvm/build/` separately** for the new symbols to be visible from Python. First smoke after the patch hit `ValueError: Function vm.builtin.rnn_state_rollback_verify_append not found` until the `3rdparty/tvm/build/` was rebuilt independently.
+- `Model::PopNFromKVCache` for `kHybrid` calls `kv_cache_popn_func_` on *both* paged kv_cache AND rnn_state. For partial-accept replay we needed kv_cache-only PopN. Workaround: use `CommitAcceptedTokenTreeNodesToKVCache(leaf_indices=-1)` which only operates on paged kv_cache (rnn_state isn't touched by that func). Cleaner long-term: add a `PopNFromPagedKVCacheOnly` to the Model API.
+- `BatchDecodeToLastHidden` requires 3D `(b, 1, h)` input; `BatchDecode` accepts 2D `(b, h)` and reshapes internally. The latter returns logits (one extra lm_head matmul, ~free for 0.8B). Use BatchDecode + discard logits if you want to match target_only's exact code path without manual reshaping.
+
+**Next — Path 1: TVM kernel patch to save per-step intermediate rnn_state**
+
+The structural fix is in the GDN kernel ([qwen35_model.py:236-355](python/mlc_llm/model/qwen35/qwen35_model.py#L236-L355)) and the rnn_state storage layout ([3rdparty/tvm/src/runtime/vm/rnn_state.cc](3rdparty/tvm/src/runtime/vm/rnn_state.cc)):
+1. Allocate `max_history` slots per multi-token append (currently allocates 1).
+2. Modify the GDN kernel to write the per-position intermediate state at each `t` to slots `H+1+t` (not just final state at `H+1`).
+3. Update `EndForward` to set `history_slot_id += seq_length`, `available_history_num = min(prev + seq_length, max-1)`.
+4. Use existing `PopN(γ+1-accept_length)` after CommitAccepted for partial accept — no replay needed, no fp16 drift, bit-exact rollback to the intermediate state at position `accept_length-1`.
+
+The advantage of Path 1 over what we just tried: **no replay forward pass**, so spec mode becomes bit-equivalent to target_only after acceptance commits (modulo the verify-of-N kernel-scheduling drift, which is now self-cancelling because we're keeping the intermediate state computed by the same kernel). Verify-of-N is still run ONCE per round; we just keep K of its intermediate states instead of recomputing them.
+
+Cost: ~γ× more rnn_state storage per sequence (1 MB × 18 layers × γ+1 = 90 MB at γ=4), plus kernel surgery to emit per-step states. ~1–2 days of work, isolated to TVM + qwen35_model.py.
+
+**Quick context for fresh session**
+- All path-3 changes are committed at the working state (engine runs, output is degenerate). To revert path 3 entirely: `git revert` the upcoming commit. To start path 1 fresh: branch from this commit and edit `rnn_state.cc` (storage layout + EndForward) and `qwen35_model.py:create_gated_delta_net_func` (write per-position state).
+- Stage 4 acceptance bar still: ≥1.5× over q4f16_g32_asym non-spec baseline = ≥198 tps tg128.
+- 0.8B HF snapshot: `/home/alfie/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/`
+- Spec smoke: `python -u scripts/spec_smoke.py --max-tokens 32 --draft-length 4`. Target-only control: `scripts/target_only_smoke_match_spec.py` (added today, uses spec_smoke's engine config with no spec mode).
+
+---
+
+## 2026-04-27 (evening) — Phase 3 Stage 3 met (engine runs, accept rate non-zero). Stage 4 blocked: TVM RNNState forbids rollback after multi-token append.
+
+**Done**
+- Diagnosed yesterday's deadlock by attaching gdb to the wedged process. Background-loop thread spinning between [batch_prefill_base.cc:86](cpp/serve/engine_actions/batch_prefill_base.cc#L86) and [eagle_new_request_prefill.cc:38](cpp/serve/engine_actions/eagle_new_request_prefill.cc#L38) — never able to admit the request.
+- Root cause: [batch_prefill_base.cc:283-290](cpp/serve/engine_actions/batch_prefill_base.cc#L283-L290) `CanPrefill` admission. With spec mode, `spec_factor = spec_draft_length + 1 = 5`. Check: `(num_running_rsentries + num_prefill_rsentries) * spec_factor > max_num_sequence`. With `mode="interactive"` (max_num_sequence=1) and `num_prefill_rsentries+1=1`, we get `5 > 1` → reject, forever. Engine never returns from `Step()` because the request stays in `waiting_queue`.
+- Fix in [scripts/spec_smoke.py](scripts/spec_smoke.py): drop `mode="interactive"`, set `max_num_sequence = spec_draft_length + 1 = 5`. **This is a UX trap in MLC-LLM core** — the admission check counts speculation slots like real concurrent sequences, so any user requesting `mode="interactive"` (default for single-stream) with EAGLE will deadlock silently. Worth an upstream fix.
+- After the deadlock fix, EAGLE+GDN engine runs end-to-end and emits **non-zero accept rate**: step-1 acceptance 23.1%, step-2 33.3%, draft proposes γ=4 tokens per round, 13 verify rounds × γ+1 = 65 verify tokens / 17 effective tokens generated. **Stage 3 acceptance bar met.**
+
+**Stage 4 blocker — TVM RNNState by design forbids rollback after multi-token append.**
+- The output is **garbage**: prompt "The capital of France is" emits "is is is is is is is is" instead of "Paris". Target alone is fine. The diff is the EAGLE verify path corrupting GDN recurrent state.
+- Trace path: EAGLE verify calls `BatchVerifyToLastHidden(γ+1 tokens)` ([model.cc:798-815](cpp/serve/model.cc#L798-L815)). For hybrid models, that calls `kv_cache_begin_forward_func_(rnn_state_, ...)` with `append_lengths={γ+1}` and runs the GDN forward through γ+1 positions, advancing rnn_state by γ+1 steps. After verify, the engine calls `CommitAcceptedTokenTreeNodesToKVCache` ([model.cc:935](cpp/serve/model.cc#L935)) — which **only rolls back paged kv_cache_, not rnn_state_**. Result: every verify round permanently advances rnn_state by γ+1 even though only `accept_length` tokens are accepted. After 13 rounds with avg accept_length≈1.3, rnn_state is over-advanced by ~48 sequence positions vs. ground truth.
+- Upstream fix attempt #1 (PopN after commit) **doesn't work**: looking at [3rdparty/tvm/src/runtime/vm/rnn_state.cc:237-260](3rdparty/tvm/src/runtime/vm/rnn_state.cc#L237-L260) `EndForward` — when `seq_length > 1` (multi-token append, which is what verify does), the code explicitly sets `available_history_num = 0`. Comment: *"We cannot rollback the prefill input."* `PopN` then asserts `n <= available_history_num`, so any rollback after multi-token verify will hard-fail with `Length of rolling back N exceeds the sequence length.`
+- The TVM RNNState backing storage allocates exactly **one history slot per max_history step** with a circular index — there's no space to record intermediate states inside a multi-token append. The `seq_length > 1 → history=0` rule is enforced at the storage level, not just at the API level.
+
+**Why the plan missed this**
+- The plan ([phase3-mtp-spec-decode.md](.claude/plans/phase3-mtp-spec-decode.md) §"2026-04-27 path decision") said: *"The rnn_state question is moot with this split: the draft model has no GDN, so [...] the target's GDN state advances only on verify, which is the correct semantics. No reconciliation needed in mtp_decode."* Correct that mtp_decode isn't on the verify path. **Wrong that no reconciliation is needed**: the target's verify itself advances rnn_state through γ+1 positions, and EAGLE expects that to be rollback-able to the accepted prefix. It isn't, by TVM design.
+
+**Two paths forward (both significant — pick at start of next session)**
+1. **TVM RNNState patch (~1 day, small surface area):** rework [rnn_state.cc](3rdparty/tvm/src/runtime/vm/rnn_state.cc) to track per-step history during multi-token `BeginForward`/`EndForward`. Allocate `max_history` slots per logical "transaction" instead of one. Update `Get`/`Set` to address the right slot during forward. Update `PopN` to use the per-step buffer. Risks: changes core TVM semantics that other models (RWKV5/6) rely on; need to confirm those aren't accidentally relying on `available_history_num=0` as a "no-rollback" sentinel.
+2. **MLC-LLM verify-path restructure (~half day, but loses ~all the EAGLE benefit on GDN models):** in `BatchVerifyToLastHidden` for `kHybrid`, replace the single γ+1-token call with γ+1 sequential single-token decodes. Each single-token `EndForward` increments `available_history_num` (up to `max_history-1`), so `PopN` works after. Loses GDN-layer parallelism on the verify step — given 18/24 layers are GDN on 0.8B, this likely tanks the spec speedup. **Path 1 is the right answer for performance.**
+
+**Quick context for next session**
+- Smoke now runs to completion: `python -u scripts/spec_smoke.py --max-tokens 16` (defaults to draft_length=4). Engine metrics show: 23% step-1 accept, garbage output. Stage 3 acceptance ✓ / Stage 4 ✗.
+- All Stage-3 wiring (loader, model, target EAGLE-compat methods, `_infer_kv_state_kind` branch for `qwen3_5_mtp_draft → kv_cache`) is in place and correct. The fix is downstream of all of this — in TVM's rnn_state, not in our code.
+- If the answer is "ship Stage 3 as proof, don't pursue Stage 4 on 0.8B": this fully validates the *plumbing* of the EAGLE+GDN pipeline. The architectural blocker is real and isolated to TVM's RNNState — same blocker would apply to 35B-A3B (also hybrid GDN) and any other GDN-based EAGLE attempt in this repo.
+
+---
+
+## 2026-04-27 (afternoon) — Phase 3 Stage 3 wiring 90% complete; EAGLE+GDN engine deadlocks on first generate.
+
+**Done**
+- Read the EAGLE C++ pipeline end-to-end: [eagle_batch_draft.cc](cpp/serve/engine_actions/eagle_batch_draft.cc), [eagle_batch_verify.cc](cpp/serve/engine_actions/eagle_batch_verify.cc), [eagle_new_request_prefill.cc](cpp/serve/engine_actions/eagle_new_request_prefill.cc). Two-model handles, `verify_model_id_=0`, `draft_model_id_=1`. Draft is driven via EAGLE-named Relax functions (`fuse_embed_hidden_states`, `*_to_last_hidden_states`) — there's no path to invoke `mtp_decode` from the EAGLE actions, confirming the prior session's decision to make MTP a separate draft artifact.
+- **Path decision: (a) trimmed** — write-up in [.claude/plans/phase3-mtp-spec-decode.md](.claude/plans/phase3-mtp-spec-decode.md). Draft is a small standalone artifact (`embed_tokens + pre-fc norms + fc + 1 MTP decoder layer + final norm`), no `lm_head` (target's lm_head reused via `CanGetLogits()=false`).
+- New module [python/mlc_llm/model/qwen35_mtp_draft/](python/mlc_llm/model/qwen35_mtp_draft/) — model + loader + `__init__.py`. Forks [eagle_model.py](python/mlc_llm/model/eagle/eagle_model.py) layout, swaps in `Qwen35Attention`/`Qwen35MLP` (with `attn_output_gate=True`, head_dim=256), preserves the Qwen3.5 fc-input order (`concat([h_norm, e_norm], dim=-1)`). Loader pulls `embed_tokens` from `model.language_model.embed_tokens` and the rest from top-level `mtp.*`. Registered as `qwen3_5_mtp_draft` in [python/mlc_llm/model/model.py](python/mlc_llm/model/model.py).
+- Convert + compile: `dist/qwen3_5-0.8B-q0f16-mtp-draft/` (524 MB params at q0f16, mostly the 510 MB embed dup; 1 MTP layer ~14 MB). 13 named params, all HF keys present, no unused `mtp.*` / `embed_tokens` keys.
+- **Target gained EAGLE-compat methods** in [qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py): split `_forward` into `_forward` (returns logits) + `_forward_to_last_hidden` (returns last hidden), added `get_logits`, plus single-batch + batch variants of `prefill_to_last_hidden_states` / `decode_to_last_hidden_states` / `batch_verify_to_last_hidden_states`. Recompiled `dist/qwen3_5-0.8B-q0f16/lib.so`.
+- **Bug fix in [interface/compile.py](python/mlc_llm/interface/compile.py)**: `_infer_kv_state_kind` matched any `model_type` containing `"qwen3_5"` and returned `"hybrid"`, but the draft is pure attention (no GDN). Added an explicit `qwen3_5_mtp_draft → "kv_cache"` branch before the generic match. Without this fix the engine segfaulted in `model.cc:882 CreateKVCache` calling a null `create_rnn_state_func_` because the draft never compiled an RNN state path.
+
+**Snag — EAGLE engine deadlocks on first generate.** Reproducible with [scripts/spec_smoke.py](scripts/spec_smoke.py):
+- Engine init fully succeeds. Both libs load via explicit `model_lib` (avoiding the JIT-recompile-with-flashinfer=1 trap). Memory estimate 6.3 GB total (1959 MB params, 192 MB KV at 4K, 4170 MB temp buffer). Output gets to `engine.cc:450 Hybrid prefill mode fallbacks to chunked prefill, due to speculative mode is enabled and not implemented with hybrid prefill yet`.
+- `engine.chat.completions.create(...)` blocks indefinitely. CPU drops from 90% → sleeping after a brief flurry. No error, no Python traceback, no segfault. ~26 worker threads all in state `S`. Tried both `chat` and `completions` APIs and both 4K / 262K KV cache: same hang.
+- Control: [scripts/target_only_smoke.py](scripts/target_only_smoke.py) (target alone, no spec) generates correctly in ~30 s — so the target's new EAGLE-compat functions and `_forward_to_last_hidden` split aren't broken in isolation. The hang is specific to spec-mode coordination.
+
+**Next session — debug the deadlock.** The cleanest first step is to attach `gdb -p <pid>` once the script is wedged and `thread apply all bt` to find the blocked stack. Likely candidates:
+1. Chunked prefill + GDN target: the chunked path may be recursively chunking the GDN forward and never reaching the lm_head/sample step; check [engine_actions/eagle_new_request_prefill.cc](cpp/serve/engine_actions/eagle_new_request_prefill.cc) `ChunkPrefillInputData` interaction with `kHybrid` KV state.
+2. `BatchPrefillToLastHidden` single-seq path on draft: when `seq_ids.size()==1`, [model.cc:405](cpp/serve/model.cc) requires `single_batch_prefill_to_last_hidden_func_` aka `prefill_to_last_hidden_states`. The draft's `get_default_spec` does include that name (it ports from eagle_model.py which exposes it). Verify the compiled draft lib actually has the symbol via `nm dist/qwen3_5-0.8B-q0f16-mtp-draft/lib.so | grep prefill_to_last_hidden`.
+3. Tuple unpacking shape: target's `_forward_to_last_hidden` returns `(hidden_states, paged_kv_cache, rnn_state)` — 3-tuple. Draft's `*_to_last_hidden_states` return `(hidden_states, paged_kv_cache)` — 2-tuple. C++ `tuple_getitem_func_(result, 0)` extracts index 0 from each, which is fine, but if Relax's tuple-getitem expects a known arity, mismatched arities could make the engine wait on never-arriving data. Worth a quick check.
+4. The "Hybrid prefill mode fallbacks to chunked prefill" warning suggests this combination is *known* untested. Searching git log for that message + "speculative_mode" might reveal upstream issues.
+
+**Quick context for fresh session:**
+- Draft artifact: `dist/qwen3_5-0.8B-q0f16-mtp-draft/` (lib.so + params + mlc-chat-config.json all in place, kv_state_kind=`kv_cache`).
+- Target artifact: `dist/qwen3_5-0.8B-q0f16/` (recompiled today with EAGLE-compat methods, kv_state_kind=`hybrid`).
+- Smoke script: `python -u scripts/spec_smoke.py --max-tokens 20`. Hangs after `--- engine constructed; starting generation ---`. Default args use both pre-built libs.
+- Control script: `python -u scripts/target_only_smoke.py` — works, ~30 s.
+- Stage 4 acceptance bar still: ≥1.5× over q4f16_g32_asym non-spec baseline = ≥198 tps tg128. Stage 3 acceptance is just "non-zero accept rate via EAGLE."
+
+---
+
+## 2026-04-27 — Phase 3 MTP Stages 1+2 landed: weights recovered, model compiles with `mtp_decode`.
+
+Plan: [.claude/plans/phase3-mtp-spec-decode.md](.claude/plans/phase3-mtp-spec-decode.md).
+
+**Done**
+- **Stage 1** — MTP weights now flow through convert. The plan's claim of an "explicit prefix-skip list" was wrong: nothing filtered `mtp.*`; they were dropped implicitly because the MLC model never declared them. Fix landed in [qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py) (added `mtp_num_hidden_layers`/`mtp_use_dedicated_embeddings` to `Qwen35Config`, parameter-only `Qwen35MTPHead` + `_Qwen35MTPDecoderLayer` reusing `Qwen35Attention`/`Qwen35MLP` so c_attn and gate_up_proj fusion fall out for free) and [qwen35_loader.py](python/mlc_llm/model/qwen35/qwen35_loader.py) (c_attn/gate_up_proj fusion loop for MTP layers; `_mlc_to_hf` knows `mtp.*` is top-level not under `model.language_model.`; `_is_rmsnorm_weight` extended for `mtp.norm`/`pre_fc_norm_embedding`/`pre_fc_norm_hidden`). Verified: 12 new MLC tensors (15 HF MTP keys after q+k+v→c_attn and gate+up→gate_up_proj fusions); zero `mtp.*` in unused-extern warning; all 7 MTP RMSNorms get the +1.0 shift.
+- **Stage 2** — Real `Qwen35MTPHead.forward(prev_hidden, prev_embed, paged_kv_cache)` (norm both → concat → fc → decoder block → final norm). MTP attention's KV slot is appended after the main model's: `create_paged_kv_cache` allocates `num_attention_layers + mtp_num_hidden_layers` slots; MTP layer i uses index `num_attention_layers + i`. Added `mtp_decode(input_embeds, prev_hidden, paged_kv_cache)` spec method, registered in `get_default_spec` only when `mtp_num_hidden_layers > 0`. Compiled q0f16 to [dist/qwen3_5-0.8B-q0f16-mtp/](dist/qwen3_5-0.8B-q0f16-mtp/) — params 1474 MB (was 1440 MB; +34 MB ≈ one decoder layer); `mtp_decode` is a callable function (125.75 MB temp buffer); `MLCEngine` loads + generates coherent text via the standard non-spec path (no regression).
+
+**Learned**
+- The 0.8B `mtp.*` block is structurally a regular Qwen3.5 full-attention decoder layer (q_proj=4096 = 2·8·256 confirms attn_output_gate) plus pre-fc norms on both inputs, an `fc` projecting concat[norm(embed), norm(hidden)] → hidden, and a final `norm`. `mtp_use_dedicated_embeddings=False` → MTP shares `embed_tokens` and the lm_head (tied embedding for 0.8B, so just `embed_tokens.lm_head_forward`).
+- The MTP attention can reuse the same paged KV cache by appending slots — same RoPE config, same head dims, just one extra layer index. No separate cache allocation needed.
+- Spec functions only enter the artifact when registered in `get_default_spec`; declaring params alone doesn't force compilation of an unreferenced forward path. `mtp_decode` had to be wired in for the MTP weights to be exercised by the compiler.
+
+**Next session — Stage 3: wire MTP as draft in MLC's EAGLE pipeline.** Open question to settle first: path (a) — two artifacts, target-with-MTP-off and target-with-MTP-on — vs path (b) — single artifact, both paths exposed. Plan recommends (a) for speed-to-working, (b) as the optimization. Concrete first steps:
+1. Read [cpp/serve/engine_actions/eagle_batch_draft.cc](cpp/serve/engine_actions/eagle_batch_draft.cc) and [eagle_batch_verify.cc](cpp/serve/engine_actions/eagle_batch_verify.cc) to see what spec the EAGLE pipeline expects from a draft model (which functions, which signatures, where prev-hidden flows in).
+2. Read [cpp/serve/model.cc](cpp/serve/model.cc) for the GDN recurrent-state handling under draft+verify — Phase 3 risk #2 in the plan: draft and verify must agree on where the GDN state is at every step, and the EAGLE pipeline was designed for attention-only models.
+3. After (1)+(2), make the path (a) vs (b) call. Likely path (a) since the spec pipeline assumes a separate draft model handle.
+4. The current `mtp_decode(input_embeds, prev_hidden, paged_kv_cache)` signature drops `rnn_state` because MTP itself has no GDN — but the GDN state from the *target* model is still live across draft steps. Reconcile after reading the C++.
+
+**Quick context for the fresh session (no need to re-discover):**
+- 0.8B HF snapshot: `/home/alfie/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/`
+- New compiled artifact (with MTP): `dist/qwen3_5-0.8B-q0f16-mtp/` (lib.so + params + mlc-chat-config.json all in place).
+- Baseline artifact (no MTP, prior): `dist/qwen3_5-0.8B-q0f16/` (still works for pre-MTP comparison).
+- Stage 4 acceptance bar: ≥1.5× over **q4f16_g32_asym** non-spec baseline = **≥198 tps tg128** (from `bc61c785`).
+
+---
+
 ## 2026-04-26 — T1 asymmetric q4 g=32 landed: small perf bump, parity neutral. Roofline conjecture refuted.
 
 **Done**

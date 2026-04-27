@@ -50,6 +50,10 @@ class Qwen35Config(ConfigBase):
     linear_conv_kernel_dim: int = 4
     full_attention_interval: int = 4
     partial_rotary_factor: float = 0.25
+    # MTP (Multi-Token Prediction) — self-speculative decoding draft head.
+    # 0.8B ships with mtp_num_hidden_layers=1; weights live under `mtp.*` in HF.
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
     # Runtime
     context_window_size: int = 0
     prefill_chunk_size: int = 0
@@ -668,6 +672,78 @@ class Qwen35DecoderLayer(nn.Module):
         return out + residual
 
 
+# ============================================================================
+# MTP (Multi-Token Prediction) head — draft for self-speculative decoding
+# ============================================================================
+
+
+class _Qwen35MTPDecoderLayer(nn.Module):
+    """Single decoder block inside the MTP head. Always full attention (no GDN)."""
+
+    def __init__(self, config: Qwen35Config):
+        self.self_attn = Qwen35Attention(config)
+        self.mlp = Qwen35MLP(config)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
+        self.post_attention_layernorm = nn.RMSNorm(
+            config.hidden_size, -1, config.rms_norm_eps, bias=False
+        )
+
+
+class Qwen35MTPHead(nn.Module):
+    """Multi-Token Prediction head (DeepSeek-V3 / Qwen3.5 style).
+
+    Given the previous step's hidden state and the embedding of the (just-sampled)
+    token, predict the hidden state for the *next* token. The caller turns that
+    hidden into logits via the shared lm_head (or tied embedding).
+
+    KV cache slots: MTP's self-attention uses cache slots appended after the
+    main model's attention slots — i.e. layer index `num_attention_layers + i`
+    for the i-th MTP layer.
+    """
+
+    def __init__(self, config: Qwen35Config):
+        self.pre_fc_norm_embedding = nn.RMSNorm(
+            config.hidden_size, -1, config.rms_norm_eps, bias=False
+        )
+        self.pre_fc_norm_hidden = nn.RMSNorm(
+            config.hidden_size, -1, config.rms_norm_eps, bias=False
+        )
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.layers = nn.ModuleList(
+            [_Qwen35MTPDecoderLayer(config) for _ in range(config.mtp_num_hidden_layers)]
+        )
+        self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
+        self._kv_layer_offset = config.num_attention_layers
+        self._tp_shards = config.tensor_parallel_shards
+
+    def forward(
+        self,
+        prev_hidden: Tensor,
+        prev_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+    ) -> Tensor:
+        e_norm = self.pre_fc_norm_embedding(prev_embed)
+        h_norm = self.pre_fc_norm_hidden(prev_hidden)
+        h = self.fc(op.concat([h_norm, e_norm], dim=-1))
+        for i, layer in enumerate(self.layers):
+            kv_layer_idx = self._kv_layer_offset + i
+            residual = h
+            x = layer.input_layernorm(h)
+            x = layer.self_attn(x, paged_kv_cache, kv_layer_idx)
+            if self._tp_shards > 1:
+                h = op.ccl_allreduce(x, "sum") + residual
+            else:
+                h = x + residual
+            residual = h
+            x = layer.post_attention_layernorm(h)
+            x = layer.mlp(x)
+            if self._tp_shards > 1:
+                h = op.ccl_allreduce(x, "sum") + residual
+            else:
+                h = x + residual
+        return self.norm(h)
+
+
 class Qwen35Model(nn.Module):
     def __init__(self, config: Qwen35Config):
         self.embed_tokens = Qwen35Embedding(config.vocab_size, config.hidden_size)
@@ -705,6 +781,8 @@ class Qwen35LMHeadModel(nn.Module):
         self.tie_word_embeddings = config.tie_word_embeddings
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.mtp_num_hidden_layers > 0:
+            self.mtp = Qwen35MTPHead(config)
         self.dtype = config.dtype
         self.hidden_size = config.hidden_size
         self.num_hidden_layers = config.num_hidden_layers
@@ -745,13 +823,47 @@ class Qwen35LMHeadModel(nn.Module):
         hidden_states, state = self.model.forward(input_embed, paged_kv_cache, state)
         if logit_positions is not None:
             hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        logits = self._lm_head(hidden_states)
+        return logits, paged_kv_cache, state
+
+    def _lm_head(self, hidden_states: Tensor) -> Tensor:
         if self.tie_word_embeddings:
             logits = self.model.embed_tokens.lm_head_forward(hidden_states)
         else:
             logits = self.lm_head(hidden_states)
         if logits.dtype != "float32":
             logits = logits.astype("float32")
-        return logits, paged_kv_cache, state
+        return logits
+
+    def _forward_to_last_hidden(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        op_ext.configure()
+        hidden_states, state = self.model.forward(input_embed, paged_kv_cache, state)
+        return hidden_states, paged_kv_cache, state
+
+    def get_logits(self, hidden_states: Tensor) -> Tensor:
+        op_ext.configure()
+        return self._lm_head(hidden_states)
+
+    def prefill_to_last_hidden_states(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embed, paged_kv_cache, rnn_state)
+
+    def decode_to_last_hidden_states(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embed, paged_kv_cache, rnn_state)
 
     def batch_prefill(
         self,
@@ -777,6 +889,55 @@ class Qwen35LMHeadModel(nn.Module):
         rnn_state: RNNState,
     ):
         return self._forward(input_embeds, paged_kv_cache, rnn_state)
+
+    def batch_prefill_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+
+    def batch_decode_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+
+    def batch_verify_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+
+    def mtp_decode(
+        self,
+        input_embeds: Tensor,
+        prev_hidden: Tensor,
+        paged_kv_cache: PagedKVCache,
+    ):
+        """One step of the MTP draft head.
+
+        Args:
+            input_embeds: (batch, 1, hidden) — embedding of the just-sampled token.
+            prev_hidden: (batch, 1, hidden) — hidden state from the prior step
+                (target model's last hidden, or prior MTP step's output).
+        Returns:
+            (logits, paged_kv_cache) — logits for the *next* token.
+        """
+        op_ext.configure()
+        h = self.mtp(prev_hidden, input_embeds, paged_kv_cache)
+        if self.tie_word_embeddings:
+            logits = self.model.embed_tokens.lm_head_forward(h)
+        else:
+            logits = self.lm_head(h)
+        if logits.dtype != "float32":
+            logits = logits.astype("float32")
+        return logits, paged_kv_cache
 
     def create_rnn_state(
         self,
@@ -819,7 +980,8 @@ class Qwen35LMHeadModel(nn.Module):
             page_size=page_size,
             support_sliding_window=support_sliding_window,
             # Only attention layers use the KV cache
-            num_hidden_layers=self.num_attention_layers,
+            # MTP attention reuses the same paged KV cache; append one slot per MTP layer.
+            num_hidden_layers=self.num_attention_layers + self.config.mtp_num_hidden_layers,
             num_attention_heads=self.num_attention_heads // self.tensor_parallel_shards,
             num_key_value_heads=self.num_key_value_heads // self.tensor_parallel_shards,
             qk_head_dim=self.head_dim,
@@ -868,6 +1030,58 @@ class Qwen35LMHeadModel(nn.Module):
                     "effect_mode": "none",
                 },
             },
+            "get_logits": {
+                "hidden_states": nn.spec.Tensor(["seq_len", self.hidden_size], self.dtype),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "prefill_to_last_hidden_states": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "decode_to_last_hidden_states": {
+                "input_embed": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_prefill_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_decode_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_verify_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
             "create_paged_kv_cache": {
                 "max_batch_size": int,
                 "max_total_seq_len": int,
@@ -888,4 +1102,14 @@ class Qwen35LMHeadModel(nn.Module):
                 },
             },
         }
+        if self.config.mtp_num_hidden_layers > 0:
+            mod_spec["mtp_decode"] = {
+                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "prev_hidden": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            }
         return nn.spec.ModuleSpec.from_raw(mod_spec, self)

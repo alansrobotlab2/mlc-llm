@@ -941,6 +941,18 @@ class ModelImpl : public ModelObj {
                                                         accepted_leaf_indices_tuple);
   }
 
+  bool RollbackRNNStateVerifyAppend(int64_t seq_id, int64_t append_length) final {
+    if (kind != KVStateKind::kHybrid) {
+      // Pure attention models have no rnn_state; nothing to roll back.
+      return false;
+    }
+    TVM_FFI_ICHECK(ft_.rnn_state_rollback_verify_append_func_.defined())
+        << "Hybrid model requires vm.builtin.rnn_state_rollback_verify_append; rebuild TVM "
+           "with the rnn_state rollback patch.";
+    ft_.rnn_state_rollback_verify_append_func_(rnn_state_, seq_id, append_length);
+    return true;
+  }
+
   void EnableSlidingWindowForSeq(int64_t seq_id) final {
     if (this->kind == KVStateKind::kNone) {
       return;

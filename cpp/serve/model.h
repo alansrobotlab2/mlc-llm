@@ -268,6 +268,15 @@ class ModelObj : public Object {
       const std::vector<int64_t>& seq_ids, const std::vector<int64_t>& accepted_leaf_indices) = 0;
 
   /*!
+   * \brief Roll back the most recent multi-token RNN-state append (verify step) for the
+   * given sequence, restoring the recurrent state pointer to its pre-verify slot.
+   * The accompanying paged KV cache rollback is the caller's responsibility.
+   * \return True if the rollback was applied (hybrid model with rnn_state); false if the
+   *   model has no rnn_state component (kKVCache only) and the call is a no-op.
+   */
+  virtual bool RollbackRNNStateVerifyAppend(int64_t seq_id, int64_t append_length) = 0;
+
+  /*!
    * \brief Enabling sliding window for the given sequence.
    * It is a no-op if the model does not support sliding window.
    * \note Given this operation is tied with the underlying KV cache,

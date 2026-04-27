@@ -125,8 +125,50 @@ def huggingface(model_config: Qwen35Config, quantization: Quantization) -> Exter
                 ),
             )
 
+    # MTP head (lives at top-level `mtp.*` in HF, not under `model.language_model.`).
+    # Single layer block — fuse c_attn and gate_up_proj exactly as for the main layers.
+    for i in range(model_config.mtp_num_hidden_layers):
+        mlc_attn = f"mtp.layers.{i}.self_attn"
+        hf_attn = f"mtp.layers.{i}.self_attn"
+        mlc_name = f"{mlc_attn}.c_attn.weight"
+        if mlc_name in named_parameters:
+            mlc_param = named_parameters[mlc_name]
+            mapping.add_mapping(
+                mlc_name,
+                [
+                    f"{hf_attn}.q_proj.weight",
+                    f"{hf_attn}.k_proj.weight",
+                    f"{hf_attn}.v_proj.weight",
+                ],
+                functools.partial(
+                    lambda q, k, v, dtype: np.concatenate([q, k, v], axis=0).astype(dtype),
+                    dtype=mlc_param.dtype,
+                ),
+            )
+        mlc_mlp = f"mtp.layers.{i}.mlp"
+        hf_mlp = f"mtp.layers.{i}.mlp"
+        mlc_name = f"{mlc_mlp}.gate_up_proj.weight"
+        if mlc_name in named_parameters:
+            mlc_param = named_parameters[mlc_name]
+            mapping.add_mapping(
+                mlc_name,
+                [
+                    f"{hf_mlp}.gate_proj.weight",
+                    f"{hf_mlp}.up_proj.weight",
+                ],
+                functools.partial(
+                    lambda gate, up, dtype: np.concatenate([gate, up], axis=0).astype(dtype),
+                    dtype=mlc_param.dtype,
+                ),
+            )
+
     def _mlc_to_hf(mlc_name: str) -> str:
-        """Convert MLC param name to HF param name by adding language_model prefix."""
+        """Convert MLC param name to HF param name by adding language_model prefix.
+
+        MTP weights live at top-level `mtp.*` in both MLC and HF — pass through.
+        """
+        if mlc_name.startswith("mtp."):
+            return mlc_name
         if mlc_name.startswith("model."):
             return mlc_name.replace("model.", f"{hf}.", 1)
         return mlc_name
@@ -136,6 +178,7 @@ def huggingface(model_config: Qwen35Config, quantization: Quantization) -> Exter
 
         Qwen3_5RMSNorm uses: output = norm(x) * (1.0 + weight)
           - input_layernorm, post_attention_layernorm, model.norm, q_norm, k_norm
+          - MTP head: pre_fc_norm_embedding, pre_fc_norm_hidden, mtp.norm
         Qwen3_5RMSNormGated uses: output = norm(x) * weight * silu(gate)
           - linear_attn.norm (gated norm) — does NOT get +1
         """
@@ -145,6 +188,9 @@ def huggingface(model_config: Qwen35Config, quantization: Quantization) -> Exter
             or name.endswith("q_norm.weight")
             or name.endswith("k_norm.weight")
             or name == "model.norm.weight"
+            or name == "mtp.norm.weight"
+            or name.endswith("pre_fc_norm_embedding.weight")
+            or name.endswith("pre_fc_norm_hidden.weight")
         )
 
     # All remaining parameters: direct 1:1 mapping with HF prefix

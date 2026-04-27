@@ -100,6 +100,10 @@ def _infer_kv_state_kind(model_type) -> str:
         return "rnn_state"
     if "medusa" in model_type:
         return "none"
+    # The Qwen3.5 MTP draft is pure-attention (no GDN), even though its model_type
+    # contains "qwen3_5". Must come before the generic qwen3_5 branch.
+    if model_type == "qwen3_5_mtp_draft":
+        return "kv_cache"
     if "qwen3_5" in model_type:
         return "hybrid"
     return "kv_cache"

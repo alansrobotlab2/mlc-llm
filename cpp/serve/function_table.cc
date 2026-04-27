@@ -262,6 +262,14 @@ void FunctionTable::_InitFunctions() {
   this->kv_cache_popn_func_ = get_global_func("vm.builtin.kv_state_popn");
   this->kv_cache_commit_accepted_token_tree_nodes_func_ =
       get_global_func("vm.builtin.attention_kv_cache_commit_accepted_token_tree_nodes");
+  // RNN-state-only rollback used by hybrid (attention + GDN) speculative decoding to
+  // undo the multi-token verify append on partial accept. Required only on hybrid
+  // models; for kKVCache-only / kRNNState-only configurations the field stays unset
+  // and Model::RollbackRNNStateVerifyAppend is a no-op.
+  if (this->model_metadata_.kv_state_kind == KVStateKind::kHybrid) {
+    this->rnn_state_rollback_verify_append_func_ =
+        get_global_func("vm.builtin.rnn_state_rollback_verify_append");
+  }
   this->kv_cache_get_num_available_pages_func_ =
       Function::GetGlobalRequired("vm.builtin.attention_kv_cache_get_num_available_pages");
   this->kv_cache_get_total_sequence_length_func_ =
