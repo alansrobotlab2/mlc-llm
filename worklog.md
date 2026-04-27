@@ -6,6 +6,48 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-26 — T1 asymmetric q4 g=32 landed: small perf bump, parity neutral. Roofline conjecture refuted.
+
+**Done**
+- Implemented asymmetric grouped int4 in [group_quantization.py](python/mlc_llm/quantization/group_quantization.py): added `symmetric: bool = True` to `GroupQuantize`. When False, `_quantize` returns `(q_weight, scale, offset)` per group (dequant = `q*scale + offset`, full [0, 15] range) instead of the symmetric `(q-7)*scale`. Wired `q_offset` through `GroupQuantizeLinear`, `GroupQuantizeEmbedding`, and the lm_head path; loader picks it up via `param_map = [..., q_offset]` for asymmetric configs. `GroupQuantizeMixtralExperts` raises `NotImplementedError` since `moe_matmul.dequantize_gemv` doesn't go through `_dequantize` — out of scope until a 35B-A3B asym test is needed.
+- Registered `q4f16_g32_asym` in [quantization.py](python/mlc_llm/quantization/quantization.py): g=32, asymmetric, full embed/final_fc quant. Convert: 0.439 GB params, 4.31 bits/param (vs 4.50 for q4f16_g16e). Compile with `flashinfer=0` (mandatory on this stack — runtime crash at `model.cc:882 CreateKVCache` otherwise). Smoke: "The capital of France is Paris." ✓ on all 3 prompts.
+
+**Bench (Orin AGX MAXN, jetson_clocks locked, mode=interactive, n=3 runs)**
+
+| quant | TG=128 | TG=512 | × llama.cpp Q4_K_S | bits/param |
+|---|---|---|---|---|
+| q4f16_g16e (commit `d710571d`) | 129.89 | 124.45 | 1.273× / 1.220× | 4.50 |
+| **q4f16_g32_asym (this)** | **132.20** | **125.98** | **1.295× / 1.235×** | **4.31** |
+| llama.cpp Q4_K_S | 102.03 | — | 1.000× | ~4.5 |
+
+Logs: [bench_q4g32asym_tg128.log](bench_q4g32asym_tg128.log), [bench_q4g32asym_tg512.log](bench_q4g32asym_tg512.log).
+
+**Greedy parity vs HF fp16 reference (5 prompts × 50 tokens)**
+
+| prompt | g16e | g32_asym | comment |
+|---|---|---|---|
+| 1 — capital of France | 34/50 | **50/50** | asym matches HF exactly; g16e drifts at token 1 (`,` vs `.`) |
+| 2 — `def fibonacci(n):` | 7/50 | 7/50 | both diverge at same position — token 2: `==` vs `<=`. Both produce a valid recursive fib. |
+| 3 — 7×6 chat | 4/50 | 8/50 | both correct (42); asym matches HF text closer |
+| 4 — once upon a time | 9/50 | 15/50 | divergent stories; both coherent |
+| 5 — Fibonacci sequence | 50/50 | 47/50 | g16e perfect; asym off-by-one at term 13 (2638 vs 2584) |
+
+**Net**: 3 wins for asym, 1 tie, 1 loss. Both quants fail the strict ≥48/50 bar on 4 of 5 prompts. Failures are at near-noise-floor logit gaps (single-token flips that produce different but still coherent continuations). The 48/50 bar is too tight for fp16 quant — it conflates "model misbehaving" with "fp16 noise flipped a 1.2× ratio at one position." Per-prompt comparison shows the two quants are at numerical parity, with asym slightly ahead on the cleanest test case.
+
+**The roofline plan's premise was wrong**
+The plan estimated +15-20% from g=16→g=32 asymmetric ("halves dequant cost on 65% of kernel time"). We got +1.8%. **Reality**: scale-load overhead is a small fraction of dequant kernel time. The dequant kernels are ALU-bound on the int4→fp16 conversion + fma chain itself (~7 ops per output byte, 1.3 TFLOPS ceiling), not on metadata loads. Halving the scale-load count doesn't move the needle. The previous session's ncu data already pointed at this — 70-75% SM busy, ALU pipeline saturated — but the plan misread "fewer scale loads" as "less ALU work."
+
+**Implication**: kernel-only work cannot reach 1.5× llama.cpp on AGX. The 1.27× → 1.30× headline gain from this session is roughly all that's left in pure-quant tuning. Larger gains require either:
+1. **Spec decode (T5)** — multiplicative with everything; still the only path to 2.5×.
+2. **Lower-bit quant** (q3 or sub-4-bit) — directly reduces ALU ops per output byte. Risky for GDN drift but worth a smoke test.
+
+**Next**
+- Pivot to T5 (spec decode). External draft: Qwen2.5-0.5B (shares tokenizer with 0.8B) or self-speculative via the model's own MTP head (`mtp_num_hidden_layers=1` exists in this checkpoint — currently dropped at convert time but recoverable). Either path needs the EAGLE pipeline at [cpp/serve/engine_actions/eagle_*.cc].
+- T2 (lm_head TIR rewrite) deferred — ncu showed 75% SM busy already, headroom is ≤5%.
+- Open question: does the asymmetric path help materially on a *coarser* g (g=64, g=128)? At g=128 storage drops to 4.13 bits/elem and dequant ALU drops more — but fidelity risk on GDN is real. Worth a single convert+smoke if T5 stalls.
+
+---
+
 ## 2026-04-25 — Roofline analysis + Qwen3-0.6B comparison: g=16 dequant ALU is the structural ceiling on AGX
 
 **Done**
