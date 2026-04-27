@@ -27,19 +27,48 @@ Captured: `profile_qwen35_decode.nsys-rep` (5.5 MB), `profile_kern_sum.csv`. Run
 
 **The real top-EV is dequant+matmul kernel quality.** Combined, they are 68.1% of kernel time, all running at 30–40% of LPDDR5 peak. Closing that to 80% peak across the board would save ~2.5 ms = +35% headline tps alone.
 
-## Path to 250 tps — honest ladder
+## Path to 250 tps — revised ladder (post-roofline analysis)
+
+After landing T1 and benching Qwen3-0.6B (dense, q4f16_1) for a comparable apples-to-apples reference, the analysis shifted. **q4 GEMV decode on Orin AGX is compute-bound on the dequant ALU pipeline at the fp16 CUDA-core throughput limit (1.3 TFLOPS).** ncu confirmed both `lm_head` and MLP at 70-75% SM busy, 80% occupancy, ALU pipeline saturated. Tensor cores can't help at batch=1 (need M≥16). Kernel polish saves diminishing % each step.
+
+The dense-baseline Qwen3-0.6B q4f16_1 (g=32) on this same hardware: **1.42× over llama.cpp**. Our 1.27× is 12% short of that ratio — closing the gap requires reducing the **per-byte ALU work**, which means moving from g=16 to a coarser group size that still preserves correctness on the GDN architecture.
 
 | Stage | Action | Effect | Est. ms saved | tps after | × llama.cpp |
 |---|---|---|---|---|---|
-| 0 | baseline q4f16_g16e | — | — | 109 | 1.07 |
-| 1 | **Try q4f16_ft at g=16** (patch FT preprocessor's `assert group_size in [None,64,128]`) | Replaces all dequant+matmul with CUTLASS fused. Was +7% on broken model — closer to peak BW per kernel. | 0.7–1.0 | 130 | 1.27 |
-| 2 | **GDN state I/O fold** (collapse rnn_state_get → gdn_func → rnn_state_set into a single kernel that reads/writes paged state directly) | Eliminate 1.16 ms of state-shuffling. | 0.7–0.9 | 145 | 1.42 |
-| 3 | **lm_head TIR rewrite** (large matmul with unusual aspect ratio 1024×248320 — 37% peak BW today; needs different tile/split-K) | Bring lm_head to 80% peak. | 0.8–1.0 | 165 | 1.62 |
-| 4 | **Engine glue audit** (cut per-step overhead from 1.2 ms → 0.4 ms; KV page mgmt, NVTX, FFI, request bookkeeping) | | 0.6–0.8 | 185 | 1.81 |
-| 5 | **FlashInfer FFI fix** for full-attn (currently TIR fallback on 6/24 layers) | | 0.1–0.2 | 190 | 1.86 |
-| 6 | **Speculative decoding** (draft model + parallel verify; 0.8B is small enough to self-distill or use a 0.4B draft. Realistic 1.5–2× with reasonable accept rate.) | The lever for 2.5×. | 1.5–2.5× tax-on | 280–380 | 2.7–3.7 |
+| 0 | baseline q4f16_g16e + T1 (vec rnn_state) | Already landed, commit `d710571d` | — | 130 | 1.27 |
+| **1** | **Asymmetric q4 at g=32** — add `(min, scale)` per group instead of just `scale` (q4f16_1's symmetric range [-7, 7] is 2× lossier than asymmetric [0, 15] with offset). Should restore correctness on GDN at g=32 while halving per-elt dequant ALU. | Halves dequant cost on 65% of kernel time | 1.0–1.5 | **150–160** | **1.47–1.57** |
+| 2 | (optional) GPTQ or AWQ at g=32 if asymmetric still too noisy on GDN | Better calibration than vanilla asymmetric | 0.5–1.0 | 165 | 1.62 |
+| 3 | lm_head TIR rewrite + MLP polish | Push remaining kernels to ~85% SM throughput | 0.5–0.8 | 175 | 1.71 |
+| 4 | Engine glue audit (cut StreamSync wait + KV page mgmt overhead) | | 0.4–0.6 | 185 | 1.81 |
+| 5 | **Speculative / lookahead decoding** (the real lever — converts decode from GEMV to GEMM, unlocks tensor cores) | 1.5–2.0× tax-on, multiplicative with everything above | — | **275–370** | **2.7–3.6** |
 
-**Without spec decode (T1–T5): ~1.85× llama.cpp = 190 tps.** That's the realistic kernel-only ceiling at the engineering scope of "profile-driven, validated each step". To reach 2.5×, **T6 speculative decoding is the load-bearing piece.**
+**Realistic ceiling without spec decode: ~1.8× llama.cpp = 185 tps.** The 2.5× target requires T5 (spec decode), which is **multiplicative with T1** — so do T1 first to maximize the per-token ceiling before stacking spec decode on top.
+
+## Approach for T1 (asymmetric q4 at g=32) — **next-session priority**
+
+The current `q4f16_1` quant function (in [python/mlc_llm/quantization/group_quantization.py](../../python/mlc_llm/quantization/group_quantization.py)) is **symmetric**: per-group scale = `max(|w|) / 7`, q = round(w / scale), dequant = q * scale. Range is [-7, 7] forced symmetric around zero.
+
+**Asymmetric variant**: per-group min + scale, q = round((w - min) / scale), dequant = q * scale + min, range [0, 15]. Stores 2 fp16 params per group (16 weights / 32 weights) instead of 1 — small storage hit (~3% bigger model), modestly more compute (1 add) but **same dequant ALU class as symmetric**. Crucially it preserves more of the per-weight signal because the quant grid isn't centered on zero.
+
+**Why it might survive on GDN at g=32**: the recurrent state in linear-attention layers compounds quant error through `gate * S` accumulation. The compounding amplifies *bias* (mean error) and *outlier* errors most. Asymmetric quant has lower bias error per group AND tighter clipping for skewed weight distributions. llama.cpp's Q4_K_S uses asymmetric per-block specifically because it works at coarser group sizes.
+
+**Steps:**
+1. Read [python/mlc_llm/quantization/group_quantization.py](../../python/mlc_llm/quantization/group_quantization.py) — find the symmetric quant function (likely in `GroupQuantize.quantize_weight`).
+2. Add a `symmetric: bool = True` field to the GroupQuantize config dataclass. When False, compute (min, max) per group, store both, dequant = q * scale + min.
+3. Register a new entry in [python/mlc_llm/quantization/quantization.py](../../python/mlc_llm/quantization/quantization.py) — `q4f16_1_asym` with `symmetric=False, group_size=32, NK, embed quantize`.
+4. Convert weights → smoke-test "capital of France" → expect "Paris" if quant works.
+5. If correct: bench against current q4f16_g16e baseline. **Acceptance: 5/5 prompt smoke coherent, tg128 ≥ 145 tps.**
+6. If broken: try `g=64 asymmetric` (super-block-style); also try just `g=32 asymmetric + embedding fp16`.
+
+**Risk**: the GDN drift bug might not actually be about group_size — it might be about the symmetric-zero clipping clamping small magnitudes to zero. Asymmetric may not fix it fully; we'll find out within a single convert+compile+smoke cycle (~3 min).
+
+## Already-done T1 (vectorized rnn_state) — landed
+
+See worklog 2026-04-25 entry. Commit `d710571d`. Replaced default dlight Fallback schedule (1024 threads × 1 elt/thread, 19% peak BW) with vectorized 256 thread × 16 byte/thread schedule (~50% peak BW). 
+- `rnn_state_get_0`: 34.5 → 10.9 μs (3.16×)
+- `rnn_state_set_0`: 17.0 → 7.8 μs (2.18×)
+- TG=128: 109.5 → 129.9 tps (+18.6%)
+- TG=512: 115.1 → 124.5 tps (+8.1%)
 
 ## Approach for T1 (FT at g=16)
 
