@@ -37,6 +37,7 @@ class GroupQuantize:
     linear_weight_layout: Literal["KN", "NK"]
     quantize_embedding: bool = True
     quantize_final_fc: bool = True
+    symmetric: bool = True
 
     num_elem_per_storage: int = 0
     num_storage_per_group: int = 0
@@ -120,10 +121,11 @@ class GroupQuantize:
                     and not is_moe_gate(name, node)
                 ):
                     weight_name = f"{name}.weight"
-                    self.quant_map.param_map[weight_name] = [
-                        f"{name}.q_weight",
-                        f"{name}.q_scale",
-                    ]
+                    self.quant_map.param_map[weight_name] = (
+                        [f"{name}.q_weight", f"{name}.q_scale", f"{name}.q_offset"]
+                        if not self.config.symmetric
+                        else [f"{name}.q_weight", f"{name}.q_scale"]
+                    )
                     self.quant_map.map_func[weight_name] = partial(
                         self.config.quantize_weight,
                         output_transpose=self.config.linear_weight_layout == "KN",
@@ -131,13 +133,20 @@ class GroupQuantize:
                     return GroupQuantizeLinear.from_linear(node, self.config)
                 if isinstance(node, nn.Embedding) and self.config.quantize_embedding:
                     weight_name = f"{name}.weight"
-                    self.quant_map.param_map[weight_name] = [
-                        f"{name}.q_weight",
-                        f"{name}.q_scale",
-                    ]
+                    self.quant_map.param_map[weight_name] = (
+                        [f"{name}.q_weight", f"{name}.q_scale", f"{name}.q_offset"]
+                        if not self.config.symmetric
+                        else [f"{name}.q_weight", f"{name}.q_scale"]
+                    )
                     self.quant_map.map_func[weight_name] = self.config.quantize_weight
                     return GroupQuantizeEmbedding.from_embedding(node, self.config)
                 if isinstance(node, MixtralExperts):
+                    if not self.config.symmetric:
+                        raise NotImplementedError(
+                            "Asymmetric GroupQuantize is not yet wired through "
+                            "GroupQuantizeMixtralExperts (moe_matmul kernels). "
+                            "Use a symmetric quantization for MoE models."
+                        )
                     weight_name = f"{name}.weight"
                     self.quant_map.param_map[weight_name] = [
                         f"{name}.q_weight",
@@ -158,8 +167,8 @@ class GroupQuantize:
         scale: te.Tensor,
         axis: int,
         out_shape: Optional[List[tirx.PrimExpr]] = None,  # noqa: UP006
+        offset: Optional[te.Tensor] = None,
     ):
-        tir_max_int = tirx.const(self.max_int_value, self.model_dtype)
         float_weight = convert_uint_to_float(
             weight,
             DataType(self.quantize_dtype).bits,
@@ -173,15 +182,26 @@ class GroupQuantize:
             out_shape = weight.shape
             out_shape[axis] *= self.num_elem_per_storage
         axis = axis if axis >= 0 else len(out_shape) + axis
+        if offset is None:
+            tir_max_int = tirx.const(self.max_int_value, self.model_dtype)
+            return te.compute(
+                shape=out_shape,
+                fcompute=lambda *idx: tirx.multiply(
+                    tirx.subtract(
+                        float_weight(*idx),
+                        tir_max_int,
+                    ),
+                    scale(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :]),
+                ),
+                name="dequantize",
+            )
         return te.compute(
             shape=out_shape,
             fcompute=lambda *idx: tirx.multiply(
-                tirx.subtract(
-                    float_weight(*idx),
-                    tir_max_int,
-                ),
+                float_weight(*idx),
                 scale(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :]),
-            ),
+            )
+            + offset(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :]),
             name="dequantize",
         )
 
@@ -237,54 +257,126 @@ class GroupQuantize:
         weight: te.Tensor,
         axis: int = -1,
         output_transpose: bool = False,
-    ) -> Tuple[te.Tensor, te.Tensor]:  # noqa: UP006
-        """Group quantization for weight tensor, defined in tensor expression."""
-        max_int = tirx.const(self.max_int_value, self.model_dtype)
+    ) -> Union[Tuple[te.Tensor, te.Tensor], Tuple[te.Tensor, te.Tensor, te.Tensor]]:  # noqa: UP006
+        """Group quantization for weight tensor, defined in tensor expression.
+
+        Symmetric (default): returns (q_weight, scale).  dequant = (q - max_int) * scale.
+        Asymmetric: returns (q_weight, scale, offset).  dequant = q * scale + offset.
+        """
         shape = weight.shape
         axis = axis if axis >= 0 else len(shape) + axis
         k = shape[axis]
-        # compute scale per group
-        r = te.reduce_axis((0, self.group_size), name="r")
         num_group = tirx.ceildiv(k, self.group_size)
         scale_shape = (*shape[:axis], num_group, *shape[axis + 1 :])
-        max_abs = te.compute(
-            shape=scale_shape,
-            fcompute=lambda *idx: te.max(
-                tirx.if_then_else(
-                    idx[axis] * self.group_size + r < k,
-                    te.abs(
+
+        if self.symmetric:
+            max_int = tirx.const(self.max_int_value, self.model_dtype)
+            r = te.reduce_axis((0, self.group_size), name="r")
+            max_abs = te.compute(
+                shape=scale_shape,
+                fcompute=lambda *idx: te.max(
+                    tirx.if_then_else(
+                        idx[axis] * self.group_size + r < k,
+                        te.abs(
+                            weight(
+                                *idx[:axis],
+                                idx[axis] * self.group_size + r,
+                                *idx[axis + 1 :],
+                            )
+                        ),
+                        te.min_value(self.model_dtype),
+                    ),
+                    axis=r,
+                ),
+                name="max_abs_value",
+            )
+            scale = te.compute(
+                scale_shape,
+                lambda *idx: max_abs(*idx).astype(self.model_dtype) / max_int,
+                name="scale",
+            )
+            scaled_weight = te.compute(
+                shape=weight.shape,
+                fcompute=lambda *idx: tirx.min(
+                    tirx.max(
+                        tirx.round(
+                            weight(*idx)
+                            / scale(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :])
+                            + max_int
+                        ),
+                        tirx.const(0, self.model_dtype),
+                    ),
+                    max_int * 2,
+                ).astype(self.storage_dtype),
+            )
+            offset = None
+        else:
+            # Range [0, 2*max_int+1] (e.g. 0..15 for int4) — asymmetric uses the full grid.
+            max_int_full = tirx.const(2 * self.max_int_value + 1, self.model_dtype)
+            r_max = te.reduce_axis((0, self.group_size), name="r_max")
+            max_val = te.compute(
+                shape=scale_shape,
+                fcompute=lambda *idx: te.max(
+                    tirx.if_then_else(
+                        idx[axis] * self.group_size + r_max < k,
                         weight(
                             *idx[:axis],
-                            idx[axis] * self.group_size + r,
+                            idx[axis] * self.group_size + r_max,
                             *idx[axis + 1 :],
-                        )
+                        ),
+                        te.min_value(self.model_dtype),
                     ),
-                    te.min_value(self.model_dtype),
+                    axis=r_max,
                 ),
-                axis=r,
-            ),
-            name="max_abs_value",
-        )
-        scale = te.compute(
-            scale_shape,
-            lambda *idx: max_abs(*idx).astype(self.model_dtype) / max_int,
-            name="scale",
-        )
-        # compute scaled weight
-        scaled_weight = te.compute(
-            shape=weight.shape,
-            fcompute=lambda *idx: tirx.min(
-                tirx.max(
-                    tirx.round(
-                        weight(*idx)
-                        / scale(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :])
-                        + max_int
+                name="max_value",
+            )
+            r_min = te.reduce_axis((0, self.group_size), name="r_min")
+            min_val = te.compute(
+                shape=scale_shape,
+                fcompute=lambda *idx: te.min(
+                    tirx.if_then_else(
+                        idx[axis] * self.group_size + r_min < k,
+                        weight(
+                            *idx[:axis],
+                            idx[axis] * self.group_size + r_min,
+                            *idx[axis + 1 :],
+                        ),
+                        te.max_value(self.model_dtype),
                     ),
-                    tirx.const(0, self.model_dtype),
+                    axis=r_min,
                 ),
-                max_int * 2,
-            ).astype(self.storage_dtype),
-        )
+                name="min_value",
+            )
+            scale = te.compute(
+                scale_shape,
+                lambda *idx: ((max_val(*idx) - min_val(*idx)).astype(self.model_dtype))
+                / max_int_full,
+                name="scale",
+            )
+            offset = te.compute(
+                scale_shape,
+                lambda *idx: min_val(*idx).astype(self.model_dtype),
+                name="offset",
+            )
+            scaled_weight = te.compute(
+                shape=weight.shape,
+                fcompute=lambda *idx: tirx.min(
+                    tirx.max(
+                        tirx.round(
+                            (
+                                weight(*idx)
+                                - offset(
+                                    *idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :]
+                                )
+                            )
+                            / scale(*idx[:axis], idx[axis] // self.group_size, *idx[axis + 1 :])
+                        ),
+                        tirx.const(0, self.model_dtype),
+                    ),
+                    max_int_full,
+                ).astype(self.storage_dtype),
+            )
+
         # compute quantized weight per storage
         num_storage = self.num_storage_per_group * num_group
         quantized_weight_shape = (*shape[:axis], num_storage, *shape[axis + 1 :])
@@ -303,7 +395,11 @@ class GroupQuantize:
                 )
             quantized_weight = topi.transpose(quantized_weight)
             scale = topi.transpose(scale)
-        return quantized_weight, scale
+            if offset is not None:
+                offset = topi.transpose(offset)
+        if offset is None:
+            return quantized_weight, scale
+        return quantized_weight, scale, offset
 
 
 class GroupQuantizeLinear(nn.Module):
@@ -339,12 +435,17 @@ class GroupQuantizeLinear(nn.Module):
                 config.storage_dtype,
             )
             self.q_scale = nn.Parameter((num_group, out_features), config.model_dtype)
+            offset_shape = (num_group, out_features)
         else:
             self.q_weight = nn.Parameter(
                 (out_features, config.num_storage_per_group * num_group),
                 config.storage_dtype,
             )
             self.q_scale = nn.Parameter((out_features, num_group), config.model_dtype)
+            offset_shape = (out_features, num_group)
+        self.q_offset = (
+            nn.Parameter(offset_shape, config.model_dtype) if not config.symmetric else None
+        )
         if bias:
             self.bias = nn.Parameter(
                 (out_features,), config.model_dtype if out_dtype is None else out_dtype
@@ -385,6 +486,8 @@ class GroupQuantizeLinear(nn.Module):
             shard = src.weight.attrs["shard_strategy"]
             apply_sharding(shard, f"{shard.name}_q_weight", quantized_linear.q_weight)
             apply_sharding(shard, f"{shard.name}_q_scale", quantized_linear.q_scale)
+            if quantized_linear.q_offset is not None:
+                apply_sharding(shard, f"{shard.name}_q_offset", quantized_linear.q_offset)
         return quantized_linear
 
     def forward(self, x: nn.Tensor) -> nn.Tensor:
@@ -401,34 +504,54 @@ class GroupQuantizeLinear(nn.Module):
         ret : nn.Tensor
             The output tensor for the group quantized linear layer.
         """
-        w = nn.op.tensor_expr_op(
-            lambda weight, scale: self.config._dequantize(
-                weight,
-                scale,
-                axis=self.config.linear_quant_axis,
-                out_shape=(
-                    [
-                        (
-                            tirx.IntImm("int64", self.out_features)
-                            if isinstance(self.out_features, int)
-                            else weight.shape[0]
-                        ),  # Reuse same tirx.Var for symbolic shape (after Exporter)
-                        tirx.IntImm("int64", self.in_features),
-                    ]
-                    if self.config.linear_weight_layout == "NK"
-                    else [
-                        tirx.IntImm("int64", self.in_features),
-                        (
-                            tirx.IntImm("int64", self.out_features)
-                            if isinstance(self.out_features, int)
-                            else weight.shape[1]
-                        ),  # Reuse same tirx.Var for symbolic shape (after Exporter)
-                    ]
+        is_nk = self.config.linear_weight_layout == "NK"
+        out_features_int = isinstance(self.out_features, int)
+
+        def _make_out_shape(weight):
+            # Reuse the same tirx.Var for symbolic shape (after Exporter)
+            return (
+                [
+                    (
+                        tirx.IntImm("int64", self.out_features)
+                        if out_features_int
+                        else weight.shape[0]
+                    ),
+                    tirx.IntImm("int64", self.in_features),
+                ]
+                if is_nk
+                else [
+                    tirx.IntImm("int64", self.in_features),
+                    (
+                        tirx.IntImm("int64", self.out_features)
+                        if out_features_int
+                        else weight.shape[1]
+                    ),
+                ]
+            )
+
+        if self.q_offset is None:
+            w = nn.op.tensor_expr_op(
+                lambda weight, scale: self.config._dequantize(
+                    weight,
+                    scale,
+                    axis=self.config.linear_quant_axis,
+                    out_shape=_make_out_shape(weight),
                 ),
-            ),
-            name_hint="dequantize",
-            args=[self.q_weight, self.q_scale],
-        )
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale],
+            )
+        else:
+            w = nn.op.tensor_expr_op(
+                lambda weight, scale, offset: self.config._dequantize(
+                    weight,
+                    scale,
+                    axis=self.config.linear_quant_axis,
+                    out_shape=_make_out_shape(weight),
+                    offset=offset,
+                ),
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale, self.q_offset],
+            )
         if self.config.linear_weight_layout == "NK":
             w = nn.op.permute_dims(w)
         x = nn.op.matmul(x, w, out_dtype=self.out_dtype)
@@ -443,6 +566,8 @@ class GroupQuantizeLinear(nn.Module):
         """
         self.q_weight.to(dtype=dtype)
         self.q_scale.to(dtype=dtype)
+        if self.q_offset is not None:
+            self.q_offset.to(dtype=dtype)
         if self.bias is not None and self.out_dtype is None:
             self.bias.to(dtype=dtype)
         if dtype is not None and isinstance(getattr(self, "dtype", None), str):
@@ -461,6 +586,11 @@ class GroupQuantizeEmbedding(nn.Module):
             (num, config.num_storage_per_group * num_group), config.storage_dtype
         )
         self.q_scale = nn.Parameter((num, num_group), config.model_dtype)
+        self.q_offset = (
+            nn.Parameter((num, num_group), config.model_dtype)
+            if not config.symmetric
+            else None
+        )
 
     @staticmethod
     def from_embedding(embedding: nn.Embedding, config: GroupQuantize) -> "GroupQuantizeEmbedding":
@@ -497,23 +627,38 @@ class GroupQuantizeEmbedding(nn.Module):
         ret : nn.Tensor
             The output tensor for the embedding layer.
         """
-        w = nn.op.tensor_expr_op(
-            lambda weight, scale: self.config._dequantize(
-                weight,
-                scale,
-                axis=-1,
-                out_shape=[
-                    (
-                        tirx.IntImm("int64", self.num)
-                        if isinstance(self.num, int)
-                        else weight.shape[0]
-                    ),  # Reuse same tirx.Var for symbolic shape (after Exporter)
-                    tirx.IntImm("int64", self.dim),
-                ],
-            ),
-            name_hint="dequantize",
-            args=[self.q_weight, self.q_scale],
-        )
+        num_int = isinstance(self.num, int)
+
+        def _make_out_shape(weight):
+            # Reuse same tirx.Var for symbolic shape (after Exporter)
+            return [
+                tirx.IntImm("int64", self.num) if num_int else weight.shape[0],
+                tirx.IntImm("int64", self.dim),
+            ]
+
+        if self.q_offset is None:
+            w = nn.op.tensor_expr_op(
+                lambda weight, scale: self.config._dequantize(
+                    weight,
+                    scale,
+                    axis=-1,
+                    out_shape=_make_out_shape(weight),
+                ),
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale],
+            )
+        else:
+            w = nn.op.tensor_expr_op(
+                lambda weight, scale, offset: self.config._dequantize(
+                    weight,
+                    scale,
+                    axis=-1,
+                    out_shape=_make_out_shape(weight),
+                    offset=offset,
+                ),
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale, self.q_offset],
+            )
         if x.ndim == 1:
             return nn.op.take(w, x, axis=0)
         return nn.op.reshape(
@@ -535,23 +680,37 @@ class GroupQuantizeEmbedding(nn.Module):
         ret : nn.Tensor
             The output tensor for the lm_head layer.
         """
-        w = nn.op.tensor_expr_op(
-            lambda weight, scale: self.config._dequantize(
-                weight,
-                scale,
-                axis=-1,
-                out_shape=[
-                    (
-                        tirx.IntImm("int64", self.num)
-                        if isinstance(self.num, int)
-                        else weight.shape[0]
-                    ),
-                    tirx.IntImm("int64", self.dim),
-                ],
-            ),
-            name_hint="dequantize",
-            args=[self.q_weight, self.q_scale],
-        )
+        num_int = isinstance(self.num, int)
+
+        def _make_out_shape(weight):
+            return [
+                tirx.IntImm("int64", self.num) if num_int else weight.shape[0],
+                tirx.IntImm("int64", self.dim),
+            ]
+
+        if self.q_offset is None:
+            w = nn.op.tensor_expr_op(
+                lambda weight, scale: self.config._dequantize(
+                    weight,
+                    scale,
+                    axis=-1,
+                    out_shape=_make_out_shape(weight),
+                ),
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale],
+            )
+        else:
+            w = nn.op.tensor_expr_op(
+                lambda weight, scale, offset: self.config._dequantize(
+                    weight,
+                    scale,
+                    axis=-1,
+                    out_shape=_make_out_shape(weight),
+                    offset=offset,
+                ),
+                name_hint="dequantize",
+                args=[self.q_weight, self.q_scale, self.q_offset],
+            )
         w = nn.op.permute_dims(w)
         return nn.op.matmul(x, w, out_dtype="float32")
 

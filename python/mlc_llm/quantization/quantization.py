@@ -155,6 +155,23 @@ QUANTIZATION: Dict[str, Quantization] = {  # noqa: UP006
         quantize_embedding=True,
         quantize_final_fc=True,
     ),
+    # Asymmetric int4 at g=32: stores per-group (scale, offset) in fp16; uses full
+    # [0, 15] range with dequant = q*scale + offset. Better fidelity than symmetric
+    # at coarser groups — needed because GDN recurrent state amplifies per-group bias.
+    # Storage is identical to q4f16_g16e (5 bits/elem) but halves scale-load count
+    # in the dequant kernel.
+    "q4f16_g32_asym": GroupQuantize(
+        name="q4f16_g32_asym",
+        kind="group-quant",
+        group_size=32,
+        quantize_dtype="int4",
+        storage_dtype="uint32",
+        model_dtype="float16",
+        linear_weight_layout="NK",
+        quantize_embedding=True,
+        quantize_final_fc=True,
+        symmetric=False,
+    ),
     "q4f16_autoawq": AWQQuantize(
         name="q4f16_autoawq",
         kind="awq",
