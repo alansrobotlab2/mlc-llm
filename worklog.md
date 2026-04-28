@@ -15,11 +15,18 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 - **Phase 3** (B-ext spec decode): **DEAD. 5.2% token agreement** (13/250). Diverges at step 0 on 4/5 prompts. Root cause: Qwen3.5-0.8B is a standard transformer; 35B-A3B is a hybrid GDN — architecturally incompatible generative trajectories.
 - **Working tree**: clean (ft_quantization.py fixes and bench artifacts already committed).
 
-**No further optimization avenues identified in pre-planned phases.** If a new session wants to push further, candidate ideas (none explored):
-- **Self-speculative / MTP**: Train or distill a small GDN-compatible draft head from the 35B's own hidden states (the EAGLE approach — works within the same architecture). Significant training effort, outside current scope.
-- **Continuous batching gains**: Profile whether `max_batch_size > 1` + request queuing yields higher sustained throughput in a real serving scenario (vs single-request bench).
-- **FT + CUDA graph wrapper**: Wrap FT extern calls in a TIR shell so CUDA graph can capture them. Estimated 2-5 sessions; ceiling is recovering to ~v6 level, not exceeding it.
-- **TIR kernel tuning**: Meta-schedule sweep on the GDN-specific ops (gdn_in_proj_qkv, attn_o_proj) — dlight defaults may not be optimal for sm_87.
+**Phase 4 plan written.** See [.claude/plans/phase4-perf.md](.claude/plans/phase4-perf.md) for full detail.
+
+Remaining avenues (stack-ranked):
+
+| Phase | Approach | Expected gain | Start condition |
+|---|---|---|---|
+| **4A** | KV cache int8 | +5–15% tg512 | Immediate |
+| **4B** | MTP self-speculative (GDN rollback unblock) | +50–100% if accept ≥60% | Confirm 35B has MTP weights first |
+| **4C** | GDN chunk-scan kernel (FLA-style) | +5–15% | Profile confirms scan is ≥15% of step |
+| **4D** | Meta-schedule on hot kernels | +2–5% | Anytime, low effort |
+
+**Recommended first session:** 4A (KV int8) — standalone, no prereqs, 1–2 sessions to know.
 
 **Phase 2D autopsy — why CUDA graph exclusion kills the gain**
 
