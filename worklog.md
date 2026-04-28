@@ -6,6 +6,76 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 🔖 SESSION HANDOFF (2026-04-28 EOD) — v6 shipped at 52.62 tps; next is Phase 2D (FT hybrid quant) OR Phase 3 (B-ext spec decode)
+
+**Where we are**
+- **Latest perf**: v6 lib at **52.62 tps tg64 / 163.42 pp_tps** (Orin AGX MAXN, ctx=128). **1.789× over llama.cpp Q4_K_S.**
+- **Latest commit**: `c5b76e70` — closes Option-1 (MoE matmul tile sweep, no win).
+- **Working tree**: clean.
+- **Lib backup**: v5 at `dist/qwen3_6-35B-A3B-q4f16_1/lib_v5.so.bak`.
+
+**What's exhausted (don't redo)**
+- ❌ Option A (dlight tile tuning for MoE gate_up): 14-config sweep at v6 confirms (32, 16, 2) is Pareto-optimal. No tile beats it by >0.2% (within noise).
+- ❌ Option E (residual+norm fusion): already done by [FuseAddRMSNorm](python/mlc_llm/compiler_pass/fuse_add_norm.py); remaining unfused norms = ~0.18 tps total potential.
+- ❌ Option B (MTP self-spec): trained Qwen3.5 MTP head behaves as 1-step echo, not a 2-step-ahead generator. PyTorch probe at [scripts/mtp_head_pytorch_check.py](scripts/mtp_head_pytorch_check.py) shows 0/14 hits on DeepSeek convention, cos(MTP_out, target_h_next) = 0.01–0.23.
+- ❌ q4f16_ft at g=16 or g=32: CUTLASS `FineGrainedScaleZeroIterator` hard-bakes `group_size / 64` into row offsets; needs 1-2 days of CUTLASS surgery for a sub-+5% gain.
+
+**Two open paths, pick in next session**
+
+### Path A — Phase 2D: FT hybrid quantization (1 day if it works, ½ day if it doesn't)
+Plan at [.claude/plans/phase2d-ft-hybrid-quant.md](.claude/plans/phase2d-ft-hybrid-quant.md). Route the 6 production dense q4 GEMVs (~5.5 ms/tok) through CUTLASS FpAIntB instead of dlight, while keeping MoE on dlight q4f16_1 via a small `FTQuantize.visit_module` patch. Three pre-flight gates: (1) microbench ≥10% faster on ≥3 shapes, (2) coherence smoke survives g=64, (3) e2e ≥+3.5%. The gates are cheap so failure mode is fast.
+
+**Cheap pre-flight first**: extend `bench_moe_kernel.py` with an FT path + bench at the production shapes. ~1 hour. Decisive.
+
+Estimated win if it lands: +1.5–3 tps (54–56 tps tg64).
+
+### Path B — Phase 3: B-ext external-draft spec decode (multi-day, ~3-5 sessions)
+Use Qwen3.5-0.8B as draft for the 35B-A3B target. **Tokenizer compat verified**: vocab.json, merges.txt, tokenizer.json byte-identical between the two models. Vocab=248,320 in both configs. EOS/pad strings match.
+
+Cheap pre-flight before the engine work: run **token-level agreement check** in PyTorch — greedy-decode both models on a few prompts, count match-rate. If it's <30%, B-ext is dead before we start. If it's >50%, worth proceeding to engine integration.
+
+Estimated win if it lands: +20–25 tps (70+ tps).
+
+**Recommendation**: do Phase 2D first. The pre-flight is a 1-hour decisive test, and even a "no" outcome teaches us something concrete about why CUTLASS underperforms dlight on Orin sm_87. Only commit to Phase 3 if 2D's ceiling isn't enough.
+
+**Reproduction commands (paste-ready)**
+
+E2E bench v6:
+```bash
+source .envrc.local && .venv/bin/python bench_mlc.py \
+    --model-dir dist/qwen3_6-35B-A3B-q4f16_1 --device cuda:0 \
+    --pp 128 --tg 64 --runs 3 --warmup 1 \
+    --baseline baseline_35B_q4f16_1_v5_dlight.json
+```
+
+Coherence smoke v6:
+```bash
+source .envrc.local && .venv/bin/python scripts/coherence_smoke.py
+```
+
+nsys profile v6:
+```bash
+source .envrc.local && nsys profile -t cuda,nvtx --cuda-graph-trace=node \
+    -o nsys_35B_v6 -f true .venv/bin/python profile_decode.py
+nsys stats --report cuda_gpu_kern_sum --format csv -o - nsys_35B_v6.nsys-rep | head -30
+```
+
+Compile recipe (Orin) — flashinfer=0 is mandatory:
+```bash
+.venv/bin/python -m mlc_llm compile dist/qwen3_6-35B-A3B-q4f16_1 --device cuda \
+  --opt "flashinfer=0;cublas_gemm=1;cudagraph=1;cutlass=1" \
+  -o dist/qwen3_6-35B-A3B-q4f16_1/lib.so
+```
+
+Interactive chat (must pass `--model-lib` to avoid JIT cache flashinfer segfault):
+```bash
+source .envrc.local && .venv/bin/python -m mlc_llm chat \
+    dist/qwen3_6-35B-A3B-q4f16_1 --device cuda:0 \
+    --model-lib dist/qwen3_6-35B-A3B-q4f16_1/lib.so
+```
+
+---
+
 ## 2026-04-28 (cont. 4) — Option-1 (MoE matmul tile push to 95% BW) ruled out empirically. Tile space exhausted at (32, 16, 2).
 
 **Done — 14-config sweep on production gate_up shape**
