@@ -619,7 +619,12 @@ def dequantize_group_gemm(
 
     Ne, N, K = num_local_experts, out_features, in_features
     BLK_M, BLK_N, BLK_K = 8, 128, 32
-    TX, TY, CTA_COUNT = 8, 32, 1024
+    # CTA_COUNT was 1024 (saturates Hopper-class GPUs). On Orin AGX at b=1
+    # top-8 decode the work is only ~64-128 tiles, so 1024 CTAs waste >90% of
+    # launches scanning the indptr to exit. 64 matches gate_up decode work-set;
+    # persistent loop still handles prefill. Decode: gate_up 2.0×, down 3.6×.
+    # Prefill: ~3% regression. Tuned at Qwen3.6-35B-A3B q4f16_1, top_k=8.
+    TX, TY, CTA_COUNT = 8, 32, 64
     VEC_X, VEC_W, VEC_O, VEC_DOT = 1, 1, 1, 1
     UNROLL = 64
     STORAGE_ALIGN = False
