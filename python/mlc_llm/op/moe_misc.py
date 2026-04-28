@@ -159,19 +159,121 @@ def gating_softmax_topk(x: Tensor, k: int, norm_topk_prob=True) -> Tuple[Tensor,
 
     TX = 1024
 
+    def _nested_max(local_top_k_f32, k_val):
+        expr = local_top_k_f32[0]
+        for i in range(1, k_val):
+            expr = T.max(expr, local_top_k_f32[i])
+        return expr
+
+    def _nested_sum(local_top_k_f32, local_top_k_max, k_val):
+        expr = T.exp(local_top_k_f32[0] - local_top_k_max[0])
+        for i in range(1, k_val):
+            expr = expr + T.exp(local_top_k_f32[i] - local_top_k_max[0])
+        return expr
+
+    def _get_topk_softmax_norm_func_v2(k_val: int):
+        # Parallel-over-experts variant: 1 CTA per batch row, num_local_experts
+        # threads per CTA (one per expert). Picks top-k via k rounds of
+        # block-wide allreduce(max) + tiebreaking allreduce(min idx) + masking
+        # the winner. Used when num_local_experts <= 1024.
+        TX_V2 = num_local_experts
+        f32_neg_inf = T.min_value("float32")
+        i32_max = T.max_value("int32")
+
+        @T.prim_func(private=True)
+        def topk_softmax_norm_func_v2(
+            var_x: T.handle,
+            var_out: T.handle,
+            var_out_index: T.handle,
+        ) -> None:
+            T.func_attr({"tirx.noalias": True, "tirx.is_scheduled": True})
+            batch_size = T.int64()
+            x = T.match_buffer(var_x, (batch_size, num_local_experts), dtype)
+            out = T.match_buffer(var_out, (batch_size, k_val), dtype)
+            out_index = T.match_buffer(var_out_index, (batch_size, k_val), index_dtype)
+
+            with T.sblock("kernel"):
+                my_val = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                cand_idx = T.sblock_alloc_buffer((1,), "int32", scope="local")
+                max_reduce = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                min_reduce = T.sblock_alloc_buffer((1,), "int32", scope="local")
+
+                winner_val = T.sblock_alloc_buffer((k_val,), "float32", scope="shared")
+                winner_idx = T.sblock_alloc_buffer((k_val,), "int32", scope="shared")
+                top_max = T.sblock_alloc_buffer((1,), "float32", scope="shared")
+                top_sum = T.sblock_alloc_buffer((1,), "float32", scope="shared")
+
+                for _bx in T.thread_binding(0, batch_size, thread="blockIdx.x"):
+                    for _tx in T.thread_binding(0, TX_V2, thread="threadIdx.x"):
+                        with T.sblock("CTA"):
+                            b, tx = T.axis.remap("SS", [_bx, _tx])
+
+                            my_val[0] = T.cast(x[b, tx], "float32")
+
+                            for r in T.serial(0, k_val):
+                                with T.sblock("block_cross_thread_max"):
+                                    T.reads(my_val[0])
+                                    T.writes(max_reduce[0])
+                                    T.attr(
+                                        T.comm_reducer(
+                                            lambda a, b: T.max(a, b),
+                                            [T.min_value("float32")],
+                                        ),
+                                        "reduce_scope",
+                                        T.reinterpret("handle", T.uint64(0)),
+                                    )
+                                    T.tvm_thread_allreduce(
+                                        T.uint32(1), my_val[0], True, max_reduce[0],
+                                        tx, dtype="handle",
+                                    )
+
+                                cand_idx[0] = T.if_then_else(
+                                    my_val[0] >= max_reduce[0], tx, i32_max
+                                )
+
+                                with T.sblock("block_cross_thread_argmax"):
+                                    T.reads(cand_idx[0])
+                                    T.writes(min_reduce[0])
+                                    T.attr(
+                                        T.comm_reducer(
+                                            lambda a, b: T.min(a, b),
+                                            [T.max_value("int32")],
+                                        ),
+                                        "reduce_scope",
+                                        T.reinterpret("handle", T.uint64(0)),
+                                    )
+                                    T.tvm_thread_allreduce(
+                                        T.uint32(1), cand_idx[0], True, min_reduce[0],
+                                        tx, dtype="handle",
+                                    )
+
+                                # All threads write the same value to the same
+                                # shared cell — benign race; avoids if-nesting
+                                # that the sync planner can't reason through.
+                                winner_val[r] = max_reduce[0]
+                                winner_idx[r] = min_reduce[0]
+
+                                # Branch-free mask: only the winning thread
+                                # actually flips its register, others identity.
+                                my_val[0] = T.if_then_else(
+                                    tx == min_reduce[0], f32_neg_inf, my_val[0]
+                                )
+
+                            T.tvm_storage_sync("shared")
+
+                            top_max[0] = _nested_max(winner_val, k_val)
+                            top_sum[0] = _nested_sum(winner_val, top_max, k_val)
+
+                            if tx < k_val:
+                                out[b, tx] = T.cast(
+                                    T.exp(winner_val[tx] - top_max[0]) / top_sum[0],
+                                    dtype,
+                                )
+                                out_index[b, tx] = winner_idx[tx]
+
+        return topk_softmax_norm_func_v2
+
     def _get_topk_softmax_norm_func(k_val: int):
-        def _nested_max(local_top_k_f32):
-            expr = local_top_k_f32[0]
-            for i in range(1, k_val):
-                expr = T.max(expr, local_top_k_f32[i])
-            return expr
-
-        def _nested_sum(local_top_k_f32, local_top_k_max):
-            expr = T.exp(local_top_k_f32[0] - local_top_k_max[0])
-            for i in range(1, k_val):
-                expr = expr + T.exp(local_top_k_f32[i] - local_top_k_max[0])
-            return expr
-
         @T.prim_func(private=True)
         def topk_softmax_norm_func(
             var_x: T.handle,
@@ -207,13 +309,13 @@ def gating_softmax_topk(x: Tensor, k: int, norm_topk_prob=True) -> Tuple[Tensor,
                                 vj = T.axis.remap("S", [j])
                                 local_top_k_f32[vj] = T.cast(local_top_k[vj], "float32")
                         with T.sblock("max"):
-                            local_top_k_max[0] = _nested_max(local_top_k_f32)
+                            local_top_k_max[0] = _nested_max(local_top_k_f32, k_val)
                         for j in T.unroll(k_val):
                             with T.sblock("output"):
                                 vj = T.axis.remap("S", [j])
                                 out[vi, vj] = T.cast(
                                     T.exp(local_top_k_f32[vj] - local_top_k_max[0])
-                                    / _nested_sum(local_top_k_f32, local_top_k_max),
+                                    / _nested_sum(local_top_k_f32, local_top_k_max, k_val),
                                     dtype,
                                 )
                                 out_index[vi, vj] = local_top_k_index[vj]
@@ -221,8 +323,20 @@ def gating_softmax_topk(x: Tensor, k: int, norm_topk_prob=True) -> Tuple[Tensor,
         return topk_softmax_norm_func
 
     if norm_topk_prob:
+        # Pick the parallel-over-experts kernel when num_local_experts fits in
+        # one CTA (≤ 1024). For decode b=1, the v0 single-thread scan over 256
+        # experts dominates; v2 parallelizes that axis (one thread per expert).
+        use_v2 = (
+            isinstance(num_local_experts, int)
+            and 32 <= num_local_experts <= 1024
+            and num_local_experts >= k
+        )
+        topk_func = (
+            _get_topk_softmax_norm_func_v2(k) if use_v2
+            else _get_topk_softmax_norm_func(k)
+        )
         return op.tensor_ir_op(
-            _get_topk_softmax_norm_func(k),
+            topk_func,
             f"top{k}_softmax",
             args=[x],
             out=(

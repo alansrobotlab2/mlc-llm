@@ -6,6 +6,58 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-28 (cont. 2) — Parallel topk_softmax kernel: 0.043 → 0.0085 ms (5×). 35B-A3B decode 44.85 → 47.88 tps (**1.629× over llama.cpp Q4_K_S**).
+
+**Done — 1 CTA × 256 threads (one per expert), branch-free k rounds**
+- Added `_get_topk_softmax_norm_func_v2` at [moe_misc.py:174-271](python/mlc_llm/op/moe_misc.py#L174-L271) and dispatch logic at [moe_misc.py:331-340](python/mlc_llm/op/moe_misc.py#L331-L340). v2 fires when `num_local_experts ∈ [32, 1024]` (covers all the Qwen MoE configs we care about); v0 stays as the fallback for >1024 experts.
+- Per-CTA layout: 1 block per batch row, `TX = num_local_experts` threads per block, each thread holds one (logit, idx) pair in registers. k=8 rounds, each: (1) `tvm_thread_allreduce` max over `my_val`, (2) compute `cand = (my_val >= max ? tx : INT_MAX)`, (3) `tvm_thread_allreduce` min over `cand` to break ties by smallest expert idx, (4) winning thread masks itself (`my_val = -inf`). Final softmax over the k winners is single-threaded; output stride-1 by `tx < k_val`.
+- Built [scripts/test_topk_softmax_parity.py](scripts/test_topk_softmax_parity.py) — random fp16 inputs at B ∈ {1, 4, 32, 128}, compares v2 output to a numpy reference (greedy topk + softmax-normalize, ties broken by min-idx). All four pass with `idx` exact-match and `weights` `rtol=1e-3, atol=1e-4`.
+- Microbench [baseline_topk_v1_parallel.json](baseline_topk_v1_parallel.json): 0.0085 ms median (vs 0.0425 ms v0 = **5.0×**).
+- Recompiled [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) (~2 min), e2e bench [baseline_35B_q4f16_1_v3_topk.json](baseline_35B_q4f16_1_v3_topk.json): **tg_tps = 47.88** (vs v2 44.85 = **+6.3%, +3.03 tps** — exactly the predicted +3 tps). pp_tps unchanged (148.10, +0.5%).
+
+**Final scoreboard — Orin AGX cuda:0, ctx=128, tg=64**
+
+| version | change | tg_tps | vs baseline | vs llama.cpp |
+|---|---|---:|---:|---:|
+| baseline | (start of last session) | 10.12 | 1.00× | 0.34× |
+| v1 | CTA_COUNT 1024 → 64 | 19.72 | 1.95× | 0.67× |
+| v2 | + spec batch_decode batch_size=1 (gemv path) | 44.85 | 4.43× | 1.52× |
+| **v3** | + parallel topk_softmax (256 threads/CTA) | **47.88** | **4.73×** | **1.629×** |
+
+Per-token decode: 22.3 ms → 20.9 ms. Bandwidth utilization: ~36% → ~38% of Orin's 180 GB/s practical.
+
+**Two gotchas worth keeping in the file**
+- *`tvm_thread_allreduce` placement.* My first cut wrote the round's winner via `if tx == 0: winner_val[r] = ...`. The s_tir thread-storage-sync pass crashed with `Cannot insert syncs inside condition` when planning syncs for the next iteration's allreduce. The pattern that DOES work: have all threads write the same value to the same shared cell (benign race, deterministic since `max_reduce[0]` and `min_reduce[0]` are post-allreduce and identical across the block). Same for the masking step — instead of `if tx == winner: my_val[0] = -inf`, use `my_val[0] = T.if_then_else(tx == winner, -inf, my_val[0])`. Both rewrites turn statement-level ifs into expression-level selects, which the sync planner handles. **General rule for parallel-reduce kernels in this codebase: keep statement-level `if` blocks empty of subsequent allreduce dependencies.**
+- *Two allreduces per round, not one.* I considered packing (val, idx) into int64 to do a single max-allreduce per round. Floating-point sortable encoding (sign-flip-on-negative) plus negated idx in low bits would work, but the bit-twiddling vs the cost of an extra allreduce is a wash on Orin — TVM's allreduce lowers to a 2-stage reduction (warp shuffle + 8-wide shared-mem reduce + broadcast) at ~50 ns, so 16 allreduces × 50 ns ≈ 0.8 µs vs the launch-overhead floor of ~5 µs. Two-allreduces-per-round is simpler and the launch overhead dominates anyway. If we ever port this to a stronger arch where the 5 µs floor halves, the int64-packed single-allreduce variant becomes interesting.
+
+**What's left in the budget (the path to 60 tps)**
+Per-token decode now 20.9 ms; 60 tps = 16.7 ms. Need ~4.2 ms savings.
+
+Ranked candidates (per-token cost / current BW utilization / estimated savings):
+1. **Shared expert dlight gemv** (`fused_dequantize4_NT_matmul3` family, 1.52 ms/tok at 14% BW). The 1024×2048 q4 GEMV is anomalously low for dlight on sm_87 — the schedule was tuned for sm_80/sm_90. Either tune dlight for sm_87 or hand-write a custom kernel matching the moe_dequantize_gemv pattern. Estimated savings: ~1 ms/tok = ~2 tps.
+2. **moe_dequantize_gemv1 (down)** at 42% BW. Push to 60-70% with better tile shape. Estimated savings: ~0.5 ms/tok = ~1 tps.
+3. **GDN dense matmuls** (`fused_dequantize1_NT_matmul`, 2.18 ms/tok at 46% BW). Same TVM-side tuning. Estimated savings: ~0.5 ms/tok = ~1 tps.
+4. **lm_head** (~3% of decode, 2.76 ms × 32 calls). Vocab 248K @ q4f16, hidden 2048 → 256 MB at b=1 = 1.4 ms theoretical, currently 2× over BW. Same shape-tuning likely.
+5. **Spec-decode finally working.** Path 1 plumbing is in but accept rate is 0% (MTP draft target-misaligned). 30%+ accept rate would multiply decode and could push 60+ tps before more kernel work. Multi-day MTP triage.
+
+Total realistic from #1–#4: ~2–3 ms/tok savings → ~52–55 tps. Crossing 60 cleanly needs spec-decode or a meaningful dlight-for-sm_87 sweep.
+
+**Next session pickup — shared expert gemv at ctx=128**
+- Profile target: re-run `nsys profile ... --cuda-graph-trace=node` on the v3 lib (next session has access to [scripts/profile_mlc_decode.py](scripts/profile_mlc_decode.py)). Expect MoE gate_up/down to drop to ~3–4 ms/tok combined (down from 4.76 ms in v2), shared expert gemv to surface as the new top kernel.
+- Code targets: dlight gemv schedule lives in `3rdparty/tvm/python/tvm/dlight/gpu/gemv.py`. The Orin-relevant tile knobs are `TS`, `TR`, `TILE_K`, vectorization width. A Hopper-tuned default likely overshoots sm_87's 16 SMs.
+- Microbench: extend [bench_moe_kernel.py](bench_moe_kernel.py) with a `shared_expert_gemv` shape (B=1, K=2048, N=1024 q4) — same JIT-via-Legalize+dlight+relax.build path. Fast (~5 sec/iter).
+- vs llama.cpp now 1.629×; 60 tps target = 2.04× over llama.cpp.
+
+**Quick context for next session**
+- Compiled: [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) at v3.
+- Code: [moe_misc.py:174-271](python/mlc_llm/op/moe_misc.py#L174-L271) (v2 kernel), [moe_misc.py:331-340](python/mlc_llm/op/moe_misc.py#L331-L340) (dispatch).
+- Microbench: `.venv/bin/python bench_moe_kernel.py --shapes topk_softmax --baseline baseline_topk_v1_parallel.json`.
+- E2E bench: `bench_mlc.py --baseline baseline_35B_q4f16_1_v3_topk.json`.
+- Parity test: `.venv/bin/python scripts/test_topk_softmax_parity.py` (numpy reference, B ∈ {1, 4, 32, 128}).
+- Bar: llama.cpp Q4_K_S 29.4 tps tg128. **MLC v3 = 47.88 tps, 1.629× over.**
+
+---
+
 ## 2026-04-28 (cont.) — **35B-A3B decode +343% in one session**: 10.12 → 44.85 tps. **1.52× over llama.cpp Q4_K_S.** Two architectural wins; 60 tps still ~1.34× away.
 
 > **Next session pickup — Option A: parallel topk_softmax.** Custom kernel at [moe_misc.py:135](python/mlc_llm/op/moe_misc.py#L135) (and the matching plain `gating_topk` at [moe_misc.py:63](python/mlc_llm/op/moe_misc.py#L63)) parallelizes only over `batch_size`; at b=1 a single thread sequentially scans 256 experts in 42 µs/call. Microbench is wired up as `bench_moe_kernel.py --shapes topk_softmax`; baseline at [baseline_topk_v0.json](baseline_topk_v0.json) (median 0.042 ms). Goal: rewrite as 1 CTA × 256 threads (one per expert) doing a parallel argmax × k rounds, or block-wide bitonic. Constraint: pure TIR (no thrust → cudagraph-safe). Expected win: ~5 µs/call → ~1.4 ms/token saved → ~3 tps gain (45 → ~48). After kernel works, recompile and run `bench_mlc.py --baseline baseline_35B_q4f16_1_v2_gemv.json` to confirm e2e.
