@@ -28,6 +28,8 @@ from tvm.relax.frontend.nn import spec
 
 from mlc_llm.op.moe_matmul import dequantize_gemv, dequantize_group_gemm
 from mlc_llm.op.moe_misc import gating_softmax_topk
+from mlc_llm.quantization.quantization import QUANTIZATION
+from mlc_llm.quantization.group_quantization import GroupQuantizeLinear
 
 
 # 35B-A3B q4f16_1 MoE shapes (Qwen3.6-35B-A3B):
@@ -49,6 +51,24 @@ SHAPES = {
     "down_gemv":       dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=8,    spread=False, kind="gemv"),
     # topk_softmax (MoE router): single-thread sequential scan at b=1
     "topk_softmax":    dict(Ne=256, N=0,    K=2048, group_size=0,  top_k=8, B=1,    spread=False, kind="topk_softmax"),
+    # Dense q4f16_1 GEMVs — the shared expert path (no MoE indptr).
+    # Routed via the regular dlight `dl.gpu.GEMV()` schedule.
+    # gate||up uses N=2*512=1024 (two cols concatenated); down N=2048.
+    "shared_expert_gate_up": dict(Ne=0, N=1024, K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "shared_expert_down":    dict(Ne=0, N=2048, K=512,  group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    # GDN dense matmul (in_proj_qkv): K=2048 hidden -> N=8192. Confirmed from
+    # phase4 IR: weight (8192, 256) uint32, scale (8192, 64) fp16. ~9.46 MB/call.
+    # v3 production: 72.0 µs/call × 30 calls/tok = 2.16 ms/tok at 73% BW.
+    "gdn_in_proj_qkv":       dict(Ne=0, N=8192, K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    # Attention o_proj (full-attn + GDN): K=4096 (heads*head_dim*2 with attn_output_gate), N=2048.
+    # v3 production: 37.8 µs/call × 40 calls/tok = 1.51 ms/tok at 69% BW.
+    "attn_o_proj":           dict(Ne=0, N=2048, K=4096, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    # lm_head: K=2048 → N=248064 (vocab). Already 90% BW per v3 profile.
+    "lm_head":               dict(Ne=0, N=248064, K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    # GDN in_proj_z (with silu*multiply epilogue): K=2048, N=4096.
+    # v3 production: 42.5 µs/call × 30 calls = 1.27 ms/tok at 62% BW.
+    # NOTE: bench harness only fuses dequant+matmul, not the silu/multiply.
+    "gdn_in_proj_z":         dict(Ne=0, N=4096, K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
 }
 
 
@@ -90,6 +110,24 @@ class _TopKSoftmaxModule(nn.Module):
         return gating_softmax_topk(x, k=self.top_k, norm_topk_prob=True)
 
 
+class _DenseGemvModule(nn.Module):
+    """Single q4f16_1 dense GEMV (the shared-expert path)."""
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        config = QUANTIZATION["q4f16_1"]
+        self.linear = GroupQuantizeLinear(
+            in_features=in_features,
+            out_features=out_features,
+            config=config,
+            bias=False,
+            out_dtype=None,
+        )
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
              spread: bool, kind: str, target, dev):
     if kind == "topk_softmax":
@@ -102,6 +140,17 @@ def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
             }
         }
         m = _TopKSoftmaxModule(top_k)
+    elif kind == "dense_gemv":
+        # Plain q4f16_1 Linear: x (B,K) → out (B,N). Mirrors the shared-expert
+        # gate_up/down path — no MoE indptr.
+        # Make seq_len symbolic so LowBatchGemvSpecialize creates the
+        # If(seq_len<=2) → LowBatchGEMV(2) dispatch the real model uses.
+        mod_spec = {
+            "forward": {
+                "x": spec.Tensor(["seq_len", K], "float16"),
+            }
+        }
+        m = _DenseGemvModule(in_features=K, out_features=N)
     elif kind == "gemv":
         # gemv: indptr is (1, top_k); x is (B, K) where B in {1, top_k}
         mod_spec = {
@@ -124,8 +173,23 @@ def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
         }
         m = _DequantGroupGemmModule(group_size)
     mod, _ = m.export_tvm(spec=mod_spec)
+    # Mirror the production lowering pipeline (compiler_pass/pipeline.py)
+    # so dequantize+permute_dims+matmul fuse into the same single kernel that
+    # runs at decode (`fused_dequantize*_NT_matmul*`).
+    from mlc_llm.compiler_pass.fuse_dequantize_transpose import FuseDequantizeTranspose
+    from mlc_llm.compiler_pass.fuse_transpose_matmul import FuseTransposeMatmul
+    from mlc_llm.compiler_pass.fuse_dequantize_matmul_ewise import FuseDequantizeMatmulEwise
+    from mlc_llm.compiler_pass.low_batch_specialization import LowBatchGemvSpecialize
     with target:
+        mod = FuseDequantizeTranspose()(mod)
+        mod = FuseTransposeMatmul()(mod)
         mod = relax.transform.LegalizeOps()(mod)
+        mod = relax.transform.AnnotateTIROpPattern()(mod)
+        mod = relax.transform.FoldConstant()(mod)
+        mod = relax.transform.FuseOps()(mod)
+        mod = relax.transform.FuseTIR()(mod)
+        mod = FuseDequantizeMatmulEwise()(mod)
+        mod = LowBatchGemvSpecialize()(mod)
         mod = dl.ApplyDefaultSchedule(
             dl.gpu.Matmul(),
             dl.gpu.GEMV(),
@@ -149,6 +213,13 @@ def make_inputs(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
         # Single input: gate logits of shape (B, Ne).
         x_np = rng.standard_normal((B, Ne), dtype="float32").astype(np.float16)
         return [_upload(x_np, dev)]
+
+    if kind == "dense_gemv":
+        # q4f16_1 NK layout: q_weight (N, K/8) uint32, q_scale (N, K/group) fp16.
+        x_np = rng.standard_normal((B, K), dtype="float32").astype(np.float16)
+        w_np = rng.integers(0, 2**32, size=(N, K // 8), dtype=np.uint32)
+        scale_np = (rng.standard_normal((N, K // group_size), dtype="float32") * 0.01).astype(np.float16)
+        return [_upload(a, dev) for a in (x_np, w_np, scale_np)]
 
     x_np = rng.standard_normal((B, K), dtype="float32").astype(np.float16)
     w_np = rng.integers(0, 2**32, size=(Ne, N, K // 8), dtype=np.uint32)

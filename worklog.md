@@ -6,6 +6,83 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-27 — sm_87 dlight GEMV tuning: 35B-A3B decode 48.07 → 51.37 tps (**1.745× over llama.cpp Q4_K_S**, +6.9% over v3 in two single-line patches).
+
+**Done — two-file dlight schedule patch keyed on `arch == "sm_87"`**
+- [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py](3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py) inner-reduction cuda branch: for static `len_S` on sm_87, override `(TS, TR, TILE_S)` from `(16, 32, 1)` → `(32, 16, 2)`. This is the path the MoE per-expert GEMV (`moe_dequantize_gemv`) takes — it has an outer `blockIdx.y = experts_per_tok=8` thread binding that's invisible to dlight, so total CTAs at runtime is `8 × bx_inner`. Default produced 8 × 128 = 1024 CTAs (16 waves on Orin's 64 active CTAs). Override → 8 × 32 = 256 CTAs (4 waves).
+- [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/low_batch_gemv.py](3rdparty/tvm/python/tvm/s_tir/dlight/gpu/low_batch_gemv.py) inner-reduction cuda branch, `len_s > len_r` case: override `(TS, TR)` from `(4, 64)` → `(16, 32)` for sm_87. The N>K case (e.g. GDN `in_proj_qkv` at N=8192, K=2048) was producing 4× more CTAs than needed.
+- Added 4 new shapes to [bench_moe_kernel.py](bench_moe_kernel.py): `shared_expert_gate_up/down`, `gdn_in_proj_qkv`, `attn_o_proj`, `gdn_in_proj_z`, `lm_head`. The harness now mirrors the production lowering pipeline (FuseDequantizeTranspose + FuseTransposeMatmul + LegalizeOps + AnnotateTIROpPattern + FoldConstant + FuseOps + FuseTIR + FuseDequantizeMatmulEwise + LowBatchGemvSpecialize + dlight) so microbench numbers match nsys within ~10%.
+
+**Headline numbers — Orin AGX cuda:0, ctx=128, tg=64 (median over 3 runs)**
+
+| version | change | tg_tps | vs baseline | vs llama.cpp |
+|---|---|---:|---:|---:|
+| baseline (start) | (start of perf phase) | 10.12 | 1.00× | 0.34× |
+| v1 | CTA_COUNT 1024 → 64 | 19.72 | 1.95× | 0.67× |
+| v2 | + spec batch_decode batch_size=1 (gemv path) | 44.85 | 4.43× | 1.52× |
+| v3 | + parallel topk_softmax (256 threads/CTA) | 47.88 | 4.73× | 1.629× |
+| **v5** | + sm_87 dlight gemv + low_batch_gemv tile fix | **51.37** | **5.08×** | **1.745×** |
+
+Per-token decode: 22.3 → **19.14 ms**. Bandwidth utilization: ~36% → ~40% of Orin's 180 GB/s practical aggregate.
+
+**Per-kernel deltas (nsys, decode µs/call)**
+
+| kernel | v3 | v5 | delta |
+|---|---:|---:|---:|
+| **moe_dequantize_gemv (MoE gate_up)** | 71.3 | 64.9 | **-9%** |
+| **moe_dequantize_gemv1 (MoE down)** | 59.4 | 38.6 | **-35%** |
+| fused_dequantize5_NT_matmul5 (shared expert gate_up) | 13.2 | 12.0 | -9% |
+| fused_dequantize1_NT_matmul (GDN in_proj_qkv) | 72.0 | 65.3 | -9% |
+| fused_dequantize4_NT_matmul3 (attn o_proj) | 37.8 | 38.5 | flat (already at 69% BW) |
+| fused_dequantize_fused_NT_matmul9_cast4 (lm_head) | 1919 | 1757 | -8% |
+
+Total kernel-level savings ≈ 1.34 ms/tok across decode kernels; e2e save 1.30 ms/tok ✓ (matches).
+
+**Two reasons the worklog's "easy 5 tps shared expert win at 17% BW" was a misread**
+- The kernel labeled "shared expert gate_up (`fused_dequantize4_NT_matmul3`)" in the v3 profile table is actually the attention `o_proj` (K=4096, N=2048 — the K=4096 comes from `attn_output_gate=True` doubling the input dim). Real shared expert gate_up is `fused_dequantize5_NT_matmul5` at K=2048, N=1024, running 13.2 µs/call already at 51% BW. There was no easy 5 tps lying there.
+- The 17% BW number was computed using the (1024×2048) shared-expert byte budget against the (4096×2048) o_proj timing — apples to oranges. Real o_proj BW is ~69% (already close to ceiling); real shared expert is ~51% (small kernel, near ceiling).
+
+**Three gotchas this session**
+- *`flashinfer=on` defaults silently break Orin builds.* Recompiling without `--opt "flashinfer=0;..."` produced a lib that linked the flashinfer DecodePlan/Run kernels, but the C++ engine (built earlier today) only knows the legacy `batch_decode_paged_kv` interface, so `CreateKVCache` segfaulted on init. Confirmed via `nm -D lib.so | grep flashinfer`. **Always pass the explicit opt string for Orin compiles.** Worth adding a tracked CLI alias.
+- *`target.attrs.get("arch")` returns a plain `str`, not a wrapped `tirx.StringImm`.* My first sm_87 check was `target.attrs.get("arch", "").value == "sm_87"`, which raised `AttributeError: 'str' object has no attribute 'value'`. The check silently bypassed the override. **Use `str(...) == "sm_87"` directly.**
+- *Worklog kernel labeling discipline.* The v3 profile table conflated kernel names with model components without verifying via phase4 IR. Going forward: any kernel name in a profile table needs a phase4 IR cross-check (search by buffer shape, not by guessed naming convention) before basing a session plan on its BW utilization.
+
+**Path-to-60-tps reality check** (post-v5, honest)
+Current per-tok decode = 19.14 ms; 60 tps = 16.67 ms; need 2.47 ms savings.
+
+Per-kernel BW utilization remaining (v5 nsys):
+- MoE gate_up (now 64.9 µs): ~80% BW. Headroom to 95% saves ~10 µs × 40 = 0.4 ms = ~1 tps.
+- MoE down (now 38.6 µs): ~92% BW. At ceiling. No headroom.
+- GDN in_proj_qkv (65.3 µs): ~80% BW. Headroom ~7 µs × 30 = 0.2 ms (already absorbed in v5; e2e gain 0).
+- lm_head (1757 µs): ~93% BW. At ceiling.
+- attn o_proj (38.5 µs): ~69% BW. Headroom ~10 µs × 40 = 0.4 ms (didn't move with my heuristic — needs different tuning).
+- Shared expert gate_up + silu/down + GDN in_proj_z: all at 50-65% BW but small per-call time, total headroom < 0.3 ms/tok.
+
+Realistic kernel-level ceiling: ~52-53 tps. **60 tps requires spec-decode** (currently 0% MTP accept rate).
+
+**Quick context for next session (v5 state)**
+- Compiled: [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) at v5. Lib only valid for `mode="interactive"` (max_batch_size=1).
+- Code changes: [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py](3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py) (sm_87 inner-reduction override) + [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/low_batch_gemv.py](3rdparty/tvm/python/tvm/s_tir/dlight/gpu/low_batch_gemv.py) (sm_87 N>K override).
+- Microbench: `bench_moe_kernel.py --shapes gate_up_gemv,down_gemv,shared_expert_gate_up,shared_expert_down,gdn_in_proj_qkv,attn_o_proj,gdn_in_proj_z` against [baseline_kernels_v5.json](baseline_kernels_v5.json).
+- E2E bench: [baseline_35B_q4f16_1_v5_dlight.json](baseline_35B_q4f16_1_v5_dlight.json) — 51.37 tps tg64.
+- Profile traces: [nsys_35B_v3.nsys-rep](nsys_35B_v3.nsys-rep) (pre-fix), [nsys_35B_v5.nsys-rep](nsys_35B_v5.nsys-rep) (post-fix). `nsys stats --report cuda_gpu_kern_sum --format csv -o - nsys_35B_v5.nsys-rep`.
+- Bar to beat: llama.cpp Q4_K_S = 29.4 tps tg128. **Now MLC = 51.37 tps, 1.745× over.**
+
+**Compile recipe (Orin)** — pinned because flashinfer=off is non-default:
+```bash
+.venv/bin/python -m mlc_llm compile dist/qwen3_6-35B-A3B-q4f16_1 --device cuda \
+  --opt "flashinfer=0;cublas_gemm=1;cudagraph=1;cutlass=1" \
+  -o dist/qwen3_6-35B-A3B-q4f16_1/lib.so
+```
+
+**Next session candidates**
+- A) **attn o_proj** at 69% BW. The K=4096, N=2048 shape didn't move with my (TS,TR) sweep — same time across all configs. Likely needs a different schedule family (TILE_S/TILE_R/VEC_C tuning, or a custom GEMV for K > 2K). Estimated savings: 0.4 ms = ~1 tps.
+- B) **MoE gate_up to 95% BW.** Currently 64.9 µs at 80% BW; ceiling at ~55 µs. May need TILE_S=4 sweep or a custom kernel. Estimated savings: 0.4 ms = ~1 tps.
+- C) **Spec-decode MTP fix** — multi-day, unlocks 60+ tps.
+- D) **Reduce kernel launch count.** Decode has ~80 kernel invocations per token; cuda graph mostly hides this but each graph node has driver-side overhead. Investigation (not action) needed.
+
+---
+
 ## 2026-04-28 (cont. 2) — Parallel topk_softmax kernel: 0.043 → 0.0085 ms (5×). 35B-A3B decode 44.85 → 47.88 tps (**1.629× over llama.cpp Q4_K_S**).
 
 **Done — 1 CTA × 256 threads (one per expert), branch-free k rounds**
