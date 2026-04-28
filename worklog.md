@@ -6,6 +6,53 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-28 (cont. 4) — Option-1 (MoE matmul tile push to 95% BW) ruled out empirically. Tile space exhausted at (32, 16, 2).
+
+**Done — 14-config sweep on production gate_up shape**
+
+After v6 (gdn register-cached) the next time-share head was the MoE q4 dequant+matmul. The worklog's "+1 tps from 80% → 95% BW" estimate assumed dlight tile-tuning had headroom. Re-swept the production gate_up shape (Ne=256, N=1024, K=2048, group=32, top_k=8, B=1) via [bench_one_moe_tile.py](/tmp/bench_one_moe_tile.py) + [sweep_moe_subproc.sh](/tmp/sweep_moe_subproc.sh) — fresh subprocess per config to avoid TVM C-side global re-registration error.
+
+| TS | TR | TILE_S | µs | vs current |
+|---:|---:|---:|---:|---:|
+| **32** | **16** | **2** (current sm_87 override) | **63.12** | — |
+| 8 | 32 | 2 | 62.99 | -0.2% (noise) |
+| 8 | 32 | 4 | 63.19 | +0.1% |
+| 32 | 16 | 4 | 63.64 | +0.8% |
+| 16 | 32 | 1 (default cuda) | 65.64 | +4.0% |
+| 16 | 32 | 2 | 65.66 | +4.0% |
+| 4 | 64 | 4 | 66.52 | +5.4% |
+| 16 | 16 | 4 | 66.88 | +6.0% |
+| 8 | 64 | 1 | 71.87 | +13.9% |
+| 32 | 32 | 2 | 84.05 | +33.2% |
+| 32 | 32 | 1 | 95.28 | +51.0% |
+| 32 | 8 | 4 | 100.83 | +60.0% |
+| 16 | 16 | 8 | 100.94 | +60.0% |
+| 16 | 8 | 8 | 119.80 | +89.8% |
+
+No config beats (32, 16, 2) by more than 0.2% — within run-to-run jitter (std ≈ 0.1 µs). **The dlight `inner_reduction` tile space is flat for this shape.**
+
+**Why the "+1 tps" estimate doesn't hold up**
+The estimate was bandwidth-derived: 64.9 µs × ~9 MB byte budget = 138 GB/s ≈ 68% of 204 GB/s nominal. Naively, lifting to 95% BW saves ~10 µs/call × 47 calls/tok ≈ 0.47 ms = ~1.3 tps. But the sweep shows tile changes don't move the kernel — meaning either:
+1. **The byte budget is wrong.** Q4 weight reads (8 MB) plus scale (1 MB) plus L1/L2 cache traffic from the dequantize-then-multiply pattern may already be hitting effective DRAM BW. Per-element q4 dequant (shift+mask+cast+multiply = 4 ops) on 16M outputs = 64M ops in 64.9 µs = 1 TFlop. **Compute may be the bottleneck**, not DRAM.
+2. **Tile size doesn't expose the right axes.** dlight's `sch_inner_reduction` schedule has fixed structure (decompose_reduction, rfactor twice, compute_at). Moving past requires a different schedule family.
+
+Either way, **dlight tile tuning is exhausted** for sm_87.
+
+**Path forward (honest)**
+- ❌ MoE matmul push via tile tuning: dead end. Confirmed.
+- ❌ Other dlight kernels: per v5 worklog, all checked kernels are at 65-95% BW; remaining tile headroom is <0.5 tps total across them.
+- 🟡 **Custom warp-shuffle GEMV kernel** (multi-session, uncertain): would bypass dlight entirely. Could win ~5-10 µs/call IF compute is actually the bottleneck (not BW). Speculative.
+- 🟢 **Spec decode (B-ext: external draft model)** (multi-day, +20 tps if it works): the only path past 53 tps. Use Qwen3.5-0.8B as draft for 35B-A3B target — same family, shared tokenizer, dense draft. Hard parts: (a) MLC engine support for two-model spec pipeline; (b) tuning accept rate.
+- 🟢 **Ship at v6.** 52.62 tps tg64, 1.789× over llama.cpp Q4_K_S, 163.42 pp_tps. Defensible result.
+
+**State**
+- v6 lib unchanged; gemv.py restored after sweep (verified clean via `git diff` on submodule).
+- No code changes from this session (negative result).
+- Sweep harness: [/tmp/bench_one_moe_tile.py](/tmp/bench_one_moe_tile.py), [/tmp/sweep_moe_subproc.sh](/tmp/sweep_moe_subproc.sh) (transient — not committed).
+- Sweep raw output: [/tmp/claude-1000/-home-alfie-mlc-llm/c3b02c8a-ec86-48e0-8898-9f4b6e84d87d/tasks/b6l55twyv.output](/tmp/claude-1000/-home-alfie-mlc-llm/c3b02c8a-ec86-48e0-8898-9f4b6e84d87d/tasks/b6l55twyv.output) (transient).
+
+---
+
 ## 2026-04-28 (cont. 3) — Option D landed: gdn_func register-cached state. **35B-A3B 51.37 → 52.62 tps tg64 (+2.4%, 1.789× over llama.cpp Q4_K_S)**, prefill 147.85 → 163.42 (+10.5%). Per-kernel gdn_func median **40.4 → 17.3 µs (-57%)**.
 
 **Done — single-file rewrite of [qwen35_model.py:236](python/mlc_llm/model/qwen35/qwen35_model.py#L236) (`create_gated_delta_net_func`)**
