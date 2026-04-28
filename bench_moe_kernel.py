@@ -30,6 +30,7 @@ from mlc_llm.op.moe_matmul import dequantize_gemv, dequantize_group_gemm
 from mlc_llm.op.moe_misc import gating_softmax_topk
 from mlc_llm.quantization.quantization import QUANTIZATION
 from mlc_llm.quantization.group_quantization import GroupQuantizeLinear
+from mlc_llm.quantization.ft_quantization import FTQuantizeLinear
 
 
 # 35B-A3B q4f16_1 MoE shapes (Qwen3.6-35B-A3B):
@@ -69,6 +70,16 @@ SHAPES = {
     # v3 production: 42.5 µs/call × 30 calls = 1.27 ms/tok at 62% BW.
     # NOTE: bench harness only fuses dequant+matmul, not the silu/multiply.
     "gdn_in_proj_z":         dict(Ne=0, N=4096, K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    # ===== FT (CUTLASS FpAIntB) candidates at g=64 — Phase 2D microbench =====
+    # group_size=64 is the production constraint (FineGrainedScaleZeroIterator
+    # hard-bakes group_size/64). Compare medians vs the q4f16_1 g=32 dlight
+    # baselines above.
+    "ft_shared_expert_gate_up": dict(Ne=0, N=1024,   K=2048, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
+    "ft_shared_expert_down":    dict(Ne=0, N=2048,   K=512,  group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
+    "ft_gdn_in_proj_qkv":       dict(Ne=0, N=8192,   K=2048, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
+    "ft_attn_o_proj":           dict(Ne=0, N=2048,   K=4096, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
+    "ft_gdn_in_proj_z":         dict(Ne=0, N=4096,   K=2048, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
+    "ft_lm_head":               dict(Ne=0, N=248064, K=2048, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
 }
 
 
@@ -128,6 +139,24 @@ class _DenseGemvModule(nn.Module):
         return self.linear(x)
 
 
+class _FTDenseGemvModule(nn.Module):
+    """Single q4f16_ft_g64 dense GEMV via CUTLASS FpAIntB extern."""
+
+    def __init__(self, in_features: int, out_features: int, group_size: int):
+        super().__init__()
+        config = QUANTIZATION[f"q4f16_ft_g{group_size}"]
+        self.linear = FTQuantizeLinear(
+            in_features=in_features,
+            out_features=out_features,
+            config=config,
+            bias=False,
+            out_dtype=None,
+        )
+
+    def forward(self, x):
+        return self.linear(x)
+
+
 def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
              spread: bool, kind: str, target, dev):
     if kind == "topk_softmax":
@@ -153,6 +182,16 @@ def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
             }
         }
         m = _DenseGemvModule(in_features=K, out_features=N)
+    elif kind == "ft_dense_gemv":
+        # FT path via CUTLASS FpAIntB (libfpA_intB_gemm.so). q_weight is int8
+        # storage (2 elts/byte for int4) shape (K, N/2); q_scale is fp16 shape
+        # (K/group_size, N).
+        mod_spec = {
+            "forward": {
+                "x": spec.Tensor([B, K], "float16"),
+            }
+        }
+        m = _FTDenseGemvModule(in_features=K, out_features=N, group_size=group_size)
     elif kind == "gemv":
         # gemv: indptr is (1, top_k); x is (B, K) where B in {1, top_k}
         mod_spec = {
@@ -181,8 +220,10 @@ def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
     from mlc_llm.compiler_pass.fuse_dequantize_transpose import FuseDequantizeTranspose
     from mlc_llm.compiler_pass.fuse_transpose_matmul import FuseTransposeMatmul
     from mlc_llm.compiler_pass.fuse_dequantize_matmul_ewise import FuseDequantizeMatmulEwise
+    from mlc_llm.compiler_pass.fuse_ft_dequantize_matmul_epilogue import FuseFTDequantizeEpilogue
     from mlc_llm.compiler_pass.low_batch_specialization import LowBatchGemvSpecialize
     with target:
+        mod = FuseFTDequantizeEpilogue()(mod)
         mod = FuseDequantizeTranspose()(mod)
         mod = FuseTransposeMatmul()(mod)
         mod = relax.transform.LegalizeOps()(mod)
@@ -221,6 +262,15 @@ def make_inputs(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
         x_np = rng.standard_normal((B, K), dtype="float32").astype(np.float16)
         w_np = rng.integers(0, 2**32, size=(N, K // 8), dtype=np.uint32)
         scale_np = (rng.standard_normal((N, K // group_size), dtype="float32") * 0.01).astype(np.float16)
+        return [_upload(a, dev) for a in (x_np, w_np, scale_np)]
+
+    if kind == "ft_dense_gemv":
+        # FT layout: q_weight (K, N/2) int8 (2 int4 packed per byte),
+        #            q_scale  (K/group_size, N) fp16.
+        # Random values are fine for timing — kernel speed is data-independent.
+        x_np = rng.standard_normal((B, K), dtype="float32").astype(np.float16)
+        w_np = rng.integers(-128, 128, size=(K, N // 2), dtype=np.int8)
+        scale_np = (rng.standard_normal((K // group_size, N), dtype="float32") * 0.01).astype(np.float16)
         return [_upload(a, dev) for a in (x_np, w_np, scale_np)]
 
     x_np = rng.standard_normal((B, K), dtype="float32").astype(np.float16)

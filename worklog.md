@@ -6,6 +6,68 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 🔖 SESSION HANDOFF (2026-04-28 cont. 2) — Phase 2D CLOSED (CUDA graph exclusion kills gain); Phase 3 preflight next
+
+**Where we are**
+- **Baseline unchanged**: v6 at 52.62 tps tg64 (lib in dist/qwen3_6-35B-A3B-q4f16_1/).
+- **Phase 2D result**: q4f16_ft_g64 lib benched at **50.62 tps tg64 (−3.8% regression)**. Perf gate failed; closed.
+- **Phase 3 preflight**: token-agreement script staged at [scripts/spec_decode_token_agreement.py](scripts/spec_decode_token_agreement.py). Run next.
+- **Working tree**: uncommitted changes to ft_quantization.py (MoE gate bugfix + MixtralExperts fallback) + bench_moe_kernel.py (FT shapes). Commit before pivoting.
+
+**Phase 2D autopsy — why CUDA graph exclusion kills the gain**
+
+T1 kernel bench showed real speedups at the kernel level:
+- attn_o_proj: −32.2%, gdn_in_proj_z: −26.2%, shared_expert_gate_up: −16.5%, lm_head: −11.0%
+- Naive per-tok projection: +1.27 ms/tok saved = predicted 56.4 tps
+
+But FT extern calls emit `relax.call_pure_packed("fastertransformer.gemm_fp16_int", ...)` — these are runtime host dispatch, not capturable by CUDA graph. v6 dlight kernels are pure TIR → captured → zero launch overhead. With `cudagraph=1`, switching ~5 hot Linears per layer × 40 layers to extern means ~200 extra host→GPU round-trips per decode step, costing **2+ ms/tok in launch overhead alone** on Orin's slow CPU-GPU bridge.
+
+**What this tells us about sm_87 + CUDA graph**: FT is only profitable if `cudagraph=0` (full launch overhead for all kernels) or if there's a way to force the FT calls into the cuda graph (would require wrapping them in a TIR primfunc shell). Neither is worth pursuing — the gap to v6 is 2 tps in the wrong direction.
+
+**Phase 2D artifacts (safe to delete if disk space needed)**
+- `dist/qwen3_6-35B-A3B-q4f16_ft_g64/` — 19 GB. Not a useful lib.
+- `baseline_kernels_ft_g64.json` — kernel timings, keep for reference.
+- `baseline_35B_q4f16_ft_v7.json` — e2e bench result, keep for record.
+
+---
+
+## 2026-04-28 (cont. 5) — Phase 2D: FT hybrid quant ruled out; CUDA graph exclusion eats kernel gains
+
+**Done**
+
+**T1 — kernel microbench**: Extended [bench_moe_kernel.py](bench_moe_kernel.py) with FT-path shapes (kind="ft_dense_gemv"), added `_FTDenseGemvModule` using `FTQuantizeLinear`. At g=64 vs v6 dlight g=32:
+
+| Shape | v6 µs | FT µs | Δ |
+|---|---:|---:|---:|
+| shared_expert_gate_up | 11.18 | 9.34 | −16.5% ✓ |
+| shared_expert_down | 8.01 | 8.69 | +8.5% (slower) |
+| gdn_in_proj_qkv | 63.15 | 58.03 | −8.1% |
+| attn_o_proj | 35.06 | 23.76 | −32.2% ✓ |
+| gdn_in_proj_z | 34.02 | 25.12 | −26.2% ✓ |
+| lm_head | 1711.66 | 1523.42 | −11.0% ✓ |
+
+T1 gate passed (≥10% faster on ≥3 shapes incl. lm_head).
+
+**T2 — FTQuantize patch**: Found and fixed a latent bug: `visit_module` was pre-populating `param_map[weight.q_weight/q_scale]` for MoE gate Linears before the `is_moe_gate` skip, leaving those weights in param_map with no map_func → `KeyError` on first 35B convert attempt. Fix: moved param_map population inside each quantize branch (fallback + FTQuantize), so MoE gates now fall through cleanly to fp16. Added `MixtralExperts` branch that uses `fallback_group_quantize()` (g=32) to route MoE experts through dlight, preventing OOM from fp16 MoE.
+
+**T3 — convert + compile + bench**:
+- convert: 35.95B params → 18.15 GB, 4.336 bits/param, 187 shards. Clean.
+- compile: 63 MB sm_87 lib.so. Clean.
+- bench: **tg_tps 50.62 (−3.8% vs v6 52.62). pp_tps 164.39 (+0.6%). PERF GATE FAILED.**
+
+**Why the regression**: FT extern calls (`call_pure_packed`) are excluded from CUDA graph capture. In v6 all TIR kernels are captured → near-zero per-step overhead. With v7 FT, ~200 extern dispatches/step incur host CPU→GPU round-trips on Orin's slower CPU-GPU bridge. The kernel savings (~1.3 ms) are overwhelmed by dispatch overhead (~2+ ms).
+
+**Ruling out FT on Orin with cudagraph=1** — this is a hard constraint. Workarounds (TIR wrapper shell around extern, cudagraph=0 rebuild) not worth 2-5 sessions for what would at best recover to v6 level. Mark closed.
+
+**State**
+- v6 lib unchanged, still current.
+- ft_quantization.py: MoE gate bugfix + MixtralExperts fallback (committed separately — these are improvements even if Phase 2D didn't land).
+- Next: Phase 3 B-ext spec decode preflight (token-agreement check).
+
+---
+
+## 🔖 SESSION HANDOFF (2026-04-28 EOD) — v6 shipped at 52.62 tps; next is Phase 2D (FT hybrid quant) OR Phase 3 (B-ext spec decode)
+
 ## 🔖 SESSION HANDOFF (2026-04-28 EOD) — v6 shipped at 52.62 tps; next is Phase 2D (FT hybrid quant) OR Phase 3 (B-ext spec decode)
 
 **Where we are**

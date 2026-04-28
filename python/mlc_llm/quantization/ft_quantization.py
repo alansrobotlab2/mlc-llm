@@ -15,10 +15,12 @@ from ..op import faster_transformer_dequantize_gemm
 from ..support import logging
 from ..support.auto_target import detect_cuda_arch_list
 from ..support.style import bold
+from ..nn import MixtralExperts
 from .group_quantization import (
     GroupQuantize,
     GroupQuantizeEmbedding,
     GroupQuantizeLinear,
+    GroupQuantizeMixtralExperts,
 )
 from .utils import is_final_fc, is_moe_gate
 
@@ -124,10 +126,6 @@ class FTQuantize:
                 """
                 if isinstance(node, nn.Linear):
                     weight_name = f"{name}.weight"
-                    self.quant_map.param_map[weight_name] = [
-                        f"{name}.q_weight",
-                        f"{name}.q_scale",
-                    ]
                     if (
                         is_final_fc(name)
                         or node.out_dtype == "float32"
@@ -154,9 +152,17 @@ class FTQuantize:
                             node.out_dtype,
                         )
                         group_quantize = self.config.fallback_group_quantize()
+                        self.quant_map.param_map[weight_name] = [
+                            f"{name}.q_weight",
+                            f"{name}.q_scale",
+                        ]
                         self.quant_map.map_func[weight_name] = group_quantize.quantize_weight
                         return GroupQuantizeLinear.from_linear(node, group_quantize)
                     if not is_moe_gate(name, node):
+                        self.quant_map.param_map[weight_name] = [
+                            f"{name}.q_weight",
+                            f"{name}.q_scale",
+                        ]
                         self.quant_map.map_func[weight_name] = self.config.quantize_weight
                         return FTQuantizeLinear.from_linear(node, self.config)
                 if isinstance(node, nn.Embedding):
@@ -168,6 +174,21 @@ class FTQuantize:
                     group_quantize = self.config.fallback_group_quantize()
                     self.quant_map.map_func[weight_name] = group_quantize.quantize_weight
                     return GroupQuantizeEmbedding.from_embedding(node, group_quantize)
+                if isinstance(node, MixtralExperts):
+                    # CUTLASS FpAIntB has no MoE-grouped variant for the q4
+                    # path. Route MixtralExperts through the GroupQuantize
+                    # fallback (q4f16_1, g=32) so the routed-expert kernels
+                    # remain on dlight while dense Linears go through FT.
+                    group_quantize = self.config.fallback_group_quantize()
+                    weight_name = f"{name}.weight"
+                    self.quant_map.param_map[weight_name] = [
+                        f"{name}.q_weight",
+                        f"{name}.q_scale",
+                    ]
+                    self.quant_map.map_func[weight_name] = group_quantize.quantize_weight
+                    return GroupQuantizeMixtralExperts.from_mixtral_experts(
+                        node, group_quantize
+                    )
                 return self.visit(name, node)
 
         model.to(dtype=self.model_dtype)
