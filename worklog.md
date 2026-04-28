@@ -6,6 +6,53 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-28 — Option B (MTP self-spec) ruled out empirically. Trained Qwen3.5 MTP head is not a usable multi-token draft.
+
+**Done — three independent diagnostic angles, all converged**
+
+1. **Reproduced 0% accept-rate baseline** — `MLC_LOG_SPEC_VERIFY=1 python -u scripts/spec_smoke.py --max-tokens 32 --draft-length 4` shows `accept_count=[N, 0, 0, 0, 0]` and 17.5 spec tps vs ~21 target_only tps (spec mode is a net loss). Same as the 2026-04-27 evening session — the bug is preexisting, not from today's dlight changes.
+
+2. **MLC C++ instrumentation** — added env-gated `MLC_LOG_SPEC_VERIFY=1` LOGs in [eagle_batch_verify.cc](cpp/serve/engine_actions/eagle_batch_verify.cc) and [eagle_new_request_prefill.cc](cpp/serve/engine_actions/eagle_new_request_prefill.cc) to dump per-position `(draft_token, target_argmax, target_p_of_draft)` plus prefill `input_length` for each model. (Reverted before commit — dev-only diagnostics.) Confirmed:
+   - Drafts are coherent token IDs but **semantically random** (Chinese chars, suffixes, special tokens, `<|im_end|>`, `_____`, `ต์`) with a clear stickiness pattern (same token repeats across consecutive draft steps within a round).
+   - `[prefill model_id=0 i=0] input_length=26` and `[prefill model_id=1 i=0] input_length=26` — the intended `mstates[draft]->inputs[1:]` shift in `eagle_new_request_prefill.cc:104-113` did not fire (or had no observable effect): both target and draft prefilled with the same length. So the MLC engine pairs `(embed_n, hidden_n)` same-position, no shift.
+
+3. **Pure-PyTorch MTP probe** ([scripts/mtp_head_pytorch_check.py](scripts/mtp_head_pytorch_check.py)) — loads the 15 `mtp.*` weights directly from HF safetensors into a from-scratch RMSNorm+attn+MLP impl, runs three diagnostics:
+
+| convention | meaning | hit rate (14 pos) |
+|---|---|---:|
+| A: `(h_n, e_{n+1}) → T_{n+2}` | DeepSeek-V3 MTP | **0/14** |
+| A: `(h_n, e_{n+1}) → T_{n+1}` | 1-step "echo" | 8/14 + several near-misses |
+| B: `(h_n, e_n) → T_{n+1}` | EAGLE-1 same-pos | 0/14 |
+| C: `(h_{n-1}, e_n) → T_{n+1}` | EAGLE-2 / inverted | 0/14 |
+| cos(MTP_out, target h_{n+1}) | MTP as cheap stand-in for next hidden | **0.01–0.23** (no) |
+
+Then chained MTP autoregressively (prefill MTP KV from target's hiddens for positions 0..S-1, then chain γ steps using MTP's own hidden as the "previous hidden"):
+- truth: `,`, ` Paris`, ` is`, ` the`
+- chain: ` `, ` `, `ied`, `ied`  ← nonsense after step 0.
+
+**Conclusion**
+
+The Qwen3.5 MTP head behaves as a **1-step training auxiliary that mostly echoes its embedding input**. Specifically:
+- It is *not* a 2-step-ahead generator like DeepSeek-V3 MTP (0/14 on the DeepSeek convention).
+- Its hidden output is *not* close to target's actual next-position hidden (cos sim 0.01–0.23), so it can't substitute for running target on the next token.
+- Chaining it autoregressively produces nonsense after step 0.
+
+The 0% accept rate in the MLC engine is **not a wiring bug** — even with perfect plumbing, this head can't draft useful tokens. Inspecting `mtp.fc.weight` confirms the embedding columns (mean abs 0.0028, max 0.58, frob 5.5) dominate the hidden columns (mean abs 0.0027, max 0.04, frob 3.7) — the head was trained to pass the embedding signal through largely intact, which is what we see in the probe. Whether this matches DeepSeek-V3's MTP-as-spec design or is a Qwen-team-specific "MTP for richer training signal" auxiliary, the head as released is not a viable spec-decode draft.
+
+**Path forward (multi-day, not Option A)**
+- **B-ext**: external draft model (e.g., Qwen2.5-0.5B q4 as draft for the 0.8B target — shares tokenizer; or Qwen3.5-0.8B as draft for the 35B-A3B target — same family). EAGLE pipeline assumes the draft has its own KV cache + own architecture; manageable but multi-day. Risk: verify-time hidden-state alignment between hybrid+MoE target and dense draft.
+- **D**: `gdn_func` custom kernel rewrite (1.19 ms/tok at ~55% BW; ~1.5 tps headroom). Multi-session.
+- **E**: kernel-launch reduction (~0.2 ms/tok = ~0.5 tps from fusing residual+norm pairs at the Relax level). Single session.
+
+**Current state for next session**
+- 35B-A3B q4f16_1: **51.37 tps tg64, 1.745× over llama.cpp Q4_K_S 29.4**. Per-tok decode 19.14 ms.
+- v5 lib at [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so).
+- Kernel-tile-tuning ceiling ~52–53 tps. Past that needs D, E, or B-ext.
+- C++ engine reverted to clean state (no debug LOGs); rebuilt cleanly at the end of session. Working tree clean.
+- 20 commits + 2 submodule commits ahead of origin/qwen3_next; not pushed.
+
+---
+
 ## 2026-04-27 (cont.) — Option A exhausted: 51.37 tps is the kernel-tile-tuning ceiling.
 
 After committing v5, swept harder on the remaining static-shape decode kernels (`attn_o_proj` K=4096 N=2048, `gdn_in_proj_z` K=2048 N=4096, `lm_head` N=248K, `gdn_in_proj_qkv` K=2048 N=8192). Used a corrected microbench that pins `B=1` (static) so dispatch matches production (the v2 batch_decode fix specialized seq_len=1 across the decode graph, so all decode kernels go through `gemv.py inner_reduction` not `low_batch_gemv.py`).
