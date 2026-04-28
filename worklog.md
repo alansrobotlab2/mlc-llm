@@ -8,6 +8,8 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ## 2026-04-28 (cont.) — **35B-A3B decode +343% in one session**: 10.12 → 44.85 tps. **1.52× over llama.cpp Q4_K_S.** Two architectural wins; 60 tps still ~1.34× away.
 
+> **Next session pickup — Option A: parallel topk_softmax.** Custom kernel at [moe_misc.py:135](python/mlc_llm/op/moe_misc.py#L135) (and the matching plain `gating_topk` at [moe_misc.py:63](python/mlc_llm/op/moe_misc.py#L63)) parallelizes only over `batch_size`; at b=1 a single thread sequentially scans 256 experts in 42 µs/call. Microbench is wired up as `bench_moe_kernel.py --shapes topk_softmax`; baseline at [baseline_topk_v0.json](baseline_topk_v0.json) (median 0.042 ms). Goal: rewrite as 1 CTA × 256 threads (one per expert) doing a parallel argmax × k rounds, or block-wide bitonic. Constraint: pure TIR (no thrust → cudagraph-safe). Expected win: ~5 µs/call → ~1.4 ms/token saved → ~3 tps gain (45 → ~48). After kernel works, recompile and run `bench_mlc.py --baseline baseline_35B_q4f16_1_v2_gemv.json` to confirm e2e.
+
 **TL;DR**
 - Two clean fixes, both 1-3 line changes after the diagnosis:
   1. `CTA_COUNT` 1024 → 64 in `dequantize_group_gemm` (Hopper-tuned grid size on Orin) → 19.72 tps.

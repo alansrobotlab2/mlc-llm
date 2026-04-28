@@ -27,6 +27,7 @@ from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import spec
 
 from mlc_llm.op.moe_matmul import dequantize_gemv, dequantize_group_gemm
+from mlc_llm.op.moe_misc import gating_softmax_topk
 
 
 # 35B-A3B q4f16_1 MoE shapes (Qwen3.6-35B-A3B):
@@ -46,6 +47,8 @@ SHAPES = {
     # gemv (intended decode path; not currently dispatched at b=1)
     "gate_up_gemv":    dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=1,    spread=False, kind="gemv"),
     "down_gemv":       dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=8,    spread=False, kind="gemv"),
+    # topk_softmax (MoE router): single-thread sequential scan at b=1
+    "topk_softmax":    dict(Ne=256, N=0,    K=2048, group_size=0,  top_k=8, B=1,    spread=False, kind="topk_softmax"),
 }
 
 
@@ -76,9 +79,30 @@ class _DequantGemvModule(nn.Module):
         )
 
 
+class _TopKSoftmaxModule(nn.Module):
+    def __init__(self, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+
+    def forward(self, x):
+        # gating_softmax_topk dispatches to the custom top{k}_softmax kernel
+        # when norm_topk_prob=True (the Qwen3.6 default).
+        return gating_softmax_topk(x, k=self.top_k, norm_topk_prob=True)
+
+
 def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
              spread: bool, kind: str, target, dev):
-    if kind == "gemv":
+    if kind == "topk_softmax":
+        # gating_softmax_topk takes (B, num_experts) "gate logits" and returns
+        # (top-k weights, top-k indices). K here re-purposed as num_experts? No:
+        # for this shape we use Ne as num_experts. Inputs: x = (B, Ne).
+        mod_spec = {
+            "forward": {
+                "x": spec.Tensor([B, Ne], "float16"),
+            }
+        }
+        m = _TopKSoftmaxModule(top_k)
+    elif kind == "gemv":
         # gemv: indptr is (1, top_k); x is (B, K) where B in {1, top_k}
         mod_spec = {
             "forward": {
@@ -121,6 +145,11 @@ def _upload(arr_np: np.ndarray, dev):
 
 def make_inputs(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
                 spread: bool, kind: str, dev, rng):
+    if kind == "topk_softmax":
+        # Single input: gate logits of shape (B, Ne).
+        x_np = rng.standard_normal((B, Ne), dtype="float32").astype(np.float16)
+        return [_upload(x_np, dev)]
+
     x_np = rng.standard_normal((B, K), dtype="float32").astype(np.float16)
     w_np = rng.integers(0, 2**32, size=(Ne, N, K // 8), dtype=np.uint32)
     scale_np = (rng.standard_normal((Ne, N, K // group_size), dtype="float32") * 0.01).astype(np.float16)
