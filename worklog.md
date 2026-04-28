@@ -6,6 +6,68 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-28 (cont. 3) — Option D landed: gdn_func register-cached state. **35B-A3B 51.37 → 52.62 tps tg64 (+2.4%, 1.789× over llama.cpp Q4_K_S)**, prefill 147.85 → 163.42 (+10.5%). Per-kernel gdn_func median **40.4 → 17.3 µs (-57%)**.
+
+**Done — single-file rewrite of [qwen35_model.py:236](python/mlc_llm/model/qwen35/qwen35_model.py#L236) (`create_gated_delta_net_func`)**
+
+The pre-rewrite kernel walked the recurrent state through `state_out_buf` (GMEM)
+five times per token: init → decay → dot_sk → delta → dot_sq. Each pass did
+128 fp32 reads + 128 fp32 writes per (b, h, col) lane. The dump of phase4 IR
+confirmed `T.reads(state_out_buf[...])` / `T.writes(state_out_buf[...])` on every
+pass — the compiler did NOT promote the cross-pass state to registers because
+state_out_buf is the output GMEM handle.
+
+The rewrite allocates a per-thread `state_local` (`T.sblock_alloc_buffer((K,), "float32", scope="local")`) once at the top of the (b_idx, h_idx, col) thread body, loads state_in into it once, runs all 5 passes against the local buffer, and flushes back to state_out exactly once at the end. K=128 fp32 fits comfortably in registers (128 regs/thread × 128 threads/block × 32 blocks → 4 blocks/SM × 8 SMs at decode, well under Orin's 16 SMs and 64 KB register file). Also fused decay+dot_sk into one row pass and delta+dot_sq into a second, halving row iterations.
+
+Same change applied to [`create_gated_delta_net_func_with_history`](python/mlc_llm/model/qwen35/qwen35_model.py#L390) for spec verify (not on the perf hot path but kept consistent — flushes per-t into the history slot).
+
+**Numerical parity** — `/tmp/gdn_parity.py` runs 4 shapes (decode 35B/0.8B, verify s5, prefill s128) against a NumPy reference impl. Max |out - ref| = 1.1e-8, max |state - ref| = 3.4e-8 across all shapes. Identical to fp32 rounding; not even a drift relative to the prior kernel.
+
+**Microbench** ([bench_gdn_kernel.py](bench_gdn_kernel.py), saved to [baseline_gdn_v0.json](baseline_gdn_v0.json)):
+
+| shape | v0 µs | v6 µs | Δ |
+|---|---:|---:|---:|
+| decode_35B (B=1, S=1, 32H) | 53.06 | 30.16 | -43% |
+| decode_0.8B (B=1, S=1, 16H) | 23.48 | 12.59 | -46% |
+| verify_35B_s5 | 161.66 | 57.39 | -65% |
+| prefill_35B_s128 | 3478.59 | 788.42 | **-77%** |
+
+Larger seq_len wins more because the per-token state-traffic share gets dominated by the `5× per pass` walk; the fewer passes amortize more wins per token. This explains the 10.5% e2e prefill speedup on top of the decode gain.
+
+**E2E** ([baseline_35B_q4f16_1_v6_gdn.json](baseline_35B_q4f16_1_v6_gdn.json), Orin AGX, ctx=128, tg=64):
+
+| version | tg_tps | pp_tps | vs llama.cpp Q4_K_S |
+|---|---:|---:|---:|
+| v5 (sm_87 dlight + low_batch_gemv) | 51.37 | 147.85 | 1.745× |
+| **v6 (gdn register-cached)** | **52.62** | **163.42** | **1.789×** |
+
+Per-kernel `gdn_func_kernel` (nsys [nsys_35B_v6.nsys-rep](nsys_35B_v6.nsys-rep)):
+- v5: 1200 inst × 40.4 µs median = ~1.45 ms/tok over 32 decode tokens (36 layers × 40.4 µs).
+- v6: 2304 inst × 17.3 µs median = ~0.62 ms/tok over 64 decode tokens.
+- Saved **0.83 ms/tok** in gdn — but e2e only saw 0.47 ms/tok (51.37 → 52.62). The remaining ~0.36 ms/tok went to other overhead (cuda-graph node dispatch, kernel-launch floor) — exactly the "0.3 ms/tok unavoidable" mentioned in the v5 entry.
+
+**Next bottleneck (from v6 nsys top kernels):**
+
+| kernel | per-tok ms | %tok |
+|---|---:|---:|
+| fused_dequantize_NT_matmul7 (lm_head?) | 1.69×126/64 = 3.33 ms (×prefill?) | check |
+| fused_dequantize5_NT_matmul4 (MoE gate_up?) | 43.9 µs × 47 calls = 2.06 | 11% |
+| fused_dequantize1_NT_matmul (MoE down?) | 39.0 µs × 35 calls = 1.37 | 7% |
+| fused_dequantize6_NT_matmul5 | 23.5 µs × 47 = 1.10 | 6% |
+| gdn_func | 17.3 µs × 36 = 0.62 | 3% |
+| fused_dequantize4_NT_matmul3 | 14.3 µs × 47 = 0.67 | 4% |
+
+Top time-share is now the q4 dequant+matmul kernels for MoE expert outputs. These were already measured at 80% BW in v3 (gate_up at ~64.9 µs); confirming microbench shows they're at the bandwidth ceiling for the dequant-then-multiply schedule. The remaining headroom there is small (5–10% at best). Past this, the only real moves are spec-decode (B-ext: external draft model) or fewer-launches (residual+norm fusion is **already done** — see Option E note).
+
+**Option E status: already implemented.** [FuseAddRMSNorm](python/mlc_llm/compiler_pass/fuse_add_norm.py) fuses every `rms_norm(add(x, y), w)` site at the Relax level. Trace shows `fuse_add_norm_*` firing ~95×/tok already. The remaining unfused norms are q_norm/k_norm in 12 attention layers + the layer-0 input_norm (~26 calls × 2.5 µs ≈ 65 µs/tok = at most 0.18 tps). Not worth a separate session.
+
+**Code state**
+- v6 lib: [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) (rebuilt 08:42 today, 21 GB total at 4K context).
+- v5 lib backup: [dist/qwen3_6-35B-A3B-q4f16_1/lib_v5.so.bak](dist/qwen3_6-35B-A3B-q4f16_1/lib_v5.so.bak).
+- New artifacts: [bench_gdn_kernel.py](bench_gdn_kernel.py), [baseline_gdn_v0.json](baseline_gdn_v0.json), [baseline_35B_q4f16_1_v6_gdn.json](baseline_35B_q4f16_1_v6_gdn.json), [nsys_35B_v6.nsys-rep](nsys_35B_v6.nsys-rep).
+
+---
+
 ## 2026-04-28 — Option B (MTP self-spec) ruled out empirically. Trained Qwen3.5 MTP head is not a usable multi-token draft.
 
 **Done — three independent diagnostic angles, all converged**
