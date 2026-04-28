@@ -6,6 +6,175 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-28 (cont.) — **35B-A3B decode +343% in one session**: 10.12 → 44.85 tps. **1.52× over llama.cpp Q4_K_S.** Two architectural wins; 60 tps still ~1.34× away.
+
+**TL;DR**
+- Two clean fixes, both 1-3 line changes after the diagnosis:
+  1. `CTA_COUNT` 1024 → 64 in `dequantize_group_gemm` (Hopper-tuned grid size on Orin) → 19.72 tps.
+  2. `batch_decode` spec batch_size dynamic → static `1` so the existing `if num_tokens == 1:` resolves at compile time and dispatches to `dequantize_gemv` (the MoE small-batch path that was unreachable) → **44.85 tps**.
+- vs llama.cpp Q4_K_S 29.6 tps tg128: was 0.34×, now **1.52×**.
+- 60 tps target needs ~1.34× more; remaining headroom requires multi-step kernel work (parallel topk, dlight gemv tuning for sm_87, or functional spec-decode).
+
+**The second fix — diagnosis chain**
+- After fix #1, profile showed `dequantize_group_gemm` *still* dominant (78% → still ~24% after node-mode trace) firing 1280 times = 40 layers × 32 decode tokens. Per-call already cut to 0.49 ms; hard ceiling without deeper schedule work.
+- Microbenched the alternative `dequantize_gemv` kernel at the same shape (which is what the MoE block IS supposed to dispatch to at b=1). Result: **6.3× faster** — 0.066 ms gate_up / 0.053 ms down vs 0.491 / 0.261 ms. dlight gemv schedule was already well-tuned; we just weren't using it.
+- Found the dispatch fork in [group_quantization.py:800-811](python/mlc_llm/quantization/group_quantization.py#L800-L811) — `if indptr.ndim == 2:` routes to `dequantize_gemv`, else to `dequantize_group_gemm`. The MoE block at [qwen3_5_moe_model.py:125](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L125) has `if num_tokens == 1:` to pick the 2D-indptr (gemv) path.
+- **Why the gemv path was unreachable in TVM 0.20**: with `batch_decode` spec `["batch_size", 1, hidden]`, `batch_size` is a SizeVar. `num_tokens = batch_size * 1` simplifies to a SizeVar. `bool(SizeVar('batch_size') == 1)` returns `False` (silently — not an exception). So the Python `if num_tokens == 1:` always falls to the `else` branch and builds 1D indptr → group_gemm. **Pinning batch_size to a literal `1` in the spec resolves the comparison at compile time and routes through gemv.** Trade-off: this lib only supports max_batch_size=1 (interactive mode); server mode would need either dynamic batch restored or a Relax `If` for runtime dispatch.
+
+**Final scoreboard — Orin AGX cuda:0, ctx=128, tg=64 (median over 2 runs)**
+
+| version | change | tg_tps | vs baseline | vs llama.cpp |
+|---|---|---:|---:|---:|
+| baseline | (10.12 tps starting point) | 10.12 | 1.00× | 0.34× |
+| v1 | CTA_COUNT 1024 → 64 | 19.72 | 1.95× | 0.67× |
+| **v2** | + spec batch_decode batch_size = 1 | **44.85** | **4.43×** | **1.52×** |
+
+Microbench medians on dequantize MoE kernels (b=1 top-8):
+
+| kernel | original | v1 (CTA=64) | v2 (gemv path) |
+|---|---:|---:|---:|
+| MoE gate_up | 1.002 ms | 0.491 ms | **0.066 ms** |
+| MoE down | 0.950 ms | 0.261 ms | **0.053 ms** |
+
+Per-token MoE compute: 30 ms → 4.76 ms. Per-token decode wall: 96.4 ms → 22.3 ms. Bandwidth utilization: 8.6% → 36% of Orin's ~180 GB/s practical.
+
+**One fix attempted, reverted: `op.softmax + op.topk` for routing**
+- Custom `top8_softmax` kernel ([moe_misc.py:135](python/mlc_llm/op/moe_misc.py#L135)) parallelizes only over batch_size (TX=1024 threads/CTA), so at b=1 a single thread sequentially scans all 256 experts in 41 µs. Total: 1.64 ms/tok. Tried replacing with `op.softmax + op.topk + manual norm`. Standard ops parallelize over the expert axis, expected ~10× faster.
+- **Crash on engine init**: `cudaErrorStreamCaptureImplicit: operation would make the legacy stream depend on a capturing blocking stream`. `op.topk` lowers to a thrust-backed kernel which uses the legacy stream and is incompatible with the cudagraph capture path that mlc_llm uses for decode. Reverted; `op.topk` is not a drop-in replacement under cudagraph.
+- Lesson for the next attempt: any standard Relax op pulled into the hot decode path needs to be cudagraph-compatible. Thrust ops are out. Need to either write a parallel topk in pure TIR (no thrust) or bypass cudagraph for that block.
+
+**What's left in the budget (the path to 60 tps)**
+Per-token decode now 22.3 ms; 60 tps = 16.7 ms. Need ~5.6 ms savings.
+
+Ranked candidates (per-token cost / current BW utilization / estimated savings):
+1. **Parallel topk_softmax** ([moe_misc.py:135-220](python/mlc_llm/op/moe_misc.py#L135-L220)). 1.64 ms/tok, single-threaded inner loop. Custom TIR rewrite to parallelize across the 256-expert axis (one thread per expert + warp-reduce argmax × k rounds). Estimated savings: ~1.4 ms/tok = ~3 tps. Cudagraph-compatible.
+2. **Shared expert dlight gemv** (`fused_dequantize4_NT_matmul3` and friends, 1.52 ms/tok at 14% BW). The 1024×2048 q4 GEMV is running at 14% BW which is anomalously low for dlight. Either tune dlight schedule for sm_87 or hand-write a custom kernel. Estimated savings: ~1 ms/tok = ~2 tps.
+3. **moe_dequantize_gemv1 (down)** at 42% BW. Could push to 60-70% with better tile shape. Estimated savings: ~0.5 ms/tok = ~1 tps.
+4. **GDN dense matmuls** (`fused_dequantize1_NT_matmul`, 2.18 ms/tok at 46% BW). Same TVM-side tuning. Estimated savings: ~0.5 ms/tok.
+5. **Spec-decode finally working.** Path 1 plumbing landed yesterday but accept rate is 0% (MTP draft target-misaligned). If we can get 30%+ accept rate, decode multiplier could push 60+ tps before any kernel work. Multi-day MTP triage.
+
+Total realistic from #1-#4: ~6 ms/tok savings → ~56 tps. To definitively cross 60 we'd need either spec-decode or the dlight gemv tuning to overshoot. Not a one-session task.
+
+**Things I learned about this codebase**
+- `bool(tirx.PrimExpr)` returns `False` silently for symbolic comparisons in TVM 0.20. Earlier TVM versions raised. This breaks Python-level `if symbolic_var == const:` patterns throughout MoE/quant code that were written before the API change. Worth a sweep of `python/mlc_llm/` for `if .* == [0-9]:` patterns where one side is a SizeVar; each is a potential dispatch bug.
+- `cublas_gemm` is hard-disabled for q4 quantization at [compiler_flags.py:103-113](python/mlc_llm/interface/compiler_flags.py#L103-L113) — only enables for q0 (no quant) or fp8. We can't use cuBLAS even on supported arch.
+- `cutlass_group_gemm` requires `arch in {"sm_90a", "sm_100a"}` ([extern.py:43-47](python/mlc_llm/op/extern.py#L43-L47)). Orin (sm_87) is excluded; Hopper/Blackwell only. Same for `cutlass_gemm`.
+- `op.topk` uses thrust under the hood — incompatible with cudagraph. Avoid in decode hot path.
+- The `if x.shape[0] * x.shape[1] == 1:` pattern in `qwen3_moe`, `qwen2_moe`, `qwen3_5_moe` MoE blocks all have the same SizeVar dispatch bug. Each routes through the slower group_gemm at decode silently. Same fix likely applicable to all of them.
+
+**Quick context for next session**
+- Compiled: [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) at v2 (gemv path). Lib only valid for `mode="interactive"` (max_batch_size=1) — server mode batched decode would compile-error.
+- Code changes: [moe_matmul.py:622-627](python/mlc_llm/op/moe_matmul.py#L622-L627) (CTA_COUNT=64 in dequantize_group_gemm only); [qwen3_5_moe_model.py:375-389](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L375-L389) (batch_decode batch_size=1 literal).
+- Microbench: `.venv/bin/python bench_moe_kernel.py --shapes gate_up_gemv,down_gemv --baseline baseline_moe.json` — gemv path at 0.066 / 0.053 ms.
+- E2E bench: `bench_mlc.py --baseline baseline_35B_q4f16_1.json` (pre-fix) or `baseline_35B_q4f16_1_v1_gemv.json` (post-fix v2).
+- Profile traces: `nsys_35B_decode.nsys-rep` (pre-fix), `nsys_35B_v1.nsys-rep` (v2). Use `--cuda-graph-trace=node` for kernel breakdown.
+- Bar to beat: llama.cpp Q4_K_S = 29.4 tps tg128. **Now MLC = 44.85 tps, 1.52× over.**
+
+---
+
+## 2026-04-28 — **35B-A3B decode +95% from one-line kernel fix**: 10.12 → 19.72 tps. Half the gap to llama.cpp closed; same pattern likely applies to other Mamba/MoE-on-Tegra deployments.
+
+**Done**
+- Built kernel microbench [bench_moe_kernel.py](bench_moe_kernel.py): JIT-compiles `dequantize_group_gemm` via Legalize+dlight+`relax.build`, times via `time_evaluator`. ~5 sec per iteration, std=0.0001 ms (rock-stable). Decode shapes (B=top_k=8) and prefill shapes (B=1024, spread across all experts) both supported. Saved baselines: [baseline_moe.json](baseline_moe.json), [baseline_moe_v0_cta1024.json](baseline_moe_v0_cta1024.json).
+- Added `--baseline` flag to [bench_mlc.py](bench_mlc.py) for quick e2e delta-vs-saved comparison; existing per-ctx JSONs work directly.
+- **Single change in [moe_matmul.py:622-627](python/mlc_llm/op/moe_matmul.py#L622-L627)**: `CTA_COUNT` 1024 → 64 in `dequantize_group_gemm`. Persistent kernel keeps the same body; only the grid dim drops.
+- Swept {32, 64, 128, 256} in the microbench: CTA=64 wins; CTA=32 regresses (under-occupancy on Orin's 16 SMs × ~4-block target).
+- Recompiled `dist/qwen3_6-35B-A3B-q4f16_1/lib.so` (~2 min). Engine warmup unchanged.
+
+**Headline numbers — Orin AGX cuda:0, ctx=128, tg=64**
+
+| metric | before | after | delta |
+|---|---:|---:|---:|
+| **35B-A3B tg_tps** | 10.12 | **19.72** | **+95.0%** |
+| 35B-A3B pp_tps | 149.88 | 147.46 | -1.6% (noise) |
+| MoE gate_up kernel (decode) | 1.002 ms | **0.491 ms** | **2.04×** |
+| MoE down kernel (decode) | 0.950 ms | **0.261 ms** | **3.63×** |
+| MoE gate_up kernel (prefill B=1024) | 14.264 ms | 14.681 ms | -2.9% |
+| MoE down kernel (prefill B=1024) | 7.024 ms | 7.175 ms | -2.1% |
+
+**vs llama.cpp Q4_K_S (29.6 tps tg128): was 0.34×, now 0.67× — halved the gap in one commit.**
+
+**Why it worked — the kernel was a Hopper-tuned constant misapplied to Orin**
+- Original: persistent-CTA kernel, fixed `CTA_COUNT=1024`. At decode b=1 top-8, total work is **64 tiles** (gate_up) or **128 tiles** (down). 1024 - 64 = **960 CTAs spin through the indptr scan** (256 expert iterations each) only to confirm no work and exit. That scan was the dominant cost.
+- Orin AGX has 16 SMs × ~4-block occupancy ≈ 64 concurrent CTAs anyway. CTA_COUNT > 64 buys nothing in parallelism, only adds spin-and-exit waves. Hopper at 132 SMs × 8 blocks = 1056 → CTA_COUNT=1024 was probably tuned there.
+- `down` got the bigger speedup (3.63× vs 2.04×) because at CTA_COUNT=64 every CTA does 2 useful tiles (128 work / 64 = 2). For gate_up every CTA does exactly 1 tile (64 work / 64 = 1). Both leave 0 wasted CTAs.
+- Prefill (B=1024) regresses 2-3% because each CTA now does 32 tiles instead of 2; some compute serialization loss. Net trade is overwhelmingly favorable: prefill is 4× behind llama.cpp anyway, decode is the headline.
+
+**Bandwidth math vs new state**
+- 35B active params/token = 3B; Q4 read = 1.5 GB/token. Orin practical BW ~180 GB/s → 8.3 ms/token theoretical floor.
+- Old: 96.4 ms/token decode = 8.6% BW. New: 50.7 ms/token = **16.4% BW** (still 2× from Volta-class theoretical).
+- llama.cpp Q4_K_S at 29.6 tps = 33.8 ms/token = 24.5% BW. We need another ~1.5× to match it; another 2× to beat it.
+
+**Three gotchas during the session**
+- *TVM 0.20 target syntax change:* `tvm.target.Target("cuda -arch=sm_87")` is rejected; must use JSON `{"kind": "cuda", "arch": "sm_87"}` or autodetect from `dev.compute_version`. Hit this immediately and was already in worklog from Stage 2 — re-confirming it bites again whenever you write standalone TVM scripts.
+- *`tvm.build` on a single PrimFunc fails:* the `tirx` lowering pipeline expects MakePackedAPI to have run; calling `tvm.build` directly on `sch.mod["main"]` errors with `func->buffer_map.size() == 0 (5 vs. 0)`. Workaround: wrap in a one-function `nn.Module` and go through Legalize+dlight+`relax.build` (the preshard.py pattern). Adds ~5 sec compile time, irrelevant for our use case.
+- *`tvm.ffi.Tensor` is dlpack-only, no uint32 path through torch:* torch lacks uint32 so `from_dlpack(torch_uint32)` silently coerces to int32, then the Relax module's spec check fails. Fix: use `tvm.runtime.empty(shape, "uint32", dev) + .copyfrom(np_arr)` directly.
+
+**Why it's the same kernel both 0.8B and 35B see — but only 35B benefits this much**
+- 0.8B has no MoE; `dequantize_group_gemm` isn't on its critical path. Its decode bottleneck is `fused_dequantize1_NT_matmul_kernel` (the dense q4 GEMV) and `batch_decode_paged_kv_kernel` for full-attn at long context. The 0.8B regression at ctx=4096 is unrelated to this fix.
+- 35B-A3B has 40 MoE layers each firing gate_up + down per decode token = 80 kernel calls/token. That's why the same per-call savings compound to 2× end-to-end.
+
+**Next session candidates**
+- A) **lm_head kernel** — `fused_dequantize_fused_NT_matmul9_cast4_kernel` was 2.76 ms × 32 calls = 88 ms in the prior trace, ~3% of decode wall. Vocab=248K @ q4f16 hidden=2048 → 256 MB at b=1 = 1.4 ms theoretical. Currently 2× over BW. Same shape-tuning likely. Smaller absolute win (~1-2 tps) but cheap to chase.
+- B) **Profile new state to find the next bottleneck.** Re-run nsys with the same `scripts/profile_mlc_decode.py` setup. Decode now 50.7 ms/token; whatever's left is the next ~10× target. Expect rnn_state_get/set + GDN dense matmuls to surface.
+- C) **cuBLAS / cutlass q4 grouped GEMM** — biggest theoretical win (BW utilization 16% → 50%) but multi-day lift. Worth doing only after (A) and (B) confirm no easier 2× elsewhere.
+- D) **0.8B long-context regression** — separate bug, unrelated to MoE. Holds until the 35B headline is past the 2× bar.
+
+**Quick context for next session**
+- Code change: `python/mlc_llm/op/moe_matmul.py:626` (CTA_COUNT=64 in `dequantize_group_gemm` only; non-quantized `group_gemm` at line 414 unchanged).
+- Microbench: `.venv/bin/python bench_moe_kernel.py --baseline baseline_moe.json` (~5 sec).
+- E2E bench: `source .envrc.local && .venv/bin/python bench_mlc.py --model-dir dist/qwen3_6-35B-A3B-q4f16_1 --device cuda:0 --pp 128 --tg 64 --runs 2 --warmup 1 --baseline baseline_35B_q4f16_1.json` (~7 min, 19.72 tps).
+- Fresh baseline JSONs (post-fix): [baseline_moe.json](baseline_moe.json) holds gate_up=0.491 ms / down=0.261 ms. [baseline_35B_q4f16_1.json](baseline_35B_q4f16_1.json) is **still pre-fix** (10.12 tps); use as the comparison baseline. After the next round of optimization, save the 19.72 tps state as a new file (don't overwrite the pre-fix one).
+
+---
+
+## 2026-04-28 — 35B decode profiled: **78% of decode GPU time is one TIR kernel** (`dequantize_group_gemm`). Running at ~9% of Orin BW peak. Kernel over-provisions 1024 CTAs for ~88 work-tiles at b=1 top-8.
+
+**Done — nsys profile of 35B-A3B decode on Orin AGX (cuda:0)**
+- Wrote [scripts/profile_mlc_decode.py](scripts/profile_mlc_decode.py) — bracketed timed decode pass with `cudaProfilerStart/Stop` (ctypes → libcudart.so) so nsys can skip the multi-minute engine warmup. Run command in script docstring.
+- Captured two traces: [nsys_35B_decode.nsys-rep](nsys_35B_decode.nsys-rep) (default `--cuda-graph-trace=graph`) and [nsys_35B_decode_node.nsys-rep](nsys_35B_decode_node.nsys-rep) (node mode, decode kernels visible inside CUDA graphs). Both at pp=128, decode tg=64/32. Decode tg_tps = 10.05–10.08 in both, matching the 35B baseline.
+- **Critical: default mode trace was misleading.** With `--cuda-graph-trace=graph` (nsys default), all decode kernels inside cudagraph captures collapse to a single graph entry per layer → dequantize_group_gemm shows 40 instances and looks like prefill-dominant. With `--cuda-graph-trace=node` you see the real per-decode-step kernel firings (1280 instances = 32 tokens × 40 layers). **Lesson: any future MLC profiling on the cudagraph=1 path needs `--cuda-graph-trace=node` or the decode breakdown is hidden.**
+
+**Headline — top decode kernels by GPU time (32-token decode, node mode)**
+
+| % | kernel | calls | per-call | what it is |
+|---:|---|---:|---:|---|
+| **42.6%** | `dequantize_group_gemm_kernel` | 1280 | **1.30 ms** | MoE gate_up grouped GEMM (40 layers × 32 tokens) |
+| **35.5%** | `dequantize_group_gemm1_kernel` | 1280 | **1.08 ms** | MoE down_proj grouped GEMM |
+| 3.6% | `gdn_func_kernel` | 960 | 147 µs | 30 GDN layers × 32 tokens |
+| 2.3% | `fused_dequantize1_NT_matmul_kernel` | 930 | 97 µs | dense matmul in GDN block |
+| 2.2% | `fused_dequantize_fused_NT_matmul9_cast4_kernel` | 31 | 2.76 ms | lm_head (vocab=251K) |
+| 1.4% | `top8_softmax_kernel` | 1280 | 41 µs | MoE router |
+| 0.7% | `batch_decode_paged_kv_kernel` | 310 | 82 µs | full-attn (10 layers × 31 tokens) |
+
+**MoE = 78.1% of decode GPU time. Per token: ~95 ms of MoE compute, vs 96.4 ms total decode wall.** Everything not-MoE — full-attn, GDN, lm_head, sampling, rnn_state ops — sums to ~1–2 ms/token.
+
+**Bandwidth math (Orin AGX, ~180 GB/s practical)**
+- 35B-A3B has 3B active params/token. At Q4_K_S/q4f16_1 (~0.5 B/param): **1.5 GB read/token → 8.3 ms/token theoretical floor.**
+- Observed: 95 ms/token of MoE GEMM = **9% of BW peak.**
+- llama.cpp Q4_K_S at 29 tps = 34.5 ms/token total ≈ **25% of BW.**
+- The 3× gap to llama.cpp is almost entirely this kernel running at ~⅓ the effective BW.
+
+**Root cause — TIR kernel over-provisions CTAs at b=1 top-8.** [moe_matmul.py:562-765](python/mlc_llm/op/moe_matmul.py#L562) `dequantize_group_gemm`: hand-scheduled persistent-CTA kernel, fixed `CTA_COUNT=1024`, `BLK_M=8, BLK_N=128, BLK_K=32`. At decode b=1 with top-8 routing, the indptr passes 8 expert-tokens (1 row each, padded to BLK_M=8) and N=ffn_inter≈1408 column tiles → real work is ~8 experts × ⌈1408/128⌉ ≈ **88 tiles**. Kernel launches **1024 CTAs**, ~94% of which do the persistent-loop spin-and-exit with no useful work. On Orin AGX (16 SMs × 4 blocks/SM = 64 active CTAs), the fixed 1024 also doesn't match the device. Tile shape BLK_M=8 also wastes M utilization (8× pad on each expert's 1 row).
+
+**Next session — three actions ranked by ROI**
+1. **Fix `dequantize_group_gemm` schedule for b=1 top-k** ([moe_matmul.py:621-625](python/mlc_llm/op/moe_matmul.py#L621-L625)). Make `CTA_COUNT`, `BLK_M`, `BLK_N` adapt to the actual `Ne × top_k × ⌈N/BLK_N⌉` work. For 35B-A3B at b=1 top-8 N=1408: target ~88 CTAs (= work-tiles), BLK_M=1 (no row padding), keep BLK_N=128. Expected speedup: 3–5× on this kernel = ~2× end-to-end decode tps. **Lowest-effort, highest-ROI.**
+2. **Try cuBLAS / cutlass grouped-GEMM with fused dequant.** [fp8_quantization.py:95-110](python/mlc_llm/quantization/fp8_quantization.py#L95-L110) shows the cutlass group_gemm path is wired up for fp8; need an equivalent for q4. Bigger lift but potentially closes the gap to ~50% BW (matching llama.cpp).
+3. **lm_head is 2.76 ms/token (~3% of decode)**: vocab=251K @ q4f16, hidden=2048 → 256 MB read at b=1 = 1.4 ms theoretical. Currently 2× over BW. Same kernel-shape issue likely. Secondary; fix #1 first.
+
+**Other observations**
+- `cudaStreamSynchronize` was 84% of CUDA API time (5.83 sec across 64 calls = 91 ms/token blocking on GPU) — that's just the per-token sync. Not a bottleneck per se, just confirms GPU is ~the only thing happening.
+- 6426 cudaGraphLaunches across 64 decode tokens = ~100 graphs/token. Cudagraph capture is working — each layer's MoE block is its own graph. Launch overhead at 20 µs/graph × 100/token = 2 ms/token = ~2% of decode. Not the bottleneck.
+- The 0.8B long-context regression (130 → 63 tps from ctx=128 → 4096) is **not** the MoE kernel (0.8B has no MoE) — that's the full-attn KV path. Separate fix, lower priority since the headline goal is 35B.
+- `bench_compare_*.md` and `qwen3_*_bench.json` from yesterday still represent baseline; re-run after each kernel change to track improvement.
+
+**Quick context for next session**
+- Profile traces on disk: `nsys_35B_decode.nsys-rep` (graph mode), `nsys_35B_decode_node.nsys-rep` (node mode). Stats command: `nsys stats --report cuda_gpu_kern_sum --format csv -o - <trace>.nsys-rep`.
+- Re-profile command: `source .envrc.local && nsys profile -o <out> --capture-range=cudaProfilerApi --capture-range-end=stop --trace=cuda,nvtx --cuda-graph-trace=node --force-overwrite=true .venv/bin/python -u scripts/profile_mlc_decode.py --model-dir dist/qwen3_6-35B-A3B-q4f16_1 --device cuda:0 --pp 128 --tg 32 --warmup-tg 8`. ~6 min total.
+- Bar to beat: llama.cpp 29.4 tps tg128. Currently MLC = 10.1 tps. 2× headline = 59 tps. With kernel #1 fix alone projected ~20 tps; need #2 (cutlass) to hit 30+.
+
+---
+
 ## 2026-04-27 (late night) — 35B-A3B compiled + benched on Orin: MLC q4f16_1 is **3× SLOWER** than llama.cpp Q4_K_S at every context. 0.8B regresses at long context. The 2× headline goal needs ~6× from here.
 
 **Done — Path 1 committed, full apples-to-apples bench harness + 0.8B and 35B baselines on Orin**
