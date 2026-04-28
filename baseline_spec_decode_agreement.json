@@ -1,0 +1,42 @@
+{
+  "draft": "dist/qwen3_5-0.8B-q4f16_1",
+  "target": "dist/qwen3_6-35B-A3B-q4f16_1",
+  "overall": {
+    "matches": 13,
+    "total": 250,
+    "rate": 0.052
+  },
+  "per_prompt": [
+    {
+      "prompt": "The capital of France is",
+      "n": 50,
+      "matches": 1,
+      "rate": 0.02
+    },
+    {
+      "prompt": "Q: What is the largest planet in our solar system? A:",
+      "n": 50,
+      "matches": 3,
+      "rate": 0.06
+    },
+    {
+      "prompt": "Write a one-sentence definition of a transformer neural network:",
+      "n": 50,
+      "matches": 7,
+      "rate": 0.14
+    },
+    {
+      "prompt": "Translate to French: Hello, how are you?",
+      "n": 50,
+      "matches": 1,
+      "rate": 0.02
+    },
+    {
+      "prompt": "List three benefits of exercise:",
+      "n": 50,
+      "matches": 1,
+      "rate": 0.02
+    }
+  ],
+  "decision": "DEAD"
+}

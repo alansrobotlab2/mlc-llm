@@ -6,13 +6,20 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
-## 🔖 SESSION HANDOFF (2026-04-28 cont. 2) — Phase 2D CLOSED (CUDA graph exclusion kills gain); Phase 3 preflight next
+## 🔖 SESSION HANDOFF (2026-04-28 cont. 3) — ALL PHASES EXHAUSTED. v6 = 52.62 tps is FINAL.
 
 **Where we are**
-- **Baseline unchanged**: v6 at 52.62 tps tg64 (lib in dist/qwen3_6-35B-A3B-q4f16_1/).
-- **Phase 2D result**: q4f16_ft_g64 lib benched at **50.62 tps tg64 (−3.8% regression)**. Perf gate failed; closed.
-- **Phase 3 preflight**: token-agreement script staged at [scripts/spec_decode_token_agreement.py](scripts/spec_decode_token_agreement.py). Run next.
-- **Working tree**: uncommitted changes to ft_quantization.py (MoE gate bugfix + MixtralExperts fallback) + bench_moe_kernel.py (FT shapes). Commit before pivoting.
+- **Baseline / current best**: v6 at **52.62 tps tg64** (1.789× llama.cpp Q4_K_S).  
+  Lib: `dist/qwen3_6-35B-A3B-q4f16_1/`. Nothing in flight.
+- **Phase 2D** (FT hybrid quant): CLOSED. −3.8% regression. CUDA graph exclusion kills kernel gains.
+- **Phase 3** (B-ext spec decode): **DEAD. 5.2% token agreement** (13/250). Diverges at step 0 on 4/5 prompts. Root cause: Qwen3.5-0.8B is a standard transformer; 35B-A3B is a hybrid GDN — architecturally incompatible generative trajectories.
+- **Working tree**: clean (ft_quantization.py fixes and bench artifacts already committed).
+
+**No further optimization avenues identified in pre-planned phases.** If a new session wants to push further, candidate ideas (none explored):
+- **Self-speculative / MTP**: Train or distill a small GDN-compatible draft head from the 35B's own hidden states (the EAGLE approach — works within the same architecture). Significant training effort, outside current scope.
+- **Continuous batching gains**: Profile whether `max_batch_size > 1` + request queuing yields higher sustained throughput in a real serving scenario (vs single-request bench).
+- **FT + CUDA graph wrapper**: Wrap FT extern calls in a TIR shell so CUDA graph can capture them. Estimated 2-5 sessions; ceiling is recovering to ~v6 level, not exceeding it.
+- **TIR kernel tuning**: Meta-schedule sweep on the GDN-specific ops (gdn_in_proj_qkv, attn_o_proj) — dlight defaults may not be optimal for sm_87.
 
 **Phase 2D autopsy — why CUDA graph exclusion kills the gain**
 
@@ -28,6 +35,34 @@ But FT extern calls emit `relax.call_pure_packed("fastertransformer.gemm_fp16_in
 - `dist/qwen3_6-35B-A3B-q4f16_ft_g64/` — 19 GB. Not a useful lib.
 - `baseline_kernels_ft_g64.json` — kernel timings, keep for reference.
 - `baseline_35B_q4f16_ft_v7.json` — e2e bench result, keep for record.
+
+---
+
+## 2026-04-28 (cont. 6) — Phase 3 preflight: B-ext spec decode DEAD (5.2% token agreement)
+
+**Script**: [scripts/spec_decode_token_agreement.py](scripts/spec_decode_token_agreement.py)  
+**Result**: [baseline_spec_decode_agreement.json](baseline_spec_decode_agreement.json)
+
+Ran greedy-vs-greedy lower-bound check: load 35B target → greedy decode 5 prompts × 50 tokens → load 0.8B draft → greedy decode same 5 prompts → compare position-by-position token IDs.
+
+| Prompt | Matches/50 | Match% | First-diverge step |
+|---|---:|---:|---:|
+| "The capital of France is" | 1/50 | 2% | step 0 |
+| "Q: What is the largest planet…" | 3/50 | 6% | step 0 |
+| "Write a one-sentence definition…" | 7/50 | 14% | step 7 |
+| "Translate to French…" | 1/50 | 2% | step 1 |
+| "List three benefits of exercise" | 1/50 | 2% | step 0 |
+| **OVERALL** | **13/250** | **5.2%** | — |
+
+**DECISION: DEAD.** Threshold for proceed was >50%; we're at 5.2%.
+
+**Root cause**: Qwen3.5-0.8B is a standard transformer decoder. Qwen3.6-35B-A3B is a hybrid GatedDeltaNet (GDN) architecture — linear-attention recurrent state replaces standard attention in half the layers. These models have fundamentally different generative dynamics: different attention patterns, different residual stream statistics, different temperature-calibration from RLHF. The draft generates a completely independent sequence from the target on every prompt.
+
+B-ext spec decode requires the draft to predict the target's continuation, not its own continuation. With 5.2% agreement that's essentially random noise — no viable accept rate, no speedup possible.
+
+**What would have been needed**: A spec-decode-tuned 0.8B model that was trained or fine-tuned on the 35B's output distribution (a "draft model" in the strong sense, not just a same-family small model). Not worth building.
+
+**Phase 3 closed.**
 
 ---
 

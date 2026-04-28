@@ -48,11 +48,16 @@ def _greedy_decode(model_dir: str, device: str, prompt: str, max_tokens: int) ->
         engine_config=EngineConfig(prefix_cache_mode="disable"),
     )
     gen_cfg = GenerationConfig(temperature=0.0, top_p=1.0, max_tokens=max_tokens, logprobs=False)
-    tokens: list[int] = []
-    for delta in engine._generate(prompt, gen_cfg, request_id="agreement"):
-        for choice in delta.choices:
-            for tok in choice.delta.token_ids or []:
-                tokens.append(tok)
+    # _generate yields List[CallbackStreamOutput]; each element has .delta_text
+    full_text = ""
+    for delta_outputs in engine._generate(prompt, gen_cfg, request_id="agreement"):
+        for output in delta_outputs:
+            if output.delta_text:
+                full_text += output.delta_text
+    # Re-tokenize the generated text to get token IDs for position-wise comparison.
+    # BPE re-tokenization of the output (without prompt context) is a slight lossy
+    # approximation but is accurate enough for the go/no-go match-rate decision.
+    tokens: list[int] = list(engine.tokenizer.encode(full_text))
     return tokens
 
 
