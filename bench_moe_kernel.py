@@ -141,13 +141,15 @@ def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
         }
         m = _TopKSoftmaxModule(top_k)
     elif kind == "dense_gemv":
-        # Plain q4f16_1 Linear: x (B,K) → out (B,N). Mirrors the shared-expert
-        # gate_up/down path — no MoE indptr.
-        # Make seq_len symbolic so LowBatchGemvSpecialize creates the
-        # If(seq_len<=2) → LowBatchGEMV(2) dispatch the real model uses.
+        # Plain q4f16_1 Linear: x (B,K) → out (B,N).
+        # B=1 (static): mirrors decode-path kernels that specialize seq_len=1.
+        # Production uses static-shape kernels (the v2 batch_decode fix pinned
+        # batch_size=1, propagating to all decode kernels), so the inner
+        # reduction goes through gemv.py — NOT low_batch_gemv. Use static
+        # shape here to match production scheduling.
         mod_spec = {
             "forward": {
-                "x": spec.Tensor(["seq_len", K], "float16"),
+                "x": spec.Tensor([B, K], "float16"),
             }
         }
         m = _DenseGemvModule(in_features=K, out_features=N)

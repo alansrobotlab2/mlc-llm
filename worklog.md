@@ -6,6 +6,48 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-27 (cont.) — Option A exhausted: 51.37 tps is the kernel-tile-tuning ceiling.
+
+After committing v5, swept harder on the remaining static-shape decode kernels (`attn_o_proj` K=4096 N=2048, `gdn_in_proj_z` K=2048 N=4096, `lm_head` N=248K, `gdn_in_proj_qkv` K=2048 N=8192). Used a corrected microbench that pins `B=1` (static) so dispatch matches production (the v2 batch_decode fix specialized seq_len=1 across the decode graph, so all decode kernels go through `gemv.py inner_reduction` not `low_batch_gemv.py`).
+
+**Result: (TS=32, TR=16, TILE_S=2) is Pareto-optimal.** Swept 10 alternative configs (16,32,1 / 16,16,4 / 32,8,4 / 16,8,8 / 8,16,8 / 32,16,8 / 16,16,8 / 8,32,8 / 32,32,1 / 32,16,16); each either ties or regresses on at least one shape. No alternative dominates.
+
+**One blind alley along the way (worth recording):** I thought my (32,16,2) override was a regression for non-MoE static kernels because microbench (with symbolic `seq_len`) showed `attn_o_proj` faster on the (16,32,1) default. Built a "v6" with the heuristic gated on a 3D-weight-buffer check (MoE only). v6 e2e regressed to 50.47 tps (-1.7% from v5). The microbench was wrong — it forced symbolic `seq_len`, routing kernels through `low_batch_gemv.py`, but production specializes `seq_len=1` and routes through `gemv.py`. After fixing the microbench to use static `B=1`, all 5 dense-shape kernels showed (32,16,2) as best or tied — confirming v5's broad heuristic was correct. **Lesson: when a microbench disagrees with e2e, audit the dispatch path before second-guessing the e2e.** The fixed microbench is now the artifact going forward.
+
+**Verified ceilings on non-matmul decode kernels too (none tunable at the tile/schedule level):**
+
+| kernel | ms/tok | bandwidth | note |
+|---|---:|---:|---|
+| `gdn_func_kernel` | 1.19 | ~55% | Custom recurrent kernel; ~25% headroom from a rewrite (warp-tile + double-buffer the (32, 128, 128) state). Multi-session work. |
+| `rnn_state_get_0` | 0.78 | ~111% | At peak DRAM BW (4 MB read+write per call, 20 µs). Truly at ceiling. |
+| `rnn_state_set_0` | 0.71 | ~111% | Same. |
+| `top8_softmax` | 0.36 | n/a | Already the parallel-kernel from v3. |
+| `batch_decode_paged_kv` | 0.96 | n/a | flashinfer fallback path — not dlight tunable. |
+
+**Final Option-A scoreboard (kernel tile tuning, two-line dlight patch):**
+
+| version | tg_tps | vs llama.cpp Q4_K_S |
+|---|---:|---:|
+| v3 (start of session) | 48.07 | 1.629× |
+| **v5 (broad sm_87 heuristic + low_batch_gemv N>K)** | **51.37** | **1.745×** |
+| ~~v6 (gated to MoE only)~~ | ~~50.47~~ | ~~1.716×~~ |
+| theoretical kernel ceiling | ~52-53 | ~1.79× |
+
+The remaining ~1.5 tps to ceiling lives in `gdn_func` (custom kernel rewrite, multi-session) and the cuda-graph-launch overhead floor (~3-5 µs/kernel × ~80 kernels/tok ≈ 0.3 ms/tok unavoidable). Anything past 53 tps requires spec-decode or fewer kernel launches.
+
+**Quick context for next session (Option A complete)**
+- Code state: same as committed v5. The broad sm_87 heuristic in `gemv.py` covers all static-shape decode kernels (every decode kernel falls into this bucket post-v2-batch-pin).
+- Microbench: now uses static `B=1` for `dense_gemv` shapes — matches production within ~10%. Was misleading before.
+- E2E baseline: [baseline_35B_q4f16_1_v5_dlight.json](baseline_35B_q4f16_1_v5_dlight.json) — 51.37 tps tg64.
+- Profile traces: [nsys_35B_v5.nsys-rep](nsys_35B_v5.nsys-rep). `nsys stats --report cuda_gpu_kern_sum --format csv -o - nsys_35B_v5.nsys-rep`.
+
+**Path past 53 tps** (multi-session; not Option A):
+- B) **MTP self-spec decode** — fp16 drift currently blocks 0% accept rate. Target: ≥30% accept → 60+ tps.
+- D) **gdn_func custom rewrite** — 0.6 ms/tok savings = ~1.5 tps. The kernel does a serial 128-row recurrence per (head, col) lane; could overlap with double-buffered state load + warp-tile across rows. Also at-Path-1 spec-decode would slot in here naturally.
+- E) **Reduce kernel launch count** — 80 kernels/tok × ~3-5 µs cuda-graph overhead = 0.3 ms/tok unavoidable. Fusing more eagerly at Relax level (especially the residual+norm pairs that fire 100+ times/tok at 5 µs each = 0.5 ms/tok) could save ~0.2 ms/tok.
+
+---
+
 ## 2026-04-27 — sm_87 dlight GEMV tuning: 35B-A3B decode 48.07 → 51.37 tps (**1.745× over llama.cpp Q4_K_S**, +6.9% over v3 in two single-line patches).
 
 **Done — two-file dlight schedule patch keyed on `arch == "sm_87"`**
