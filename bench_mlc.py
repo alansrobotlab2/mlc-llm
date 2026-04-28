@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=1)
     p.add_argument("--label", default="MLC", help="Label for the summary header")
     p.add_argument("--json-out", help="Optional path to write JSON summary {pp: {pp_tps, tg_tps}}.")
+    p.add_argument("--baseline", help="Path to baseline JSON; print delta vs baseline.")
     return p.parse_args()
 
 
@@ -135,6 +136,27 @@ def main() -> None:
     print(f"{'pp':>8}  {'pp_tps':>10}  {'tg_tps':>10}")
     for pp, pp_tps, tg_tps in summaries:
         print(f"{pp:>8}  {pp_tps:>10.2f}  {tg_tps:>10.2f}")
+
+    if args.baseline:
+        import json as _json
+        try:
+            base = _json.loads(Path(args.baseline).read_text())
+        except FileNotFoundError:
+            print(f"[mlc] baseline missing: {args.baseline}", file=sys.stderr)
+            sys.exit(1)
+        print()
+        print(f"=== vs baseline {args.baseline} ===")
+        print(f"{'pp':>8}  {'pp_tps':>14}  {'tg_tps':>14}")
+        for pp, pp_tps, tg_tps in summaries:
+            entry = base.get(str(pp))
+            if entry is None:
+                print(f"{pp:>8}  {pp_tps:>14.2f}  {tg_tps:>14.2f}  (NEW)")
+                continue
+            ref_pp = entry.get("pp_tps", float("nan"))
+            ref_tg = entry.get("tg_tps", float("nan"))
+            d_pp = (pp_tps - ref_pp) / ref_pp * 100.0 if ref_pp else float("nan")
+            d_tg = (tg_tps - ref_tg) / ref_tg * 100.0 if ref_tg else float("nan")
+            print(f"{pp:>8}  {pp_tps:>8.2f}({d_pp:+5.1f}%)  {tg_tps:>8.2f}({d_tg:+5.1f}%)")
 
     if args.json_out:
         import json

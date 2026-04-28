@@ -12,6 +12,15 @@ bench_*.log
 gguf_download.log
 mlc_q4_convert.log
 .envrc.local
+
+# nsys profiling outputs (binary, multi-MB)
+nsys_*.nsys-rep
+nsys_*.sqlite
+nsys_*.qdrep
+nsys_*.qdstrm
+*.nsys-rep
+*.qdrep
+*.qdstrm
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
