@@ -30,23 +30,46 @@ Per-token decode: 22.3 ms → 20.9 ms. Bandwidth utilization: ~36% → ~38% of O
 - *`tvm_thread_allreduce` placement.* My first cut wrote the round's winner via `if tx == 0: winner_val[r] = ...`. The s_tir thread-storage-sync pass crashed with `Cannot insert syncs inside condition` when planning syncs for the next iteration's allreduce. The pattern that DOES work: have all threads write the same value to the same shared cell (benign race, deterministic since `max_reduce[0]` and `min_reduce[0]` are post-allreduce and identical across the block). Same for the masking step — instead of `if tx == winner: my_val[0] = -inf`, use `my_val[0] = T.if_then_else(tx == winner, -inf, my_val[0])`. Both rewrites turn statement-level ifs into expression-level selects, which the sync planner handles. **General rule for parallel-reduce kernels in this codebase: keep statement-level `if` blocks empty of subsequent allreduce dependencies.**
 - *Two allreduces per round, not one.* I considered packing (val, idx) into int64 to do a single max-allreduce per round. Floating-point sortable encoding (sign-flip-on-negative) plus negated idx in low bits would work, but the bit-twiddling vs the cost of an extra allreduce is a wash on Orin — TVM's allreduce lowers to a 2-stage reduction (warp shuffle + 8-wide shared-mem reduce + broadcast) at ~50 ns, so 16 allreduces × 50 ns ≈ 0.8 µs vs the launch-overhead floor of ~5 µs. Two-allreduces-per-round is simpler and the launch overhead dominates anyway. If we ever port this to a stronger arch where the 5 µs floor halves, the int64-packed single-allreduce variant becomes interesting.
 
+**v3 profile — top decode kernels (Orin AGX, ctx=128, tg=32, [nsys_35B_v3.nsys-rep](nsys_35B_v3.nsys-rep))**
+
+| rank | kernel | fires/tok | µs/call | ms/tok | est. % of 180 GB/s |
+|---:|---|---:|---:|---:|---:|
+| 1 | MoE gate_up gemv (`moe_dequantize_gemv`) | 40 | 71.3 | 2.85 | ~62% |
+| 2 | MoE down gemv (`moe_dequantize_gemv1`) | 40 | 59.4 | 2.38 | ~44% |
+| 3 | GDN dense `in_proj_qkv` (`fused_dequantize1_NT_matmul`) | 30 | 72.0 | 2.16 | ~70% |
+| 4 | **Shared expert gate_up (`fused_dequantize4_NT_matmul3`)** | 40 | 37.8 | **1.51** | **~17%** ← |
+| 5 | Shared expert silu/down (`fused_dequantize2…silu1_multiply1`) | 30 | 42.5 | 1.27 | ~30% |
+| — | full-attn `batch_decode_paged_kv` | 10 | 81.8 | 0.82 | n/a |
+| — | rnn_state get/set | 60 | ~20 | 1.23 | n/a |
+| — | top8_softmax (post-fix) | 40 | 7.0 | **0.29** | (was 1.32 in v2 — 4.6× confirmed at e2e) |
+
+vs the v2 profile, MoE gate_up/down dropped from 30 → 5.23 ms/tok combined (the gemv-path fix from last session is fully picked up); top8_softmax dropped from 1.32 → 0.29 ms/tok (this session's fix). The new ranking puts shared expert gate_up clearly as #1 by headroom — every other top kernel is at 44–70% BW (close to its sm_87 ceiling), shared expert is at ~17%.
+
 **What's left in the budget (the path to 60 tps)**
-Per-token decode now 20.9 ms; 60 tps = 16.7 ms. Need ~4.2 ms savings.
+Per-token decode now 21.3 ms (under nsys; 20.9 ms unprofiled); 60 tps = 16.7 ms. Need ~4.5 ms savings.
 
-Ranked candidates (per-token cost / current BW utilization / estimated savings):
-1. **Shared expert dlight gemv** (`fused_dequantize4_NT_matmul3` family, 1.52 ms/tok at 14% BW). The 1024×2048 q4 GEMV is anomalously low for dlight on sm_87 — the schedule was tuned for sm_80/sm_90. Either tune dlight for sm_87 or hand-write a custom kernel matching the moe_dequantize_gemv pattern. Estimated savings: ~1 ms/tok = ~2 tps.
-2. **moe_dequantize_gemv1 (down)** at 42% BW. Push to 60-70% with better tile shape. Estimated savings: ~0.5 ms/tok = ~1 tps.
-3. **GDN dense matmuls** (`fused_dequantize1_NT_matmul`, 2.18 ms/tok at 46% BW). Same TVM-side tuning. Estimated savings: ~0.5 ms/tok = ~1 tps.
-4. **lm_head** (~3% of decode, 2.76 ms × 32 calls). Vocab 248K @ q4f16, hidden 2048 → 256 MB at b=1 = 1.4 ms theoretical, currently 2× over BW. Same shape-tuning likely.
-5. **Spec-decode finally working.** Path 1 plumbing is in but accept rate is 0% (MTP draft target-misaligned). 30%+ accept rate would multiply decode and could push 60+ tps before more kernel work. Multi-day MTP triage.
+Ranked candidates (per-token cost / current BW / estimated savings):
+1. **Shared expert gate_up (`fused_dequantize4_NT_matmul3`)** — 1.51 ms/tok at 17% BW. Per-call shape: K=2048, N=1024 q4 → 1.13 MB / 37.8 µs = 30 GB/s. Lift to 60% BW → save ~1 ms/tok ≈ 2 tps.
+2. **Shared expert silu/down combo (`fused_dequantize2…silu1_multiply1`)** — 1.27 ms/tok at ~30% BW. K=512, N=2048. Same dlight-gemv schedule family. Lift to 60% → save ~0.7 ms/tok ≈ 1–2 tps.
+3. **MoE down gemv** — 2.38 ms/tok at ~44%. Better tile shape could push to 60–70%. Save ~0.5 ms/tok ≈ 1 tps.
+4. **lm_head** (`fused_dequantize_fused_NT_matmul9_cast4`) — 31 calls × 1.92 ms = 1.86 ms/tok. Hidden 2048 → vocab 248K @ q4. Big shape, well-tuned schedule should land near BW ceiling. Save 0.3–0.5 ms/tok.
+5. **Spec-decode finally working.** Path 1 plumbing is in but accept rate is 0% (MTP draft target-misaligned). 30%+ accept rate would multiply decode and push 60+ tps before more kernel work. Multi-day MTP triage.
 
-Total realistic from #1–#4: ~2–3 ms/tok savings → ~52–55 tps. Crossing 60 cleanly needs spec-decode or a meaningful dlight-for-sm_87 sweep.
+The crucial insight from this profile: **all four kernel candidates above route through the same dlight gemv schedule** (`fused_dequantize*_NT_matmul*` are dlight-lowered q4 GEMVs). A single dlight-for-sm_87 schedule fix likely lifts all four together. That makes #1+#2 a much bigger compounded win than the per-kernel numbers suggest — closer to ~2 ms/tok ≈ 5 tps if the fix generalizes.
 
-**Next session pickup — shared expert gemv at ctx=128**
-- Profile target: re-run `nsys profile ... --cuda-graph-trace=node` on the v3 lib (next session has access to [scripts/profile_mlc_decode.py](scripts/profile_mlc_decode.py)). Expect MoE gate_up/down to drop to ~3–4 ms/tok combined (down from 4.76 ms in v2), shared expert gemv to surface as the new top kernel.
-- Code targets: dlight gemv schedule lives in `3rdparty/tvm/python/tvm/dlight/gpu/gemv.py`. The Orin-relevant tile knobs are `TS`, `TR`, `TILE_K`, vectorization width. A Hopper-tuned default likely overshoots sm_87's 16 SMs.
-- Microbench: extend [bench_moe_kernel.py](bench_moe_kernel.py) with a `shared_expert_gemv` shape (B=1, K=2048, N=1024 q4) — same JIT-via-Legalize+dlight+relax.build path. Fast (~5 sec/iter).
+**Next session pickup — dlight q4 GEMV schedule for sm_87**
+- Build path: dlight gemv schedule lives in `3rdparty/tvm/python/tvm/dlight/gpu/gemv.py`. Orin sm_87 = 16 SMs × ~4 blocks/SM ≈ 64 active CTAs (same constraint that forced CTA_COUNT=64 in `dequantize_group_gemm` last session). The dlight default tile knobs (`TS`, `TR`, `TILE_K`, vectorization width) are tuned for sm_80/sm_90 ≥ 100 SMs and likely over-provision blocks here.
+- Microbench: extend [bench_moe_kernel.py](bench_moe_kernel.py) with two new shapes — `shared_expert_gate_up` (B=1, K=2048, N=1024, group=32, q4) and `shared_expert_down` (B=1, K=512, N=2048, group=32, q4). Same JIT-via-Legalize+dlight+relax.build path; ~5 sec/iter. Save baseline as `baseline_shared_expert_v0.json` before touching dlight.
+- Iterate dlight schedule via TVM's `dl.gpu.GEMV` rule. Sweep tile dims, save microbench JSON each step. Target: 17% → 60%+ BW on shared_expert_gate_up.
+- After the schedule lands, recompile [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) and run `bench_mlc.py --baseline baseline_35B_q4f16_1_v3_topk.json` to confirm e2e gain.
+- Re-profile (`nsys ... --cuda-graph-trace=node`) and check whether GDN `in_proj_qkv` and MoE down also moved.
 - vs llama.cpp now 1.629×; 60 tps target = 2.04× over llama.cpp.
+
+**Quick context for next session (v3 state)**
+- Profile trace: [nsys_35B_v3.nsys-rep](nsys_35B_v3.nsys-rep) (1.8 MB). Stats: `nsys stats --report cuda_gpu_kern_sum --format csv -o - nsys_35B_v3.nsys-rep`.
+- E2E baseline: [baseline_35B_q4f16_1_v3_topk.json](baseline_35B_q4f16_1_v3_topk.json) — 47.88 tps tg64 / 148.10 tps pp128.
+- Topk microbench baseline: [baseline_topk_v1_parallel.json](baseline_topk_v1_parallel.json) — 0.0085 ms.
+- Commit: `535403c3` "[Perf] Parallel topk_softmax MoE router — 5× kernel, 35B-A3B 44.85 → 47.88 tps".
 
 **Quick context for next session**
 - Compiled: [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) at v3.
