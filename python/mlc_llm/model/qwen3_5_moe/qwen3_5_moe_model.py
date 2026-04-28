@@ -372,8 +372,15 @@ class Qwen35MoEForCausalLM(nn.Module):
                     "effect_mode": "none",
                 },
             },
+            # batch_size pinned to 1 (literal int, not SizeVar) so the MoE block's
+            # `if num_tokens == 1:` resolves statically at compile time and routes
+            # through `dequantize_gemv` (~6× faster than `dequantize_group_gemm` at
+            # b=1 top-8 on Orin). Trade-off: this lib only supports max_batch_size=1
+            # at decode (interactive mode); server mode with batched decode would
+            # need either the dynamic-batch spec restored or a Relax If for runtime
+            # dispatch. batch_prefill / batch_verify keep dynamic seq_len.
             "batch_decode": {
-                "input_embeds": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "input_embeds": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "rnn_state": nn.spec.Object(object_type=RNNState),
                 "$": {
