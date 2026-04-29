@@ -25,7 +25,8 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:  # noqa: UP00
     assert isinstance(call_args[0], relax.ExternFunc)
     assert call_args[0].global_symbol == "mlc.create_paged_kv_cache_generic"
     args = call_args[1:]
-    assert len(args) == 18
+    # 18: legacy payload (no dtype_kv). 19: Phase 5 payload with dtype_kv.
+    assert len(args) in (18, 19), f"unexpected paged_kv_cache_generic arg count: {len(args)}"
     assert isinstance(args[0], (relax.StringImm, relax.Tuple))
     # Check if attn_kind is a single value or a list with length of hidden layers
     if isinstance(args[0], relax.StringImm):
@@ -48,6 +49,8 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:  # noqa: UP00
     assert isinstance(args[13], relax.StringImm)
     assert isinstance(args[16], (relax.Constant, relax.PrimValue))
     assert isinstance(args[17], relax.DataTypeImm)
+    if len(args) == 19:
+        assert isinstance(args[18], relax.DataTypeImm)
 
     return {
         "attn_kind": attn_kind,
@@ -72,6 +75,7 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:  # noqa: UP00
         "rotary_dim": args[15].value.value,
         "enable_disaggregation": bool(args[16].value.value),
         "dtype": args[17].value,
+        "dtype_kv": args[18].value if len(args) == 19 else args[17].value,
     }
 
 
@@ -231,7 +235,16 @@ class DispatchKVCacheCreation:
                     support_sliding_window,
                 ],
             ):
-                cache = kv_cache.FlashInferPagedKVCache(target=self.target, **kwargs)
+                # FlashInferPagedKVCache does not yet take dtype_kv. Strip it
+                # if equal to dtype (no-op); raise if differs (Phase 5 path
+                # only supports the TIR cache for now).
+                fi_kwargs = dict(kwargs)
+                fi_dtype_kv = fi_kwargs.pop("dtype_kv", None)
+                if fi_dtype_kv is not None and str(fi_dtype_kv) != str(fi_kwargs["dtype"]):
+                    raise NotImplementedError(
+                        "FlashInfer PagedKVCache does not yet support dtype_kv != dtype"
+                    )
+                cache = kv_cache.FlashInferPagedKVCache(target=self.target, **fi_kwargs)
                 bb.emit_func_output(cache._expr)
         except Exception as e:
             logger.info(

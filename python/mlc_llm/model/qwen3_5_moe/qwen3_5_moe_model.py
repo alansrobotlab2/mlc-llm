@@ -293,6 +293,8 @@ class Qwen35MoEForCausalLM(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.dtype = config.dtype
+        # Phase 5: optional fp8 KV cache. None or empty falls back to self.dtype.
+        self.kv_cache_dtype = getattr(config, "kv_cache_dtype", None) or None
         self.hidden_size = config.hidden_size
         self.num_hidden_layers = config.num_hidden_layers
         self.num_attention_heads = config.num_attention_heads
@@ -536,6 +538,7 @@ class Qwen35MoEForCausalLM(nn.Module):
             rope_theta=self.rope_theta,
             rotary_dim=rotary_dim,
             dtype=self.dtype,
+            dtype_kv=getattr(self, "kv_cache_dtype", None) or self.dtype,
         )
 
     def get_default_spec(self):

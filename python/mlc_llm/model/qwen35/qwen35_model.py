@@ -60,6 +60,9 @@ class Qwen35Config(ConfigBase):
     tensor_parallel_shards: int = 1
     dtype: str = "float32"
     max_batch_size: int = 1
+    # Phase 5: dtype of the paged KV cache. None or "" -> use the model dtype.
+    # Set to e.g. "float8_e4m3fn" to enable fp8 KV storage (Phase 5).
+    kv_cache_dtype: Optional[str] = None
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)  # noqa: UP006
 
     def __post_init__(self):

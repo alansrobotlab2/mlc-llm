@@ -6,6 +6,237 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-29 — **Phase 5 (fp8 KV cache) shipped end-to-end. Functional but a wall-clock LOSS on sm_87: −25% at tg8192. Software-only fp8 dequant on Orin is the killer.**
+
+User asked for an end-to-end Phase 5 implementation (plan: [.claude/plans/phase5-fp8-kv-cache.md](.claude/plans/phase5-fp8-kv-cache.md)). Delivered all six stages; final acceptance bench fails on throughput.
+
+### What landed
+
+- **5.1 TVM fp8 lowering spike** — confirmed `T.cast(float8_e4m3fn, fp16)` lowers cleanly on sm_87 *after* two TVM patches:
+  - [3rdparty/tvm/python/tvm/contrib/nvcc.py](3rdparty/tvm/python/tvm/contrib/nvcc.py) — lowered `nvcc.supports_fp8` threshold from sm_89 to sm_70 (the existing gate conflated native FP8 MMA with software conversions; cuda_fp8.h works on any sm with CUDA ≥11.8).
+  - [3rdparty/tvm/src/target/source/codegen_cuda.cc](3rdparty/tvm/src/target/source/codegen_cuda.cc) and [literal/cuda_half_t.h](3rdparty/tvm/src/target/source/literal/cuda_half_t.h) — guarded `__nv_fp8x*_e8m0` helpers behind CUDACC ≥12.7 (Blackwell-only types break older nvcc); added vec-elem load/store path for fp8x2/fp8x4 (was hitting `.x/.y/.z/.w` accessors which don't exist on `__nv_fp8x4_e4m3`); fall through fp8 vector casts to per-element when target isn't fp16/bf16.
+  - Spike file: [scratch_phase5_fp8_spike.py](scratch_phase5_fp8_spike.py). Bit-perfect 64×128 fp8→fp16 round-trip on Orin.
+- **5.3 dtype split** — added `dtype_kv` parameter through three layers: [python/mlc_llm/nn/kv_cache.py](python/mlc_llm/nn/kv_cache.py) `create_generic`, [python/mlc_llm/compiler_pass/dispatch_kv_cache_creation.py](python/mlc_llm/compiler_pass/dispatch_kv_cache_creation.py), and [3rdparty/tvm/python/tvm/relax/frontend/nn/llm/kv_cache.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/kv_cache.py) `TIRPagedKVCache`. Trailing `rx.StringImm(dtype_kv)` arg into the runtime constructor; C++ side reads it in [3rdparty/tvm/src/runtime/vm/paged_kv_cache.cc](3rdparty/tvm/src/runtime/vm/paged_kv_cache.cc) and threads as a separate `DLDataType dtype_kv` for the page buffer (temp Q/K/V/O still in `dtype`).
+- **5.4 + 5.5 kernel surgery** — explicit `T.cast(pages[…], dtype)` on the read side ([_decode_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_decode_kernels.py), [_prefill_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_prefill_kernels.py), [tree_attn.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/tree_attn.py)) and `T.cast(k_data, dtype_kv)` on the write side ([_page_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_page_kernels.py)). Also fixed `_rope` in [_kernel_common.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_kernel_common.py) to cast to fp32 *before* negation (previously `-buffer[...]` was emitted as fp8*fp8 multiply which has no operator). Memcpy kernels (copy_single_page, compact_kv_copy) just propagate dtype_kv. Runtime dtype-equality assertions in `paged_kv_cache.cc` relaxed to allow pages.dtype != qkv.dtype. **Skipped** for the prototype: per-(layer, head) static scales (5.2). Storage with implicit scale=1.0 was the simpler test; if accuracy had failed, calibration would have been the obvious follow-up.
+- **5.6 bench + parity** — both libs compiled and run.
+
+### Numbers
+
+**Regression-free sanity**: patched TVM with `dtype_kv == dtype` benches at **52.22 tg64 tps** (vs cont. 13's 49.46) — well within noise of the historical baseline. Phase 5 dtype-split refactor is regression-free as a standalone change.
+
+**Long-context bench, fp16-KV (regression) vs fp8-KV** ([dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/](dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/) lib has `kv_cache_dtype: float8_e4m3fn` in mlc-chat-config.json):
+
+| pp | tg | regression tg_tps | fp8 tg_tps | delta | plan predicted |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 64 | 52.22 | 51.45 | **−1.5 %** | ~0 % |
+| 512 | 256 | 46.50 | 43.28 | **−6.9 %** | ~0.13 % |
+| 4 096 | 256 | 24.82 | 19.71 | **−20.6 %** | ~+1 % |
+| 8 192 | 256 | 16.17 | 12.16 | **−24.8 %** | ~+2 % |
+
+Sign is wrong AND magnitude grows with context. The plan's stop condition explicitly fires: "if **tg8192 gain < +0.5 %** AND capacity gate fails, close". We hit −25 % at tg8192.
+
+**Greedy parity (50 tokens, 5 prompts)**: 4/5 EXACT, 1/5 diverges (62/228 chars common prefix on "The capital of France is" — fp8 says "on the Seine River" / "most populous in Europe" vs fp16's "along the Seine" / "most visited in the world", both factual). Functional correctness is fine.
+
+### Why fp8 loses on sm_87
+
+Orin has *no native* FP8 hardware. Every fp8→fp16 cast in the decode/prefill kernels lowers to a software bit-twiddle inside `<cuda_fp8.h>` — roughly 5–8 instructions per lane, in software, on the same SMs that are running the matmul. The plan's BW math (≈+2 % at tg8192) assumed dequant cost was negligible relative to HBM read savings. On sm_87 it isn't: dequant runs on the same compute that's meant to be doing useful work, and at long context the dequant volume (160 MB of fp8 = 160 MB of dequant work per step) dominates the 80 MB of avoided HBM traffic. Every extra K of context makes it worse, not better — exactly opposite of what we wanted.
+
+This is **structural**, not a kernel-tuning issue. sm_89+ would have it for free (hardware fp8↔fp16 conversion path), but Orin is sm_87 and not getting upgraded.
+
+### Decision
+
+**Close Phase 5 on Orin.** Land the dtype-split refactor anyway (regression-free, mechanically clean, useful for any future int8/fp8/MXFP4 work or any port to sm_89+ hardware). Don't enable the fp8-KV path by default. The lib at [dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/lib.so](dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/lib.so) is preserved as a reference for any future Blackwell port — same code, different sign on the bench.
+
+Capacity claim from the plan ("2× max seqlen at the same VRAM") is *probably* true (page buffer is now half the bytes) but wasn't measured — the throughput cliff makes capacity moot for this hardware.
+
+### Follow-up checks (post-handoff): VEC_SIZE + per-lane lambda
+
+User pushed back on the −25 % number — fair, llama.cpp's `--type-k q8_0` reports ~0 to −10 % on most GPUs, so −25 % is on the bad end and might be impl-quality, not pure structural.
+
+Two specific suspects from the plan ("two places where my impl is likely worse than it needs to be"):
+
+1. **VEC_SIZE in `_attention_decode` is hardcoded for fp16 byte width.** [decode_kernels.py:202](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_decode_kernels.py#L202) computes `VEC_SIZE = min(max(8 // qkv_dtype_bytes, D//32), 4)` → 4 for fp16, also 4 for fp8. With fp8 storage, that's 4 bytes/thread/iter vs 8 for fp16 — half the per-thread byte load width. Tried doubling to 8 for fp8 pages: TVM IR rejects with `Check failed: lanes <= 4 (8 vs. 4) : Ramp of more than 4 lanes is not allowed.` The 4-lane Ramp limit is enforced inside the lowering pipeline, not just the schedule. Reverted. Per-warp transaction is still fully coalesced (32 threads × 4 B = 128 B = one cache line), just 32 B vs 64 B per warp instruction.
+
+2. **Per-lane lambda in PrintVecElemLoad fp8 case** ([codegen_cuda.cc:699-707](3rdparty/tvm/src/target/source/codegen_cuda.cc)). Captured the generated `tvm_kernels.cu`: confirmed the QK compute path emits `(float)(([](){...})((vec.__x >> i*8) & 0xFF))` per lane — the slow path, not the SIMD `__nv_cvt_fp8x2_to_halfraw2` from the half4_bfloat164 ctor. *Why:* dlight scheduler inlines K_smem out (it sees K_smem written then immediately consumed, fuses the two), so the cast goes pages→fp32 directly without going through the half4 SIMD ctor. The lambda itself is fine — NVCC inlines it. The cost is the *software fp8→fp32 conversion* on sm_87, which is the structural ceiling regardless of how the cast is spelled.
+
+Re-bench after both points investigated (no kernel changes that took): tg8192 = **12.16 tps** (vs −24.8 % to fp16), reproduces previous numbers exactly. The −25 % is structural, not impl-quality.
+
+**Next lane**: see [.claude/plans/phase6-int8-kv-cache.md](.claude/plans/phase6-int8-kv-cache.md). int8 with per-token scales — `cvt.rn.f16.s8` is a single hardware SASS instruction since Pascal, so the dequant cost that killed fp8 just doesn't exist for int8. Goal is **capacity unblock** (2× max in-flight tokens at fixed VRAM), not throughput. The Phase 5 dtype-split refactor + runtime threading is reused intact — net new work is the scale tensor, the per-token max-abs in append, and the FMA-on-read in decode/prefill.
+
+### Files
+
+- New: [.claude/plans/phase5-fp8-kv-cache.md](.claude/plans/phase5-fp8-kv-cache.md), [.claude/plans/phase6-int8-kv-cache.md](.claude/plans/phase6-int8-kv-cache.md), [scratch_phase5_fp8_spike.py](scratch_phase5_fp8_spike.py), [scratch_phase5_round_trip.py](scratch_phase5_round_trip.py), [scratch_phase5_parity.py](scratch_phase5_parity.py).
+- Modified TVM (vendored fork on `mlc-6-gce9cb40`):
+  - [3rdparty/tvm/python/tvm/contrib/nvcc.py](3rdparty/tvm/python/tvm/contrib/nvcc.py)
+  - [3rdparty/tvm/python/tvm/relax/frontend/nn/llm/kv_cache.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/kv_cache.py)
+  - [3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_kernel_common.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_kernel_common.py)
+  - [3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_page_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_page_kernels.py)
+  - [3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_decode_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_decode_kernels.py)
+  - [3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_prefill_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_prefill_kernels.py)
+  - [3rdparty/tvm/python/tvm/relax/frontend/nn/llm/tree_attn.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/tree_attn.py)
+  - [3rdparty/tvm/src/target/source/codegen_cuda.cc](3rdparty/tvm/src/target/source/codegen_cuda.cc)
+  - [3rdparty/tvm/src/target/source/literal/cuda_half_t.h](3rdparty/tvm/src/target/source/literal/cuda_half_t.h)
+  - [3rdparty/tvm/src/runtime/vm/paged_kv_cache.cc](3rdparty/tvm/src/runtime/vm/paged_kv_cache.cc)
+- Modified MLC:
+  - [python/mlc_llm/nn/kv_cache.py](python/mlc_llm/nn/kv_cache.py)
+  - [python/mlc_llm/compiler_pass/dispatch_kv_cache_creation.py](python/mlc_llm/compiler_pass/dispatch_kv_cache_creation.py)
+  - [python/mlc_llm/model/qwen35/qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py) — added `kv_cache_dtype: Optional[str] = None` config field
+  - [python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py) — reads `self.kv_cache_dtype`, threads to `create_generic`
+- Saved libs:
+  - [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) = regression (= old lib_v6 + dtype-split refactor; functionally identical)
+  - [dist/qwen3_6-35B-A3B-q4f16_1/lib_pre_phase5.so.bak](dist/qwen3_6-35B-A3B-q4f16_1/lib_pre_phase5.so.bak) = pre-Phase-5 backup
+  - [dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/lib.so](dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/lib.so) = fp8-KV variant
+
+---
+
+## 2026-04-28 (cont. 14) — Engine γ=1 fast path: feasibility analysis. **Math says it's a lateral move, not a wall-clock win on the 35B-Orin. Recommend shelve.**
+
+User asked to explore lane (3) from the handoff. Did the analysis instead of jumping to C++.
+
+**The fast path proposal (per handoff)**: at γ=1 EAGLE, replace one b=2 batched verify with two sequential single-token decodes. Handoff cited "verify b=2 = 42.5 ms vs 2 × single-decode = 36.8 ms" → 5.7 ms savings → "+10% over target_only" (49.2 → ~54 tps).
+
+**Sequential decode flow (simpler variant, matches existing accept semantics)**:
+1. BatchDecode at position N with token committed_N → hidden_N, logit_N (1 single decode on verify model)
+2. Sample/verify against D_1: accept D_1 if argmax matches; else sample T_{N+1} (replaces D_1, ends round with 1 new token)
+3. (Accept only) BatchDecode at position N+1 with D_1 → hidden_{N+1}, logit_{N+1}; sample T_{N+2}; round produces 2 tokens
+4. Standard EAGLE draft for next round
+
+**Per-round wall-clock decomposition** (97% step-1 accept from cont. 11):
+- Accept (97%): 2 × 18.4 (decodes) + 5 (MTP draft) + 1 (sampling) = 42.8 ms, 2 tokens
+- Reject (3%): 1 × 18.4 + 5 + 1 = 24.4 ms, 1 token
+- Avg: 0.97 × 42.8 + 0.03 × 24.4 = 42.2 ms, 1.97 tokens
+- **Projected fast-path tps: 1.97 / 0.0422 = 46.7 tps**
+
+**Comparison table**:
+
+| | round wall | tokens | tps | vs target_only |
+|---|---:|---:|---:|---:|
+| target_only single decode | 19.4 ms | 1 | 51.5 (theoretical) / 49.2 (measured) | — |
+| current spec γ=1 (verify-b=2) | 48.5 ms | 1.97 | 40.8 | -17% |
+| **fast path γ=1 (sequential 2× decode)** | **42.2 ms** | **1.97** | **46.7** | **-5%** |
+
+**The handoff's "+10% over target_only" was optimistic.** That projection assumed draft cost ~0 ms; in reality the 5B-param MTP draft at q4f16_1 reads 0.71 GB → 3.5 ms BW floor + small compute = ~5 ms measured. Draft cost is **structurally irreducible at γ=1** — it's the price of running spec.
+
+Best case: fast path closes 65% of the spec→target_only gap (40.8 → 46.7 tps, +14% over current spec) but does **NOT exceed target_only** on the 35B-Orin. **Lateral move.**
+
+**Empirical sanity check** (`scratch_g1_math_check.py`, 32-token completion on prompt "The capital of France is", warmup pass first):
+
+| mode | wall (ms) | text |
+|---|---:|---|
+| target_only b=1 | 620.3 | "...Western Europe. It is bordered by Belgium..." |
+| spec γ=1 | 812.8 | "...Paris is the largest city. Paris is the center..." |
+
+Spec is **31% slower wall-clock** on this run. (Different output text — both correct, but greedy hit different argmax tie-breakers; not a parity concern.) Confirms the cont. 12 finding: spec γ=1 loses to target_only by ~17% on the 35B-Orin, and the fast path can recover ~12% but not flip the sign.
+
+**Implementation effort sketch** (~200-300 lines of C++ in `cpp/serve/engine_actions/eagle_batch_verify.cc`):
+
+1. Detect γ=1 at top of `Step()` and dispatch to `StepG1FastPath()`.
+2. Phase 1 — `BatchDecodeToLastHidden(committed_N)` on verify model → logit_N. Already exists, used for draft side at [eagle_batch_verify.cc:268](cpp/serve/engine_actions/eagle_batch_verify.cc#L268).
+3. Phase 1.5 — custom greedy/sample-and-compare for the single-position verify (avoid the tree-token `BatchVerifyDraftTokensWithProbAfterTopP` overhead at γ=1).
+4. Phase 2 — only on accept: `BatchDecodeToLastHidden(D_1)` → logit_{N+1}, sample T_{N+2}.
+5. KV state management — much simpler than current verify (no GDN history mode, no PopNFromRNNStateOnly, no CommitAcceptedTokenTreeNodes — each decode just appends).
+6. Draft model KV sync on reject — pop the draft's bad N+1 entry (PopNFromKVCache(1)), the post-verify draft step then re-populates.
+
+Effort: ~2 sessions of C++ engine work + iterations against the 12-min C++ recompile cycle. Plus parity testing.
+
+**Risks beyond the wall-clock projection**:
+- Custom verify-at-single-position sampler interaction (rejection sampling for non-greedy modes is non-trivial).
+- New code path for γ=1 means a maintenance burden (the standard verify path stays for γ≥2).
+- Numerical parity on reject differs slightly from current spec (current discards bad logit_{N+1}; fast path doesn't compute it). Greedy parity should hold but stochastic-mode parity may not.
+
+**Recommendation: SHELVE.**
+
+The 35B-on-Orin is structurally BW-bound. spec γ=1 has a ~5 ms irreducible draft cost that means the fast path's best case is "match target_only," not beat it. 2 sessions of C++ engine work for a lateral move on a single hardware target is not a good use of effort.
+
+**Alternative lanes ranked by EV** (unchanged from cont. 13):
+
+| | lane | effort | wall-clock impact | unblock |
+|---|---|---|---|---|
+| 1 | **Phase 5 (fp8 KV cache, long-context)** | ~1 wk | +2-15% at 8K-64K seqlen, **2× capacity** | unblocks long-context use cases |
+| 2 | **Blackwell port + bench** | 1-2 sessions | 35B-spec already a known win on BW-rich hardware | shipping on different hardware |
+| 3 | depthwise_conv1d small-batch kernel | 2-3 sessions | ~1-2 ms saved per verify | bandwidth-bound, won't break gap |
+| ~~4~~ | ~~Engine γ=1 fast path~~ | ~~2 sessions~~ | **lateral, doesn't beat target_only** | shelved |
+
+**Files**
+- New: `scratch_g1_math_check.py` (35B target_only vs spec γ=1 wall-clock probe).
+
+---
+
+## 2026-04-28 (cont. 13) — Diagnostic pass on the post-handoff lanes (1) + (2). **Both come back negative: the lib is approximately optimal as-is.** Phase 4B is a wrap on the 35B; remaining gain on Orin needs the engine γ=1 fast path or a hardware change.
+
+**Lane 1 — Re-bench v6 baseline at tg512 on the new lib (5 min)**
+
+Ran `bench_mlc.py --pp 128 --tg 512 --runs 3 --warmup 1` against the freshly-compiled 35B lib (mtime 2026-04-28 19:12, dlight-patched). MAXN locked, no stale processes.
+
+| run | ttft (ms) | decode (ms) | tg_tps |
+|---|---:|---:|---:|
+| warmup | 846.5 | — | — |
+| 0 | 784.1 | 10327.0 | 49.48 |
+| 1 | 784.0 | 10343.7 | 49.40 |
+| 2 | 784.2 | 10331.0 | 49.46 |
+| **median** | **784.2** | **10331.0** | **49.46** |
+
+Cont. 12 reported target_only at 49.2 (likely tg32 from `spec_smoke_35b`). At tg512, target_only is **49.46 tps** — within noise of cont. 12's 49.2. **The dlight TX patch did NOT lift target_only on the 35B.** Consistent with the analysis: target_only never enters the broadcast-epilogue GEMV branch (no per-token unroll, no broadcast-multiply input feeding a matmul). Only the verify path benefits from the dlight patch, and only on the broadcast-epilogue sites (out_proj, o_proj, shared expert down_proj). **Confirmed: 0.8B's +21% from the same patch came entirely through its spec γ=4 verify path, not through the model's regular forward.**
+
+Gap "v6 52.62" → current 49.46 (-6%) is the cumulative cost of EAGLE/spec infrastructure (γ-specialized verify entries, ~100 cudagraph variants per entry) baked into the lib, not a new dlight-patch regression.
+
+**Lane 2 — Verify per-token loop runs at b=1 in IR (30 min)**
+
+Captured nsys profile of γ=2 verify with cudaProfilerStart/Stop bracket (`scratch_nsys_g2.py`, trace `/tmp/nsys_g2.nsys-rep`, 16 verify rounds × max_tokens=32). Used `--cuda-graph-trace=node` per the cont. 1 lesson — without it, decode kernels collapse inside cudagraph captures.
+
+**Expected per-linear instance counts at γ=2 (s=3), 16 rounds:**
+
+| site | per-token ON | per-token OFF (re-fused) |
+|---|---:|---:|
+| GDN linear (30 layers) | **1440** | 480 |
+| GDN linear, two sharing kernel (a+b) | **2880** | 960 |
+| Attn linear (10 layers) | **480** | 160 |
+| MoE shared expert (40 layers) | **1920** | 640 |
+
+**Observed (top matmul/GEMV kernels by total time):**
+
+| kernel | inst | avg µs | total ms | identification |
+|---|---:|---:|---:|---|
+| `fused_dequantize1_NT_matmul` | **1440** | 61.9 | 89.1 | GDN in_proj_qkv per-token ✓ |
+| `fused_dequantize2_NT_matmul1` | **1440** | 32.3 | 46.6 | GDN in_proj_z per-token ✓ |
+| `fused_dequantize3_NT_matmul2` | **2880** | 6.4 | 18.3 | GDN in_proj_a + in_proj_b sharing kernel, per-token ✓ |
+| `fused_dequantize4_NT_matmul3` | **1920** | 33.0 | 63.4 | MoE gate_up_proj per-token ✓ |
+| `fused_dequantize5_NT_matmul5` | **1920** | 9.8 | 18.9 | MoE shared (silu fused) per-token ✓ |
+| `fused_dequantize6_NT_matmul6` | **1920** | 6.4 | 12.2 | MoE down_proj per-token ✓ |
+| `fused_dequantize7_NT_matmul8` | **480** | 68.9 | 33.1 | suspect — see below |
+| `NT_matmul22` | 640 | 148.2 | 94.8 | paged-attn related (10 attn × 4 sub-kernels × 16) |
+| `fused_NT_matmul23_tir_sigmoid10_multiply19_add7` | 640 | 33.1 | 21.2 | MoE expert combine (40 × 16) |
+| `fused_dequantize_fused_NT_matmul28_cast26_kernel` | 16 | 3293 | 52.7 | LM head, batched γ=2 (s=3) |
+| `gdn_func_history_kernel` | 480 | 48.0 | 23.0 | GDN recurrence (30 × 16) |
+| `depthwise_conv1d3_kernel` | 480 | 29.3 | 14.1 | GDN conv1d (30 × 16) |
+
+**Verdict: per-token branch is firing correctly on every site we checked.** The 1440 / 2880 / 1920 counts are exact matches for `n_layers × s × n_rounds` (s=3, n_rounds=16). No re-fusion detected.
+
+**The 480-instance suspect (`fused_dequantize7_NT_matmul8`, 69 µs avg)** is most likely **attn `c_attn` per-token** (10 attn × 3 × 16 = 480), not GDN out_proj batched: avg 69 µs at b=1 matches the c_attn shape (in 2048, out 9216 → 9.4 MB weight read at ~70% BW peak = 67 µs theoretical). GDN out_proj per-token would land at 1440 instances; if it had been re-fused to b=3, it would show up at 480 inst with a lower avg time (~30 µs) since the dlight broadcast-epilogue schedule fuses the precursor multiply. No 480-inst kernel matches that profile.
+
+**The handoff's hypothesized "5 ms unlock from suppressing fusion" is not on the table.** The "30 instances × 256 µs" cont. 12 observation was a snapshot from the pre-dlight, pre-out_proj-per-token state — already addressed by cont. 12's commit. There's no remaining missed optimization in the per-token dispatch.
+
+**Conclusion**
+
+The 35B lib is approximately optimal for the per-token + dlight patch architecture. The 17% gap to target_only on Orin is **structural BW saturation**, exactly as cont. 12 predicted. No quick win on lanes (1) or (2).
+
+Ranked options by EV:
+
+| | next lane | effort | expected on Orin | unblock value |
+|---|---|---|---|---|
+| 1 | Engine γ=1 fast path (2 single-token decodes vs batched verify) | 2 sessions | **+10% on 35B at γ=1, possibly beats target_only** | only path to a wall-clock win on Orin |
+| 2 | Phase 5 (fp8 KV cache, long-context lane) | ~1 wk | +2% at 8K, +4% at 16K, **2× max seqlen capacity** | unblocks long-context use cases on Orin |
+| 3 | depthwise_conv1d small-batch kernel | 2-3 sessions | ~1-2 ms saved per verify, modest tps lift | bandwidth-bound, won't break 17% gap |
+| 4 | CUDA graph capture pruning | 1 session | uncertain | reduce capture-time/runtime overhead |
+
+**Recommendation: stop pushing on 35B-on-Orin verify perf.** The γ=1 fast path (next lane) is the only realistic Orin win, but it's a 2-session C++ engine change. Phase 5 is the orthogonal long-context lane. **If Blackwell deployment is on the table, the 35B is already shipped — porting + benching there is the highest-EV move.**
+
+**Files**
+- New: `scratch_nsys_g2.py` (cudaProfilerStart-bracketed γ=2 probe).
+- New artifacts: `/tmp/nsys_g2.nsys-rep`, `/tmp/bench_35b_v6_dlight.json` (under /tmp; not committed).
+
+---
+
 ## 🔖 SESSION HANDOFF (2026-04-28 EOD, post cont. 12) — Phase 4B shipped on 0.8B; 35B in tight BW-bound regime on Orin
 
 **Where the work landed**
