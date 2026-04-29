@@ -243,13 +243,23 @@ void FunctionTable::_InitFunctions() {
   this->alloc_embedding_tensor_func_ = mod_get_func("alloc_embedding_tensor");
   this->cuda_graph_alloc_init_func_ = mod_get_func("cuda_graph_alloc_init");
   this->create_kv_cache_func_ = mod_get_func("create_flashinfer_paged_kv_cache");
-  if (this->model_metadata_.sliding_window_size != -1 || !this->create_kv_cache_func_.defined()) {
+  // Hybrid models always need RNN state regardless of which paged-KV variant
+  // (FlashInfer or TIR) is used. The original code only entered the RNN-state
+  // setup branch when sliding window or FlashInfer was unavailable, leaving
+  // ``create_rnn_state_func_`` null for FlashInfer + hybrid combos.
+  if (this->model_metadata_.kv_state_kind == KVStateKind::kHybrid) {
     Function f_create_rnn_state = mod_get_func("create_rnn_state");
-    if (this->model_metadata_.kv_state_kind == KVStateKind::kHybrid) {
-      // Hybrid models need both KV cache and RNN state.
+    // If sliding window is on or FlashInfer is unavailable, fall back to TIR
+    // for the paged KV. Otherwise keep the FlashInfer cache we just fetched.
+    if (this->model_metadata_.sliding_window_size != -1 ||
+        !this->create_kv_cache_func_.defined()) {
       this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
-      this->create_rnn_state_func_ = f_create_rnn_state;
-    } else if (f_create_rnn_state.defined()) {
+    }
+    this->create_rnn_state_func_ = f_create_rnn_state;
+  } else if (this->model_metadata_.sliding_window_size != -1 ||
+             !this->create_kv_cache_func_.defined()) {
+    Function f_create_rnn_state = mod_get_func("create_rnn_state");
+    if (f_create_rnn_state.defined()) {
       this->create_kv_cache_func_ = f_create_rnn_state;
     } else {
       this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");

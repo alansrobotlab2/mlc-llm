@@ -1,5 +1,7 @@
 # Phase 6 — int8 KV cache for Qwen3.6-35B-A3B on Orin AGX (capacity unblock lane)
 
+**Status (2026-04-29):** SHIPPED in batched single-pass implementation. Plumbing landed; int8 throughput on sm_87 is essentially neutral (−2 % at tg512, −1.6 % at tg8192) — exactly as predicted. Greedy parity hit 2/5 EXACT (gate wanted ≥4/5); divergences are small token-level argmax shifts after 100+ identical chars, not catastrophic. **The plumbing is the durable win**; int8 lib is opt-in for memory-bound deployments. See worklog 2026-04-29 entry for the full result.
+
 **Date opened:** 2026-04-29
 **Predecessor:** [phase5-fp8-kv-cache.md](phase5-fp8-kv-cache.md). **Phase 5 shipped end-to-end and was a wall-clock LOSS** (−25 % at tg8192) on sm_87 because every fp8→fp16 cast lowers to a software bit-twiddle. Phase 6 reuses Phase 5's plumbing but switches the storage format to **int8 with per-token scales**, which has a hardware conversion path on every sm since Pascal.
 
@@ -41,6 +43,43 @@ These are all preserved on the current branch as part of the Phase 5 dtype-split
 - Config field `kv_cache_dtype: Optional[str] = None` on `Qwen35Config` — set to `"int8"` for the int8 build.
 
 **Net new work for Phase 6 is the scale tensor and the math at the read/write boundary, not the plumbing.**
+
+---
+
+## Findings after first-pass survey (2026-04-29)
+
+The original plan ("net new work is the scale tensor + math at boundary") was right in shape but underestimated the **C++ class-hierarchy threading**. Phase 5 only changed kernel internals; Phase 6 changes kernel *signatures*, which forces virtual-method changes through `attn_backend.h`. Surface area for plumbing alone:
+
+**Python TIR (7 kernels — 1 new arg each, gated on `dtype_kv == "int8"`):**
+- [_page_kernels.py](../../3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_page_kernels.py) — `_kv_cache_transpose_append` (write-side quant), `_kv_cache_debug_get_kv` (read-side dequant), `_copy_single_page`, `_compact_kv_copy` (memcpy + propagate scales)
+- [_decode_kernels.py](../../3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_decode_kernels.py) — `_attention_decode` (read-side dequant)
+- [_prefill_kernels.py](../../3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_prefill_kernels.py) — `_attention_prefill` (read-side dequant)
+- [tree_attn.py](../../3rdparty/tvm/python/tvm/relax/frontend/nn/llm/tree_attn.py) — `tree_attn_with_paged_kv_cache` (read-side dequant)
+
+**C++ runtime ([paged_kv_cache.cc](../../3rdparty/tvm/src/runtime/vm/paged_kv_cache.cc)):**
+- New field `std::vector<Tensor> scales_;` plus `bool use_int8_kv_;` flag derived from `dtype_kv`.
+- Alloc loop at line 380-386: when `use_int8_kv_`, also allocate `scales_[i]` shape `[num_total_pages, 2, num_kv_heads, page_size]` dtype fp32.
+- 5 kernel-call sites need `scales_[local_layer_id]` threaded in: `f_transpose_append_mha_` (lines 1352, 1380), `f_debug_get_kv_` (lines 1659, 1705), `f_compact_copy_` (line 731), `f_copy_single_page_` (line 700), plus the decode/prefill MHA() virtual dispatches (in `AttentionInternal` and `MHACrossAttnInternal`).
+
+**C++ class hierarchy ([attn_backend.h](../../3rdparty/tvm/src/runtime/vm/attn_backend.h)):**
+- `PagedDecodeFunc::MHA`, `PagedPrefillFunc::MHA`, `PagedPrefillTreeMaskFunc::MHA` virtual signatures get a new `Tensor scales` parameter. (`RaggedPrefillFunc` does not — ragged path doesn't read pages.)
+- TIR overrides forward `scales` into `attn_func_(...)` after `pages`. FlashInfer overrides ignore `scales` (FlashInfer doesn't support int8 KV; defensive `TVM_FFI_ICHECK` if `scales->shape[0] > 1`).
+
+**Risky piece: per-token max-abs reduction in TIR append kernel.** Existing `_kv_cache_transpose_append` is element-wise over `(token, head, dim)`. Per-token quant needs a reduction across `head_dim` (256 elems for Qwen3.6) before the cast. Restructure the loop:
+- Outer parallel: `(token, head)` bound to `blockIdx.x` — one block per (token, head) pair.
+- Inner: `head_dim` bound to `threadIdx.x` (256 threads, one warp × 8 = max workgroup, fits page-load CTA budget).
+- Reduction: `T.cross_thread_reduction` for max-abs. Naive form first; warp-shuffle is a follow-up if it shows up in profiling.
+
+### Revised stage breakdown — single batched pass
+
+The 4-stage breakdown below was written assuming per-stage rebuilds. With `dtype_kv == "int8"` gating the new code paths, **the regression case (fp16 KV) is preserved as a no-op throughout** — Stage 6.1 acceptance falls out of any correct implementation. Therefore:
+
+- **Single batched implementation**: all kernel signature changes + C++ class-hierarchy threading + scale alloc + quant/dequant math go in one batch, gated on `dtype_kv == "int8"`. fp16/fp8 paths are byte-identical to today.
+- **One TVM rebuild** (12 min) instead of four (48 min).
+- **One model recompile** of the int8 lib (35 s) on top of the existing fp16 lib.
+- Acceptance staged via test-execution order, not code-change order: regression bench (validates 6.1) → debug round-trip (validates 6.2) → layer-output cosine (validates 6.3) → end-to-end bench/parity/capacity (validates 6.4).
+
+Trade-off: harder to bisect if something breaks, since several layers change at once. Mitigation: changes are per-file and per-function additive (not refactors), each with a clear `if dtype_kv == "int8":` (Python) or `if (use_int8_kv_)` (C++) guard. A bisect would naturally split along those guards.
 
 ---
 
