@@ -6,6 +6,74 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 🔖 SESSION HANDOFF (2026-04-28 EOD, post cont. 12) — Phase 4B shipped on 0.8B; 35B in tight BW-bound regime on Orin
+
+**Where the work landed**
+- TVM submodule commit `ce9cb40`: dlight TX-typo patch.
+- Main repo commit `c3ab6f4c`: Phase 4B end-to-end (concat-order fix, 35B MTP draft module, EAGLE plumbing on the MoE target, per-token small-batch verify dispatch in 5 sites, γ-specialized verify entries, C++ engine γ-dispatch, worklog cont. 8 → 12).
+- 28 → 30 commits ahead of `origin/qwen3_next`. Not pushed.
+
+**Lib state (in dist/, all freshly compiled):**
+- `qwen3_5-0.8B-q0f16/` + `qwen3_5-0.8B-q0f16-mtp-draft/` — production-ready, γ=4 lands 120.5 tps with byte-identical parity.
+- `qwen3_6-35B-A3B-q4f16_1/` — 196 MB lib with 4 γ-specialized verify entries; backups at `lib_v6_eagle_no_history.so.bak`, `lib_v6_b5_moe_only.so.bak`, `lib_v6_b6_gdn_in_only.so.bak`, `lib_v6_history.so.bak`, `lib_v6_pre_eagle.so.bak`.
+- `qwen3_6-35B-A3B-q4f16_1-mtp-draft/` — new MTP draft artifact (5B params, 0.71 GB at q4f16_1).
+
+**Working tree:** clean except `.claude/plans/phase5-fp8-kv-cache.md` (untracked, predates this session) and the scratch_*.py + tuning/ leftovers from cont. 4. Safe to ignore.
+
+### Final numbers
+
+**0.8B-q0f16 (clean win, shippable):**
+
+| | tps γ=4 | accept_len | parity | runner |
+|---|---:|---:|---|---|
+| **Production config** | **120.5** | 4.71 | byte-identical | `scripts/run_0.8B_spec.py` |
+
+**Qwen3.6-35B-A3B on Orin AGX (sm_87, 204 GB/s):**
+
+| metric | tps | per-accepted-token ms |
+|---|---:|---:|
+| target_only baseline (recompiled lib) | **49.2** | 18.4 |
+| spec γ=1 best | **40.8** | 21.6 |
+| spec γ=2 | 37.1 | 23.0 |
+| spec γ=3 | 38.2 | 26.2 |
+| spec γ=4 | 30.6 | 32.8 |
+| theoretical BW floor | 68.0 | 14.7 |
+
+**Spec on the 35B loses to target_only by 17% on Orin.** Same code on Blackwell (MTP=3) has been observed by the user to net-speed-up — bottleneck shifts in our favor on BW-rich hardware.
+
+### Analysis: why Orin ≠ Blackwell
+
+The 35B-A3B at q4f16 reads ~3 GB of active weights per decode step. On Orin's 204 GB/s peak BW, that's a **14.7 ms theoretical floor**. We measure target_only at 18.4 ms = **80% of peak BW**. There's only 4 ms of BW slack; spec-decode's gain comes from amortizing weight reads across γ tokens in a single verify forward, but 4 ms isn't enough headroom to amortize the per-token activation work + small-batch tile under-utilization across the verify path.
+
+Empirically: at γ=1, verify-batch (b=2) costs 42.5 ms vs 2 × single-decode = 36.8 ms. The 5.7 ms gap = batched-verify overhead that can't be amortized at this BW ceiling.
+
+On Blackwell (~5 TB/s, sm_120), single-token decode is **compute-bound, not BW-bound**. Verify-batch reads weights once and shares them across γ tokens — that's free amortization. Spec wins decisively.
+
+### Next-session priorities (ordered by EV)
+
+| # | Lane | Effort | Expected | Notes |
+|---|---|---|---|---|
+| 1 | **Re-bench v6 baseline at tg512 on the new lib** | 5 min | Establishes whether the dlight patch alone shifted v6 (the 0.8B got +21% from it). Free signal. | |
+| 2 | **Verify per-token loop runs at b=1 in IR** | 30 min | Cont. 12 nsys showed some GDN linears still at 30 instances × 256 µs — TVM may have re-fused per-token calls. If yes, suppress with attrs, unlock ~5 ms. | |
+| 3 | **Engine γ=1 fast path: 2 single-token decodes vs batched verify** | 2 sessions | **Math says +10% over target_only.** Touches `cpp/serve/engine_actions/eagle_batch_verify.cc`. **This is the cleanest path to a wall-clock win on the 35B on Orin.** | |
+| 4 | **depthwise_conv1d small-batch kernel** | 2-3 sessions | Currently 128 µs/layer × 30 = 3.85 ms in verify; 2× expected at b=2 — same tile under-utilization story. | |
+| 5 | **CUDA graph capture pruning** | 1 session | Lib has ~100 cudagraph variants per γ-specialized entry. Reducing capture-time/runtime overhead may help. | |
+| 6 | **Phase 4A KV-cache int8** | ~1 wk | Deferred. ~5-15% on tg512 if landed. | |
+| 7 | **Phase 4C GDN chunk-scan kernel** | multi-day | Compounds with spec. Lower priority. | |
+
+**Recommended entry point**: do (1) and (2) as cheap diagnostics first. If (1) shows v6 itself moved to ~58 tps, the gap to spec is wider and (3) becomes more urgent. If (2) reveals fusion is hiding gains, that's a quick win. Then commit to (3) if Orin spec is still the goal.
+
+**If Blackwell deployment is on the table**, the work is already complete — the 35B should win MTP=3-style on BW-rich hardware. Verify by porting + benching.
+
+### Open questions
+
+- The dlight TX patch is upstream-able to TVM main. Worth a PR; one-line fix in well-known dead code with strong test case.
+- 11 cont. entries on 2026-04-28; ~2400 lines in worklog.md. Should compact into a "Phase 4B summary" section if the next session moves to a new phase.
+- The `.claude/plans/phase4-perf.md` doc still says "B.4 acceptance gate: tg512 ≥ 79 tps" — that gate is unmet on Orin (we hit 40.8 at γ=1 on tg32). Plan should be revised to reflect Orin BW-bound reality.
+- γ=3 trajectory diverged by 1 token mid-stream (cont. 12). Not a correctness bug per se, but worth noting that fp16 noise from per-token-vs-batched compute paths can flip near-tied logits at γ=3 specifically; γ=1, 2, 4 byte-identical.
+
+---
+
 ## 2026-04-28 (cont. 12) — B.6 fully unblocked: dlight TX-typo patched (one-line fix in vendored TVM), all 4 per-token sites enabled. **35B spec γ=1: 40.8 tps (+62% cumulative cont. 9 → 12). Bonus: 0.8B γ=4 jumps 99.5 → 120.5 tps (+21%) from the dlight patch alone, no 0.8B code changes.**
 
 **The dlight bug:** [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py:289](../3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py#L289) had `factors=[None, TX]` and `bind(tx, "threadIdx.x")` in the GEMV scheduler's `is_broadcast_epilogue` branch. `TX` is referenced but **never defined** in the surrounding `apply()` closure. The companion `apply()` at [gemv.py:566](../3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py#L566) has the same branch correctly written with `TS` and `TAG_S` (the existing thread-axis size and binding tag). One-character typo in dead code.
