@@ -1,26 +1,49 @@
 # Phase 4 — Next perf avenues for Qwen3.6-35B-A3B on Orin AGX
 
 **Date opened:** 2026-04-28  
+**Last triaged:** 2026-04-28 (cont. 8) — **4B re-opened: 64% accept rate at γ=1 after concat-order fix.**
 **Predecessor:** [phase2d-ft-hybrid-quant.md](phase2d-ft-hybrid-quant.md) (closed, −3.8%), B-ext spec decode (dead, 5.2% token agreement).  
 **Current best:** v6 at **52.62 tps tg512 / 174 tps tg64** (1.789× llama.cpp Q4_K_S).  
 **Lib:** `dist/qwen3_6-35B-A3B-q4f16_1/`
 
-## Summary of remaining avenues
+## Status (post-cont. 8 wiring fix)
+
+| Phase | Status | Next |
+|---|---|---|
+| **4A** KV cache int8 | **DEFERRED** — ~1 wk TVM kernel work | Revisit only if 4B doesn't deliver and we want another +5–15% |
+| **4B** MTP self-spec | **GO — wiring fix landed, B.3 next** | The original 0.8B port had `cat([h_norm, e_norm])` (reversed). vLLM uses `cat([embeds, hidden])`. After fixing all 3 Python sites, 35B γ=1 lands **64% accept rate**. State drift on rejected tokens still corrupts trajectory past ~20 tokens (verify uses non-history forward). **B.3:** port `forward_with_history` from qwen35_model.py to qwen3_5_moe_model.py and wire `batch_verify_to_last_hidden_states` to use it; recompile target; sweep γ ∈ {1,2,3,4} for clean accept-rate measurement and tps. |
+| **4C** GDN chunk-scan | Open, lower EV than B.3 | Profile first if pursued |
+| **4D** Meta-schedule | **DEAD** — regressed 1.78× | Closed |
+
+**Phase 4 recommendation: B.3.** The Phase 3 / cont. 8 conclusion that "the MTP head is a training auxiliary" was based on contaminated probes (same `cat([h, e])` bug in [scripts/mtp_head_pytorch_check.py:122](../../scripts/mtp_head_pytorch_check.py#L122)). With the head proven usable, the path to a real speedup is: history mode → clean trajectories → measurable wall-clock gain. Original plan target was tg512 ≥ 79 tps (≥ 1.5× v6); at 64% step-1 accept and ~2 average accept_len, the math is in range.
+
+## What landed in cont. 8
+
+- **New module** `python/mlc_llm/model/qwen3_5_moe_mtp_draft/` — 35B variant of the MTP draft (parameterized hidden, MoE block instead of dense MLP).
+- **EAGLE-compat methods on the MoE target** — `*_to_last_hidden_states` × 5 + `get_logits` + matching spec entries in [qwen3_5_moe_model.py](../../python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py). Required for spec decode on the 35B.
+- **`_infer_kv_state_kind` fix** in [interface/compile.py](../../python/mlc_llm/interface/compile.py) — the new draft model_type was falling through to `hybrid` (segfault in `CreateKVCache`); now correctly maps to `kv_cache`.
+- **The concat-order fix in 3 sites:** new 35B draft model, original 0.8B draft model (was buggy), and the integrated `Qwen35MTPHead.forward` in qwen35_model.py:966 (also buggy). All 3 changed from `cat([h_norm, e_norm])` → `cat([e_norm, h_norm])`.
+- **Recompiled libs:** `dist/qwen3_6-35B-A3B-q4f16_1/lib.so` (with EAGLE methods; backup at `lib_v6_pre_eagle.so.bak`), `dist/qwen3_6-35B-A3B-q4f16_1-mtp-draft/lib.so` (new artifact, with corrected concat).
+- **Stale and need recompile before re-benching Phase 3:** `dist/qwen3_5-0.8B-q0f16-mtp-draft/lib.so` and `dist/qwen3_5-0.8B-q0f16-mtp/lib.so`. Phase 3's "0% accept rate" was almost certainly the same bug.
+
+## Summary of remaining avenues (original, kept for context)
 
 Ranked by expected return / effort:
 
 | Phase | Approach | Expected gain | Effort | Risk |
 |---|---|---|---|---|
-| **4A** | KV cache int8 quantization | +5–15% tg512 | 1–2 sessions | Low |
+| **4A** | KV cache int8 quantization | +5–15% tg512 | ~~1–2 sessions~~ ~1 wk (revised) | Low |
 | **4B** | MTP self-speculative (GDN rollback unblock) | +50–100% (1.5–2×) if accept ≥60% | 3–6 sessions | High |
 | **4C** | GDN chunk-scan kernel (FLA-style) | +5–15% (scan-heavy steps) | 2–4 sessions | Medium |
-| **4D** | Meta-schedule sweep on hot kernels | +2–5% | 1–2 sessions | Low |
+| **4D** | Meta-schedule sweep on hot kernels | +2–5% | 1–2 sessions | Low — **CLOSED, regressed** |
 
-**Do phases in order.** 4A is standalone; 4B requires GDN rollback work that also unblocks clean transfer of 4C. 4D can run in parallel with anything.
+~~Do phases in order.~~ **Revised order:** 4B is now the only viable lane. 4A deferred. 4D dead. 4C only if 4B lands.
 
 ---
 
-## Phase 4A — KV cache int8 quantization
+## Phase 4A — KV cache int8 quantization (DEFERRED)
+
+> **2026-04-28 update:** A.1 audit revealed there is no `kv_cache_dtype` plumbing in MLC. TVM's `PagedKVCache` takes a single dtype that propagates everywhere. Real cost is ~1 wk of TVM kernel work (modify ~6 TIR kernels for dequant-on-read + quant-on-write, scale storage layout in paged blocks). On hold pending 4B. Original plan kept below for reference if this is ever revived.
 
 ### Background
 
@@ -69,7 +92,55 @@ python bench.py --model dist/qwen3_6-35B-A3B-q4f16_1_kv8/ --tg 512 --tg 64 --pp 
 
 ---
 
-## Phase 4B — MTP self-speculative decode (unblock GDN rollback)
+## Phase 4B — MTP self-speculative decode (GO)
+
+> **2026-04-28 cont. 8 update:** B.2 landed end-to-end on the 35B with a **64% step-1 accept rate at γ=1** after the concat-order fix described in [Status](#status-post-cont-8-wiring-fix) above. Initial 0% reading was a wiring bug carried over from the original 0.8B port and the contaminated PyTorch probe at scripts/mtp_head_pytorch_check.py. vLLM's qwen3_5_mtp.py confirms the correct convention is `cat([embeds, hidden])`, not `cat([hidden, embeds])`.
+>
+> **Smoke results (γ ∈ {1, 2, 3, 4}, 35B, completions API + ignore_eos)**
+>
+> | γ | accept_count (per step) | step1 acc | step2 acc | step3 acc | step4 acc | avg accept_len | decode tps |
+> |---:|---|---:|---:|---:|---:|---:|---:|
+> | 1 | [39, 25] | **64%** | — | — | — | 1.64 | 22.8 |
+> | 2 | [29, 19, 15] | 66% | 79% | — | — | 2.17 | 22.1 |
+> | 3 | [33, 15, 10, 7] | 45% | 67% | 70% | — | 1.97 | 17.2 |
+> | 4 | [9, 3, 3, 3, 3] | 33% | 100% | 100% | 100% | 2.33 | 15.7 |
+>
+> Decode tps is currently *below* target_only baseline (45 tps tg32 warmup-dominated) because of state drift: `batch_verify_to_last_hidden_states` uses regular forward (no GDN history), so rejected tokens corrupt the GDN state. Trajectories degrade into repetition loops within ~20 tokens — which actually inflates late-trajectory accept rates (draft and target both predict the same repeating token) but breaks the text. **B.3 is what unlocks the wall-clock win.**
+
+### B.3 — Port `forward_with_history` to qwen3_5_moe_model (next session)
+
+The 0.8B already has this in `qwen35_model.py`:
+- `Qwen35GatedDeltaNet.forward_with_history` ([qwen35_model.py:606](../../python/mlc_llm/model/qwen35/qwen35_model.py#L606)) — TIR kernel that scatters per-position GDN state into history slots so subsequent `PopN` can roll back to the accepted prefix bit-exactly.
+- `Qwen35DecoderLayer.forward_with_history` ([line 890](../../python/mlc_llm/model/qwen35/qwen35_model.py#L890)) — wraps the GDN call.
+- `Qwen35Model.forward_with_history` ([line 1015](../../python/mlc_llm/model/qwen35/qwen35_model.py#L1015)) — chains layers.
+- `Qwen35LMHeadModel._forward_to_last_hidden_with_history` + `batch_verify_to_last_hidden_states` ([line 1101 / 1174](../../python/mlc_llm/model/qwen35/qwen35_model.py#L1101)) — the entry point.
+
+**Steps:**
+1. Mirror these into `qwen3_5_moe_model.py`. The MoE layer's structure differs only at the MLP — both call `Qwen35GatedDeltaNet` (already has `forward_with_history`), so the work is just plumbing through `Qwen35MoEDecoderLayer.forward_with_history` and `Qwen35MoEModel.forward_with_history`.
+2. Update `Qwen35MoEForCausalLM.batch_verify_to_last_hidden_states` to call `_forward_to_last_hidden_with_history`.
+3. Engine side: ensure `set_use_history_mode(True)` is called before `BeginForward` on the verify (already wired in `cpp/serve/engine_actions/eagle_batch_verify.cc` per Phase 3 cont. 4).
+4. Recompile target lib. Backup current at `lib_v6_eagle_no_history.so.bak`.
+
+**Acceptance:** spec output text matches target_only byte-identically on a long prompt (≥ 100 tokens). Then sweep γ ∈ {1, 2, 3, 4}: report decode tps and accept rate. Pick the best γ and commit to gen_config.
+
+### B.4 — Final bench (after B.3)
+
+```bash
+for gamma in 1 2 3 4; do
+    python bench.py --model dist/qwen3_6-35B-A3B-q4f16_1/ \
+        --draft dist/qwen3_6-35B-A3B-q4f16_1-mtp-draft/ \
+        --spec-draft-length $gamma \
+        --tg 512 --tg 64
+done
+```
+
+**Acceptance gate:** tg512 ≥ 79 tps (≥ 1.5× v6 baseline 52.62). At 64% step-1 accept × ~1.64 accept_len the math says this is reachable. If we miss the gate, fall back to whichever γ gives the best wall-clock (might still be net positive at γ=1 even at 22 tps if the warmup amortizes).
+
+### B.5 — Recompile 0.8B drafts and re-validate Phase 3
+
+The 0.8B `dist/qwen3_5-0.8B-q0f16-mtp-draft/lib.so` and `dist/qwen3_5-0.8B-q0f16-mtp/lib.so` are stale (built before the concat-order fix). Recompile and re-run `scripts/spec_smoke.py`. The "Phase 3 dead at 0% accept rate" verdict from the 2026-04-28 entry needs to be re-evaluated under the corrected wiring.
+
+> Original plan (B.1, B.2 stages) kept below for reference.
 
 ### Background
 
@@ -218,7 +289,9 @@ Wrap in TIR shell to stay CUDA-graph-capturable. Wire into `qwen3_next_model.py`
 
 ---
 
-## Phase 4D — Meta-schedule tuning (parallelizable)
+## Phase 4D — Meta-schedule tuning (DEAD)
+
+> **2026-04-28 update:** 500-trial evolutionary+xgb canary on `attn_o_proj` (the highest-headroom kernel) produced **59.3 µs vs dlight 33.3 µs = 1.78× regression**. Plateaued by trial 192. dlight's hand-written `dl.gpu.GEMV()` schedule for int4-dequant-fused low-batch GEMV is too specialized to beat with the generic `post-order-apply` space generator. The other three target kernels share the same schedule — same wall. Phase 4D closed. Original plan kept below for reference.
 
 ### Background
 
@@ -262,6 +335,27 @@ Apply via `ApplyHistoryBest` in the compile pipeline. Rebuild lib, full bench.
 - **4C:** FLA scan kernel ≥15% faster gate fails → close.
 - **4D:** No single kernel ≥5% faster → close.
 
+---
+
+## Status updates (2026-04-28)
+
+### 4A — REVISED (not as scoped)
+**Investigation revealed:** MLC's TVM has no `kv_cache_dtype` plumbing. `PagedKVCache.create_generic` takes a single `dtype` that propagates to every attention kernel ([python/mlc_llm/nn/kv_cache.py:32](../../python/mlc_llm/nn/kv_cache.py#L32)). No `int8`/`fp8`/`e4m3` matches anywhere in TVM kv_cache or MLC `cpp/serve/`. Flashinfer underneath has separate `dtype_q/dtype_kv/dtype_o` but is called with all three equal — and on Orin (sm_87) flashinfer isn't used anyway, the TIR path is.
+
+**Effort to actually deliver int8 KV:** thread `dtype_kv` through `PagedKVCache.create_generic`, modify ~6 TIR kernels (`_attention_prefill`, `_attention_decode`, `_kv_cache_transpose_append`, `_copy_single_page`, `_compact_kv_copy`, `_kv_cache_debug_get_kv`) for dequant-on-read + quant-on-write with per-token/per-head scales, decide scale storage layout in paged blocks. ~1 week of TVM kernel work, not "1–2 sessions." On hold pending 4B.
+
+### 4B.1 — PASS
+35B snapshot `995ad96` ships **19 MTP weight keys**: 1 MTP layer + EAGLE-style fc head (`mtp.fc.weight`, `mtp.pre_fc_norm_{embedding,hidden}.weight`, `mtp.norm.weight`, plus `mtp.layers.0.{self_attn, mlp.experts/shared_expert, *_layernorm}`). Architecture mirrors the 0.8B's MTP head except MoE replaces dense MLP. Phase 4B is a real path — not a training project.
+
+### 4D — DEAD (canary regressed)
+- **Bench reproduced:** dlight per-call timings on the four target kernels are stable to <0.2% std. Real numbers (vs the plan's stale baselines): lm_head 1717 µs, gdn_in_proj_qkv 63 µs, attn_o_proj 35 µs, gdn_in_proj_z 34 µs. End-to-end physical ceiling for 4D is **+9.5%** (Amdahl: these four are 31.7% of decode time at v6, all ~66–82% of peak BW).
+- **Canary:** 500-trial evolutionary+xgb sweep on `attn_o_proj` (highest-headroom kernel). Result: **59.3 µs tuned vs 33.3 µs dlight = 1.78× regression**, plateaued by trial 192. Tooling (`scratch_ms_smoke.py`, `tune_kernel.py`) all green; the regression is real.
+- **Why:** dlight's `dl.gpu.GEMV()` schedule is hand-specialized for low-batch GEMV-with-int4-dequant at exactly these shapes. Meta-schedule's general space generator explores matmul-style tilings and wmma paths (we saw a `TensorIntrin 'wmma_fill_16x16x16_f16' is not registered` error on DB reload, confirming wmma candidates were generated) — wmma with B=1 wastes compute because MMA needs M ≥ 16.
+- **Not chasing the other three kernels:** they're all GEMV+int4-dequant hitting the same `dl.gpu.GEMV()` schedule and would hit the same wall.
+
+### Recommended next phase
+4B is now the only viable lane. Order: **B.1 ✓ → B.2 (port MTP draft loader from 0.8B to 35B, γ=1 first to bypass RNNState rollback) → measure accept rate → B.3 (state checkpoint/restore) only if γ=1 lands a real speedup.**
+
 ## Dependency map
 
 ```
@@ -271,14 +365,15 @@ Apply via `ApplyHistoryBest` in the compile pipeline. Rebuild lib, full bench.
 4C (GDN scan)   — independent from 4A/4B; gains compound with 4B if both land
 ```
 
-Recommended order for a single engineer: **4A → 4B.1+4B.2 → 4B.3 → 4C (if profiling shows payoff) → 4D (background)**
+~~Recommended order for a single engineer~~ **(superseded)**: post-triage, the only live lane is **4B.2 → 4B.3 (Option A or B) → 4B.4** as the recommended order. 4A deferred, 4C dependent, 4D dead.
 
 ## Reference numbers
 
-| Config | tg512 tps | tg64 tps | vs llama.cpp |
-|---|---:|---:|---:|
-| v6 (current best) | 52.62 | ~174 | 1.789× |
-| llama.cpp Q4_K_S | 29.40 | — | 1.000× |
-| 4A target | ≥55.0 | ~180 | ~1.87× |
-| 4B target (γ=4, α=60%) | ≥79 | ~250 | ~2.7× |
-| 4A+4B combined | ≥82 | ~260 | ~2.8× |
+| Config | tg512 tps | tg64 tps | vs llama.cpp | Status |
+|---|---:|---:|---:|---|
+| v6 (current best) | 52.62 | ~174 | 1.789× | shipped |
+| llama.cpp Q4_K_S | 29.40 | — | 1.000× | external bar |
+| 4A target | ≥55.0 | ~180 | ~1.87× | deferred |
+| 4B target (γ=1, α=60%) | ~74 | ~240 | ~2.5× | next milestone |
+| 4B target (γ=4, α=60%) | ≥79 | ~250 | ~2.7× | post-rollback |
+| 4D | — | — | — | dead (regressed 1.78×) |

@@ -16,6 +16,7 @@
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/tensor.h>
 
+#include <array>
 #include <string>
 
 #include "../metadata/model.h"
@@ -99,6 +100,12 @@ struct FunctionTable {
   Function prefill_to_last_hidden_func_;
   Function decode_to_last_hidden_func_;
   Function verify_to_last_hidden_func_;
+  // γ-specialized verify-to-last-hidden variants (seq_len pinned to γ+1).
+  // Empty if the model lib doesn't expose them; engine falls back to the
+  // generic dynamic-seq_len `verify_to_last_hidden_func_` in that case.
+  // Indexed by γ; verify_to_last_hidden_g_funcs_[γ] handles seq_len=γ+1.
+  // Slots 1..4 are the supported range (γ=1..4 → seq_len=2..5); 0 unused.
+  std::array<Function, 5> verify_to_last_hidden_g_funcs_;
   Function fuse_embed_hidden_func_;
   Function get_logits_func_;
   Function batch_get_logits_func_;

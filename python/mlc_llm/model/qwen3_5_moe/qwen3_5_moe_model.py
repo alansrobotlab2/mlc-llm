@@ -63,6 +63,18 @@ class Qwen35MoEMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: Tensor):
+        # Per-token GEMV dispatch when called from the MoE block at small batch
+        # (verify spec entries with seq_len pinned to literal). 5× small-batch
+        # tax in dense matmul → ~13 ms savings per verify on the 35B at γ=2.
+        if len(x.shape) == 2 and isinstance(x.shape[0], int) and 1 < x.shape[0] <= 5:
+            num_tokens = x.shape[0]
+            parts = op.split(x, indices_or_sections=num_tokens, axis=0)
+            outs = []
+            for t in range(num_tokens):
+                concat_t = self.gate_up_proj(parts[t])
+                x1, x2 = op.split(concat_t, 2, axis=-1)
+                outs.append(self.down_proj(self.act_fn(x1) * x2))
+            return op.concat(outs, dim=0)
         concat_x1_x2 = self.gate_up_proj(x)
         x1, x2 = op.split(concat_x1_x2, 2, axis=-1)
         return self.down_proj(self.act_fn(x1) * x2)
@@ -124,6 +136,19 @@ class Qwen35MoESparseMoeBlock(nn.Module):
         ]
         if num_tokens == 1:
             moe_hidden_states = _expert_forward(x_flat, expert_indices)
+        elif isinstance(num_tokens, int) and 1 < num_tokens <= 5:
+            # Spec-decode verify (γ=1..4, num_tokens = γ+1): dispatch per-token
+            # through the b=1 dequantize_gemv kernel. Bench at B=24 group_gemm
+            # showed 0.058 ms/row flat at small batch vs gemv 0.008 ms/row →
+            # ~7× speedup per-token. Avoids cumsum/scatter overhead entirely.
+            # Triggered only when seq_len is pinned to a literal in the spec
+            # (see batch_verify_g{N}_to_last_hidden_states variants).
+            h_parts = op.split(x_flat, indices_or_sections=num_tokens, axis=0)
+            ind_parts = op.split(expert_indices, indices_or_sections=num_tokens, axis=0)
+            out_parts = [
+                _expert_forward(h_parts[t], ind_parts[t]) for t in range(num_tokens)
+            ]
+            moe_hidden_states = op.concat(out_parts, dim=0)
         else:
             cumsum = op_ext.moe_misc.moe_cumsum(expert_indices, num_experts)
             reverse_indices, token_indices = op_ext.moe_misc.get_indices(cumsum, expert_indices)
@@ -187,6 +212,29 @@ class Qwen35MoEDecoderLayer(nn.Module):
         hidden_states = self._apply_residual(out, residual=hidden_states)
         return hidden_states, state
 
+    def forward_with_history(
+        self,
+        hidden_states: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        """Verify-path variant — scatters per-position GDN state into history slots.
+
+        Mirrors `Qwen35DecoderLayer.forward_with_history` from qwen35_model.py:890.
+        Only the linear_attn call differs from `forward`; full_attention layers are
+        rolled back via PagedKVCache PopN, which doesn't need a history-mode forward.
+        """
+        out = self.input_layernorm(hidden_states)
+        if self.layer_type == "full_attention":
+            out = self.self_attn(out, paged_kv_cache, self.category_id)
+        else:
+            out, state = self.linear_attn.forward_with_history(out, state)
+        hidden_states = self._apply_residual(out, residual=hidden_states)
+        out = self.post_attention_layernorm(hidden_states)
+        out = self.mlp(out)
+        hidden_states = self._apply_residual(out, residual=hidden_states)
+        return hidden_states, state
+
     def _apply_residual(self, out, residual):
         if self.tensor_parallel_shards > 1:
             return op.ccl_allreduce(out, "sum") + residual
@@ -219,6 +267,20 @@ class Qwen35MoEModel(nn.Module):
         hidden_states = inputs
         for layer in self.layers:
             hidden_states, state = layer.forward(hidden_states, paged_kv_cache, state)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, state
+
+    def forward_with_history(
+        self,
+        inputs: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        hidden_states = inputs
+        for layer in self.layers:
+            hidden_states, state = layer.forward_with_history(
+                hidden_states, paged_kv_cache, state
+            )
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
 
@@ -257,6 +319,15 @@ class Qwen35MoEForCausalLM(nn.Module):
             input_ids = op.ccl_broadcast_from_worker0(input_ids)
         return self.model.embed_tokens(input_ids)
 
+    def _lm_head(self, hidden_states: Tensor) -> Tensor:
+        if self.tie_word_embeddings:
+            logits = self.model.embed_tokens.lm_head_forward(hidden_states)
+        else:
+            logits = self.lm_head(hidden_states)
+        if logits.dtype != "float32":
+            logits = logits.astype("float32")
+        return logits
+
     def _forward(
         self,
         input_embed: Tensor,
@@ -268,13 +339,127 @@ class Qwen35MoEForCausalLM(nn.Module):
         hidden_states, state = self.model.forward(input_embed, paged_kv_cache, state)
         if logit_positions is not None:
             hidden_states = op.take(hidden_states, logit_positions, axis=1)
-        if self.tie_word_embeddings:
-            logits = self.model.embed_tokens.lm_head_forward(hidden_states)
-        else:
-            logits = self.lm_head(hidden_states)
-        if logits.dtype != "float32":
-            logits = logits.astype("float32")
-        return logits, paged_kv_cache, state
+        return self._lm_head(hidden_states), paged_kv_cache, state
+
+    def _forward_to_last_hidden(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        op_ext.configure()
+        hidden_states, state = self.model.forward(input_embed, paged_kv_cache, state)
+        return hidden_states, paged_kv_cache, state
+
+    def _forward_to_last_hidden_with_history(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+    ):
+        op_ext.configure()
+        hidden_states, state = self.model.forward_with_history(
+            input_embed, paged_kv_cache, state
+        )
+        return hidden_states, paged_kv_cache, state
+
+    def get_logits(self, hidden_states: Tensor) -> Tensor:
+        op_ext.configure()
+        return self._lm_head(hidden_states)
+
+    def prefill_to_last_hidden_states(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embed, paged_kv_cache, rnn_state)
+
+    def decode_to_last_hidden_states(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embed, paged_kv_cache, rnn_state)
+
+    def batch_prefill_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+
+    def batch_decode_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+
+    def batch_verify_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        # Verify uses the per-position-history GDN forward so partial accept can
+        # roll the recurrent state back to the accepted prefix bit-exactly via
+        # PopN. Mirrors the 0.8B path (qwen35_model.py:1184). The engine pairs
+        # this with `set_use_history_mode(True)` before BeginForward so EndForward
+        # advances `available_history_num` by `seq_len`.
+        # Dynamic seq_len entry; falls through MoE block's group_gemm path.
+        # For γ ∈ {1..4}, the engine should call batch_verify_g{γ}_* below to
+        # hit the per-token gemv fast path.
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
+
+    # Specialized verify entry points with literal seq_len. These trace the same
+    # forward but pin num_tokens to a Python int inside the MoE block, which fires
+    # the per-token-gemv dispatch branch (avoids ~7× group_gemm small-batch tax).
+    # Engine selects by γ at runtime: γ=1 → g1 (seq_len=2), γ=2 → g2 (3), etc.
+    def batch_verify_g1_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
+
+    def batch_verify_g2_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
+
+    def batch_verify_g3_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
+
+    def batch_verify_g4_to_last_hidden_states(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
 
     def batch_prefill(
         self,
@@ -390,6 +575,101 @@ class Qwen35MoEForCausalLM(nn.Module):
             },
             "batch_verify": {
                 "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            # EAGLE-compat entry points: hidden-state-returning variants for
+            # self-spec decode. The engine pairs these with the draft model's
+            # `*_to_last_hidden_states` and routes through `get_logits`.
+            "get_logits": {
+                "hidden_states": nn.spec.Tensor(["seq_len", self.hidden_size], self.dtype),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "prefill_to_last_hidden_states": {
+                "input_embed": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "decode_to_last_hidden_states": {
+                "input_embed": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_prefill_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_decode_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_verify_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            # Specialized verify entries with seq_len pinned to literal γ+1.
+            # These activate the per-token-gemv fast path inside the MoE block
+            # (see Qwen35MoESparseMoeBlock.forward). One per supported γ; engine
+            # picks at runtime based on actual draft length.
+            "batch_verify_g1_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, 2, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_verify_g2_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, 3, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_verify_g3_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, 4, self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_verify_g4_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, 5, self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "rnn_state": nn.spec.Object(object_type=RNNState),
                 "$": {

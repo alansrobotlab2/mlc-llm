@@ -806,13 +806,22 @@ class ModelImpl : public ModelObj {
 
     // args: embeddings, logit_pos, kv_cache, params
     ObjectRef result;
+    // Pick a γ-specialized verify entry if total_length matches (γ+1) ∈ {2..5}
+    // and the model lib exposes one. These pin seq_len to a literal so the MoE
+    // block fires the per-token-gemv fast path, ~7× faster than the dynamic
+    // group_gemm path at small batch.
+    Function verify_func = ft_.verify_to_last_hidden_func_;
+    if (total_length >= 2 && total_length <= 5 && num_sequences == 1) {
+      int g = total_length - 1;
+      if (ft_.verify_to_last_hidden_g_funcs_[g].defined()) {
+        verify_func = ft_.verify_to_last_hidden_g_funcs_[g];
+      }
+    }
     if (kind == KVStateKind::kHybrid) {
-      result =
-          ft_.verify_to_last_hidden_func_(embeddings_dref_or_nd, kv_cache_, rnn_state_, params_)
-              .cast<ObjectRef>();
-    } else {
-      result = ft_.verify_to_last_hidden_func_(embeddings_dref_or_nd, kv_cache_, params_)
+      result = verify_func(embeddings_dref_or_nd, kv_cache_, rnn_state_, params_)
                    .cast<ObjectRef>();
+    } else {
+      result = verify_func(embeddings_dref_or_nd, kv_cache_, params_).cast<ObjectRef>();
     }
     ft_.kv_cache_end_forward_func_(kv_cache_);
     if (kind == KVStateKind::kHybrid) {

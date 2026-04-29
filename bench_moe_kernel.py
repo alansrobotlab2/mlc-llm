@@ -47,9 +47,40 @@ SHAPES = {
     "down":            dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=8,    spread=False, kind="group_gemm"),
     "gate_up_prefill": dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=1024, spread=True,  kind="group_gemm"),
     "down_prefill":    dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=1024, spread=True,  kind="group_gemm"),
+    # Small-batch verify shapes (B = num_tokens * top_k, spread across experts).
+    # These are what spec-decode verify pays at γ=1..4 inside the MoE block:
+    #   γ=1 (b=2 verify, num_tokens=2): B=16
+    #   γ=2 (b=3 verify, num_tokens=3): B=24
+    #   γ=3 (b=4 verify, num_tokens=4): B=32
+    #   γ=4 (b=5 verify, num_tokens=5): B=40
+    # spread=True approximates pessimistic routing (each row goes to a distinct
+    # expert; no expert sharing across drafted tokens). Realistic small-batch
+    # routing has 30-50% expert overlap which would shift these toward gemv-cost.
+    "gate_up_b16":     dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=16,   spread=True,  kind="group_gemm"),
+    "down_b16":        dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=16,   spread=True,  kind="group_gemm"),
+    "gate_up_b24":     dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=24,   spread=True,  kind="group_gemm"),
+    "down_b24":        dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=24,   spread=True,  kind="group_gemm"),
+    "gate_up_b32":     dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=32,   spread=True,  kind="group_gemm"),
+    "down_b32":        dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=32,   spread=True,  kind="group_gemm"),
+    "gate_up_b40":     dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=40,   spread=True,  kind="group_gemm"),
+    "down_b40":        dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=40,   spread=True,  kind="group_gemm"),
+    "gate_up_b64":     dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=64,   spread=True,  kind="group_gemm"),
+    "down_b64":        dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=64,   spread=True,  kind="group_gemm"),
     # gemv (intended decode path; not currently dispatched at b=1)
     "gate_up_gemv":    dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=1,    spread=False, kind="gemv"),
     "down_gemv":       dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=8,    spread=False, kind="gemv"),
+    # gemv at multi-token batch — what we'd pay if we dispatched each verify
+    # token through a separate gemv call (γ=1 → 2 calls, γ=2 → 3, γ=3 → 4, γ=4 → 5).
+    # Each call does B=1 gemv (1 token × top_k=8 active experts).
+    # The existing _DequantGemvModule takes B = num_tokens and indptr (1, top_k),
+    # so we can also bench "single kernel call processing N tokens through 1 fixed
+    # expert set" — useful as a lower bound on the small-batch kernel.
+    "gate_up_gemv_b2": dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=2,    spread=False, kind="gemv"),
+    "gate_up_gemv_b3": dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=3,    spread=False, kind="gemv"),
+    "gate_up_gemv_b5": dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=5,    spread=False, kind="gemv"),
+    "down_gemv_b2":    dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=2,    spread=False, kind="gemv"),
+    "down_gemv_b3":    dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=3,    spread=False, kind="gemv"),
+    "down_gemv_b5":    dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=5,    spread=False, kind="gemv"),
     # topk_softmax (MoE router): single-thread sequential scan at b=1
     "topk_softmax":    dict(Ne=256, N=0,    K=2048, group_size=0,  top_k=8, B=1,    spread=False, kind="topk_softmax"),
     # Dense q4f16_1 GEMVs — the shared expert path (no MoE indptr).

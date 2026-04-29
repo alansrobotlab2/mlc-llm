@@ -219,6 +219,13 @@ void FunctionTable::_InitFunctions() {
   this->prefill_to_last_hidden_func_ = mod_get_func("batch_prefill_to_last_hidden_states");
   this->decode_to_last_hidden_func_ = mod_get_func("batch_decode_to_last_hidden_states");
   this->verify_to_last_hidden_func_ = mod_get_func("batch_verify_to_last_hidden_states");
+  // Optional γ-specialized verify variants. Models that don't expose them
+  // leave these slots null and the engine falls back to the dynamic-seq_len
+  // `verify_to_last_hidden_func_` for all γ.
+  for (int g = 1; g <= 4; ++g) {
+    this->verify_to_last_hidden_g_funcs_[g] =
+        mod_get_func("batch_verify_g" + std::to_string(g) + "_to_last_hidden_states");
+  }
   this->fuse_embed_hidden_func_ = mod_get_func("fuse_embed_hidden_states");
   Module mod = this->use_disco ? this->disco_mod.value()->DebugGetFromRemote(0).cast<Module>()
                                : this->local_vm.value();

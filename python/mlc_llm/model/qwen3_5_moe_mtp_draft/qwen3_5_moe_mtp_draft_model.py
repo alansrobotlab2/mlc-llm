@@ -1,19 +1,14 @@
-"""Qwen3.5 MTP head as a standalone EAGLE-style draft model.
+"""Qwen3.5-MoE MTP head as a standalone EAGLE-style draft model (35B-A3B).
 
-Pairs with the Qwen3.5 target (`qwen3_5`) for self-speculative decoding via the
-EAGLE pipeline. The draft contains:
-  - embed_tokens (full vocab embedding, shared semantically with target via tied
-    weights but a separate VRAM copy here)
-  - pre_fc_norm_embedding, pre_fc_norm_hidden, fc (the MTP fuse step)
-  - one decoder layer (Qwen35Attention + Qwen35MLP, attn_output_gate=True)
-  - final norm
+Same shape as `qwen35_mtp_draft` (the 0.8B variant) — one decoder layer feeding
+the MTP fuse step — except the MLP is the sparse MoE block (256 routed experts
+top-8 + shared expert with sigmoid gate), matching the released 35B-A3B
+checkpoint.
 
-No `get_logits` is exposed: the engine routes hidden states through the target's
-lm_head via `CanGetLogits()=false` in the EAGLE pipeline.
-
-Function names match the EAGLE template (`fuse_embed_hidden_states`,
-`*_to_last_hidden_states`) so the existing C++ EAGLE actions drive this model
-without modification.
+Reuses `Qwen35Attention` (full attention with output gate) and the MoE block
+from `qwen3_5_moe_model`. No `get_logits` is exposed: the engine routes hidden
+states through the target's lm_head via `CanGetLogits()=false` in the EAGLE
+pipeline.
 """
 
 import dataclasses
@@ -26,25 +21,21 @@ from tvm.relax.frontend.nn import Tensor, op
 from mlc_llm import op as op_ext
 from mlc_llm.nn import PagedKVCache, RopeMode
 
-from ..qwen35.qwen35_model import (
-    Qwen35Attention,
-    Qwen35Config,
-    Qwen35Embedding,
-    Qwen35MLP,
-)
+from ..qwen35.qwen35_model import Qwen35Attention, Qwen35Embedding
+from ..qwen3_5_moe.qwen3_5_moe_model import Qwen35MoEConfig, Qwen35MoESparseMoeBlock
 
 
 @dataclasses.dataclass
-class Qwen35MTPDraftConfig(Qwen35Config):
-    """Reuses Qwen35Config; only the MTP-relevant fields are exercised."""
+class Qwen35MoEMTPDraftConfig(Qwen35MoEConfig):
+    """Reuses Qwen35MoEConfig; only the MTP-relevant fields are exercised."""
 
 
-class _Qwen35MTPDraftDecoderLayer(nn.Module):
-    """Single decoder block matching `_Qwen35MTPDecoderLayer` in the target model."""
+class _Qwen35MoEMTPDraftDecoderLayer(nn.Module):
+    """Single full-attention + MoE-MLP decoder block, matching `mtp.layers.0` in HF."""
 
-    def __init__(self, config: Qwen35Config):
+    def __init__(self, config: Qwen35MoEMTPDraftConfig):
         self.self_attn = Qwen35Attention(config)
-        self.mlp = Qwen35MLP(config)
+        self.mlp = Qwen35MoESparseMoeBlock(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, -1, config.rms_norm_eps, bias=False
@@ -69,14 +60,14 @@ class _Qwen35MTPDraftDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen35MTPDraftLM(nn.Module):
-    """EAGLE-compatible draft head for Qwen3.5 self-speculative decoding."""
+class Qwen35MoEMTPDraftLM(nn.Module):
+    """EAGLE-compatible draft head for Qwen3.5-MoE (Qwen3.6-35B-A3B) self-spec decoding."""
 
-    def __init__(self, config: Qwen35MTPDraftConfig):
+    def __init__(self, config: Qwen35MoEMTPDraftConfig):
         if config.mtp_num_hidden_layers <= 0:
             raise ValueError(
-                "Qwen35MTPDraftLM requires `mtp_num_hidden_layers >= 1`. "
-                "Set it in the model config (Qwen3.5-0.8B ships with 1)."
+                "Qwen35MoEMTPDraftLM requires `mtp_num_hidden_layers >= 1`. "
+                "Set it in the model config (Qwen3.6-35B-A3B ships with 1)."
             )
         self.config = config
         self.embed_tokens = Qwen35Embedding(config.vocab_size, config.hidden_size)
@@ -88,7 +79,7 @@ class Qwen35MTPDraftLM(nn.Module):
         )
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.layers = nn.ModuleList(
-            [_Qwen35MTPDraftDecoderLayer(config) for _ in range(config.mtp_num_hidden_layers)]
+            [_Qwen35MoEMTPDraftDecoderLayer(config) for _ in range(config.mtp_num_hidden_layers)]
         )
         self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
 
@@ -107,6 +98,8 @@ class Qwen35MTPDraftLM(nn.Module):
         super().to(dtype=dtype)
         if dtype is not None:
             self.dtype = dtype
+            for layer in self.layers:
+                layer.mlp.dtype = dtype
 
     def embed(self, input_ids: Tensor):
         if self.tensor_parallel_shards > 1:
@@ -115,9 +108,9 @@ class Qwen35MTPDraftLM(nn.Module):
 
     def fuse_embed_hidden_states(self, input_embed: Tensor, hidden_states: Tensor):
         # vLLM's qwen3_5_mtp.py:138 fuses as cat([embeds, hidden]) — embeds in
-        # the FIRST half of fc's input, hidden in the second. The original
-        # 0.8B port had this reversed; that bug zeroed the spec-decode accept
-        # rate (verified on the 35B variant: 0% → 64% at γ=1 after the fix).
+        # the FIRST half of fc's input, hidden in the second. The 0.8B port
+        # in qwen35_mtp_draft has the order reversed; that bug zeros the accept
+        # rate (0% rather than ~70% at γ=1).
         e_norm = self.pre_fc_norm_embedding(input_embed)
         h_norm = self.pre_fc_norm_hidden(hidden_states)
         return self.fc(op.concat([e_norm, h_norm], dim=-1))
@@ -180,6 +173,10 @@ class Qwen35MTPDraftLM(nn.Module):
         )
 
     def get_default_spec(self):
+        # batch_decode pinned to 1 for the same reason as the main MoE model: the
+        # MoE block's `if num_tokens == 1:` static dispatch routes through
+        # `dequantize_gemv` instead of `dequantize_group_gemm`, which is ~6× faster
+        # at b=1 top-8 on Orin.
         mod_spec = {
             "embed": {
                 "input_ids": nn.spec.Tensor(["seq_len"], "int32"),
@@ -221,7 +218,7 @@ class Qwen35MTPDraftLM(nn.Module):
                 },
             },
             "batch_decode_to_last_hidden_states": {
-                "hidden_states": nn.spec.Tensor(["batch_size", 1, self.hidden_size], self.dtype),
+                "hidden_states": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "$": {
                     "param_mode": "packed",

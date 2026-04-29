@@ -116,10 +116,12 @@ class MTPHead(nn.Module):
         b, s, _ = h_seq.shape
         device = h_seq.device
 
-        # Fuse step
+        # Fuse step. vLLM qwen3_5_mtp.py:138 fuses as cat([embeds, hidden]).
+        # The original probe had this reversed — same bug as the engine port —
+        # which produced the bogus "0/14 hit rate on every convention" reading.
         h_norm = self.pre_fc_norm_hidden(h_seq)
         e_norm = self.pre_fc_norm_embedding(e_seq)
-        x = self.fc(torch.cat([h_norm, e_norm], dim=-1))  # (B, S, hidden)
+        x = self.fc(torch.cat([e_norm, h_norm], dim=-1))  # (B, S, hidden)
 
         # Decoder layer
         residual = x

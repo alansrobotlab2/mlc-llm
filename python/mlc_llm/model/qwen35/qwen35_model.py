@@ -202,8 +202,14 @@ class Qwen35Attention(nn.Module):
     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
         d, h_q, h_kv = self.head_dim, self.num_attention_heads, self.num_key_value_heads
         b, s, _ = hidden_states.shape
-        # c_attn outputs flat: [Q_with_gate (h_q * 2 * d), K (h_kv * d), V (h_kv * d)]
-        proj = self.c_attn(hidden_states)
+        # c_attn per-token at small static seq: same small-batch tax fix as
+        # GDN/MoE. Pinned-seq verify entries (s ∈ {2..5}) hit this branch.
+        if isinstance(s, int) and 1 < s <= 5:
+            h_parts = op.split(hidden_states, indices_or_sections=s, axis=1)
+            proj = op.concat([self.c_attn(h_parts[t]) for t in range(s)], dim=1)
+        else:
+            # c_attn outputs flat: [Q_with_gate (h_q * 2 * d), K (h_kv * d), V (h_kv * d)]
+            proj = self.c_attn(hidden_states)
         # Reshape to heads: (b, s, 2*h_q + 2*h_kv, d)
         proj = op.reshape(proj, (b, s, 2 * h_q + 2 * h_kv, d))
         # Split: first 2*h_q heads have interleaved [Q, gate] per head, then h_kv K, h_kv V
@@ -225,6 +231,9 @@ class Qwen35Attention(nn.Module):
         )
         # Apply output gate: sigmoid(gate) * attn_output
         output = output * op.sigmoid(gate)
+        if isinstance(s, int) and 1 < s <= 5:
+            o_parts = op.split(output, indices_or_sections=s, axis=1)
+            return op.concat([self.o_proj(o_parts[t]) for t in range(s)], dim=1)
         return self.o_proj(output)
 
 
@@ -620,10 +629,23 @@ class Qwen35GatedDeltaNet(nn.Module):
         n_vh = self.num_value_heads
         layer_idx = self.linear_layer_idx
 
-        qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states)
-        alpha = self.in_proj_a(hidden_states)
-        beta_raw = self.in_proj_b(hidden_states)
+        # Per-token GEMV dispatch when seq_len is a Python int and small (1<s<=5).
+        # Each linear at b=3 is ~5× slower per row than at b=1 due to tile under-
+        # utilization in dlight's small-batch matmul; running per-token through
+        # the dl.gpu.GEMV() path saves substantial verify cost. Triggered by the
+        # seq_len-pinned `batch_verify_g{1..4}` spec entries on the 35B target;
+        # 0.8B target's dynamic-seq verify falls through unchanged.
+        if isinstance(s, int) and 1 < s <= 5:
+            h_parts = op.split(hidden_states, indices_or_sections=s, axis=1)
+            qkv = op.concat([self.in_proj_qkv(h_parts[t]) for t in range(s)], dim=1)
+            z = op.concat([self.in_proj_z(h_parts[t]) for t in range(s)], dim=1)
+            alpha = op.concat([self.in_proj_a(h_parts[t]) for t in range(s)], dim=1)
+            beta_raw = op.concat([self.in_proj_b(h_parts[t]) for t in range(s)], dim=1)
+        else:
+            qkv = self.in_proj_qkv(hidden_states)
+            z = self.in_proj_z(hidden_states)
+            alpha = self.in_proj_a(hidden_states)
+            beta_raw = self.in_proj_b(hidden_states)
 
         qkv_dim = qkv.shape[-1]
         conv_state = state.get(
@@ -680,7 +702,13 @@ class Qwen35GatedDeltaNet(nn.Module):
         out_normed = self.norm(out_recurrent)
         out_flat = op.reshape(out_normed, (b, s, n_vh * V))
         out_gated = out_flat * op.silu(z)
-        return self.out_proj(out_gated), state
+        # out_proj per-token at small static seq for the same reason as in_proj_*.
+        if isinstance(s, int) and 1 < s <= 5:
+            og_parts = op.split(out_gated, indices_or_sections=s, axis=1)
+            out = op.concat([self.out_proj(og_parts[t]) for t in range(s)], dim=1)
+        else:
+            out = self.out_proj(out_gated)
+        return out, state
 
     def _causal_conv1d_with_state_history(
         self, qkv: Tensor, conv_state: Tensor
@@ -961,9 +989,11 @@ class Qwen35MTPHead(nn.Module):
         prev_embed: Tensor,
         paged_kv_cache: PagedKVCache,
     ) -> Tensor:
+        # vLLM's qwen3_5_mtp.py:138 fuses as cat([embeds, hidden]) — embeds in
+        # the FIRST half of fc's input. Reversed order zeros accept rate.
         e_norm = self.pre_fc_norm_embedding(prev_embed)
         h_norm = self.pre_fc_norm_hidden(prev_hidden)
-        h = self.fc(op.concat([h_norm, e_norm], dim=-1))
+        h = self.fc(op.concat([e_norm, h_norm], dim=-1))
         for i, layer in enumerate(self.layers):
             kv_layer_idx = self._kv_layer_offset + i
             residual = h

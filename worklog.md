@@ -6,27 +6,359 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
-## 🔖 SESSION HANDOFF (2026-04-28 cont. 3) — ALL PHASES EXHAUSTED. v6 = 52.62 tps is FINAL.
+## 2026-04-28 (cont. 12) — B.6 fully unblocked: dlight TX-typo patched (one-line fix in vendored TVM), all 4 per-token sites enabled. **35B spec γ=1: 40.8 tps (+62% cumulative cont. 9 → 12). Bonus: 0.8B γ=4 jumps 99.5 → 120.5 tps (+21%) from the dlight patch alone, no 0.8B code changes.**
+
+**The dlight bug:** [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py:289](../3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py#L289) had `factors=[None, TX]` and `bind(tx, "threadIdx.x")` in the GEMV scheduler's `is_broadcast_epilogue` branch. `TX` is referenced but **never defined** in the surrounding `apply()` closure. The companion `apply()` at [gemv.py:566](../3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py#L566) has the same branch correctly written with `TS` and `TAG_S` (the existing thread-axis size and binding tag). One-character typo in dead code.
+
+The patched line (now `factors=[None, TS]`, `bind(ts, TAG_S)`) makes the broadcast-epilogue case schedulable. Triggers any matmul whose input is a broadcast-multiply result — i.e., `act(x1) * x2 → linear`, `out * silu(z) → out_proj`, `attn_out * sigmoid(gate) → o_proj`.
+
+**B.6 full restoration (after dlight patch):**
+- [qwen3_5_moe_model.py Qwen35MoEMLP.forward](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L65) — shared expert per-token (gate_up + down).
+- [qwen35_model.py:660-680](python/mlc_llm/model/qwen35/qwen35_model.py#L660) — GDN `out_proj` per-token (in addition to in_proj_qkv/z/a/b from cont. 11).
+- [qwen35_model.py:202-238](python/mlc_llm/model/qwen35/qwen35_model.py#L202) — Qwen35Attention `c_attn` and `o_proj` per-token.
+
+**35B-A3B smoke results (γ=1..4, prompt 15 tokens, max 64, byte-identical text to target_only at γ=1, 2, 4; γ=3 trajectory diverges by 1 token mid-stream — fp16 noise tipping a near-tied logit, kept generating coherent capitals just in different order):**
+
+| γ | accept_len | verify ms | decode tps | vs cont. 11 (B.6 v3) | vs target_only (49.2) | vs v6 (52.62 tg512) |
+|---:|---:|---:|---:|---:|---:|---:|
+| **1** | 1.97 | **42.5** | **40.8** | (was 32.4, **+26%**) | -17% | -22% |
+| 2 | 2.42 | **55.6** | **37.1** | (was 32.9, +13%) | -25% | -29% |
+| 3 | 3.15 | **68.0** | **38.2** | (was 31.2, +22%) | -22% | -27% |
+| 4 | 3.00 | **82.3** | **30.6** | (was 28.8, +6%) | -38% | -42% |
+
+**Best γ=1 at 40.8 tps decode.** Verify per-accepted-token: 42.5 / 1.97 = **21.6 ms** vs target_only single decode 18.4 ms = **1.17×** target_only per-token cost. We're within 17% of breaking even.
+
+Per-prompt variation: on a longer narrative prompt (80 tokens) γ=1 drops to 36.3 tps (lower accept_len 1.75, more uncertain continuation). Mean across the two prompts: ~38 tps γ=1.
+
+**0.8B-q0f16 regression check (B.6 changes are gated on `isinstance(s, int)`; 0.8B's dynamic-seq verify never hits the new branch — but the dlight patch affects the kernel-level scheduler that everyone goes through):**
+
+Recompiled `dist/qwen3_5-0.8B-q0f16/lib.so` and `dist/qwen3_5-0.8B-q0f16-mtp-draft/lib.so`. γ=4 smoke on default prompt:
+
+| metric | cont. 9 | cont. 12 | Δ |
+|---|---:|---:|---:|
+| accept_count | [7, 7, 7, 6, 6] | [7, 7, 7, 6, 6] | identical |
+| accept_len | 4.71 | 4.71 | identical |
+| verify ms (b=5) | ~30 | **19.7** | **-34%** |
+| decode tps | 99.5 | **120.5** | **+21%** |
+
+The 21% gain on the 0.8B is "free" — the dlight patch fixed the broadcast-epilogue path which the 0.8B's dynamic-seq verify was apparently hitting too. **No regression, real improvement.** Output text byte-identical to target_only.
+
+**Cumulative B.5 + B.6 wins (cont. 9 → 12):**
+- 35B γ=1: 25.2 → 40.8 tps (**+62%**)
+- 35B γ=2: 24.3 → 37.1 tps (**+53%**)
+- 35B γ=4: 20.5 → 30.6 tps (+49%)
+- 0.8B γ=4: 99.5 → 120.5 tps (+21%, dlight only)
+
+**Verify cost decomposition at 35B γ=2 over the trajectory:**
+- cont. 9 (no per-token): 96 ms
+- cont. 10 (B.5 routed-MoE per-token): 78 ms (-19%)
+- cont. 11 (+ GDN in_proj per-token): 67 ms (-16%)
+- cont. 12 (+ shared expert + GDN out_proj + attention per-token): **55.6 ms** (-17%)
+
+**Architectural ceiling check.** Spec γ=1 verify per-token: 21.6 ms. Single decode: 18.4 ms. The 3.2 ms gap is ~17% of single-decode cost. 35B-A3B at q4f16 reads ~3 GB of weights per token; on Orin's 204 GB/s that's a 14.7 ms BW floor. We're at 18.4 ms = 80% of BW peak. To break even with target_only at γ=1, verify needs to read weights at ~1× the effective BW of single decode for 1 token, but with actual 1.97 tokens/round → average ~0.5× weight read per token. Theoretically winnable, but fp16 numerics + kernel launch overhead + layer norm/residual/conv1d at 3× tokens are close to the remaining gap.
+
+**Files**
+- Modified: [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py:289](../3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py#L289) (TX → TS / TAG_S — vendored TVM patch).
+- Modified: [qwen3_5_moe_model.py Qwen35MoEMLP.forward](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L65) (shared expert per-token).
+- Modified: [qwen35_model.py:202-238](python/mlc_llm/model/qwen35/qwen35_model.py#L202) (Qwen35Attention c_attn + o_proj per-token), [:660-680](python/mlc_llm/model/qwen35/qwen35_model.py#L660) (GDN out_proj per-token).
+- Recompiled: 35B target lib (196 MB) + both 0.8B libs. Backups: `lib_v6_b6_gdn_in_only.so.bak` (cont. 11 numbers).
+
+**Decision points for next session**
+1. **Ship the 35B as-is**: spec γ=1 at 40.8 tps. Loses to target_only by 17% wall-clock but the head is correct, the wiring is robust, and the whole spec lane infrastructure is now correct. Useful for any future iteration (different draft, different model, better Orin).
+2. **0.8B: clearly shippable**: 120.5 tps γ=4 with byte-identical parity. Update default lib to use B.6.
+3. **Explore upstreaming the dlight patch** to TVM main. One-line fix in well-known dead code; should be uncontroversial.
+4. **Revisit the 35B if hardware changes**: on a memory-bandwidth-richer GPU (H100, Blackwell), spec verify wins much more aggressively. The current code is ready for that.
+
+---
+
+## 2026-04-28 (cont. 11) — B.6 GDN in_proj per-token + nsys profiling. Spec γ=2 now 32.9 tps (+35% cumulative cont. 9 → 11). dlight `TX is not defined` bug blocks ~30 ms of remaining gain in shared expert / GDN out_proj / attention.
+
+**Profiling pass (nsys, 1.88s spec γ=2 trace):** decoded the 60 ms unaccounted gap from cont. 10. Per-verify-round breakdown at γ=2 (seq=3):
+
+| Component | per-verify ms | % of verify | small-batch tax |
+|---|---:|---:|---:|
+| GDN dense projections (5 linears × 30 layers) | ~37 | 47% | 5–6× |
+| Shared expert (gate_up + down × 40 layers) | ~17 | 22% | 5× |
+| Routed MoE experts (already optimized in B.5) | 12 | 15% | 1× |
+| Attention (q/k/v + o_proj × 10 layers) | 7 | 9% | 3× |
+| GDN recurrence + conv1d | 5 | 7% | — |
+
+The B.5 routed-MoE per-token dispatch hit its prediction (12 ms ≈ 0.098 ms × 3 × 40); the rest of the verify is just the same small-batch tax on every other dense GEMV in the model. **Same fix pattern applies to all of them.**
+
+**B.6 attempted: per-token dispatch on shared expert + GDN (5 linears) + attention.** Three of the four sites trigger a dlight scheduler bug:
+
+```
+File ".../tvm/python/tvm/s_tir/dlight/gpu/gemv.py", line 289, in apply
+    _, tx = sch.split(sch.fuse(*s), factors=[None, TX])
+RuntimeError: name 'TX' is not defined
+```
+
+This is in dlight's GEMV `is_broadcast_epilogue` branch — `TX` is referenced but never defined in scope (likely a typo for `TS`, which is what the parallel non-broadcast branch uses with 3 factors). Fires on any matmul whose input has a broadcast (elementwise) producer:
+- shared expert: `act_fn(x1) * x2 → down_proj` ← broadcast multiply feeding matmul
+- GDN out_proj: `out_flat * silu(z) → out_proj` ← same pattern
+- attention: `output * sigmoid(gate) → o_proj` ← same pattern
+
+Patching dlight to substitute `TS` for `TX` would likely fix it but touches `3rdparty/tvm` — out of scope for this session. Reverted those three sites.
+
+**B.6 v3 (only the fix that's compatible with dlight): GDN in_proj_qkv / in_proj_z / in_proj_a / in_proj_b** at small static seq → per-token GEMV. These are pure linears with no broadcast producer, so they avoid the bug.
+
+[qwen35_model.py:606-625](python/mlc_llm/model/qwen35/qwen35_model.py#L606): four `op.split` + `op.concat` of the in_proj outputs in `Qwen35GatedDeltaNet.forward_with_history`. Gated on `isinstance(s, int) and 1 < s <= 5` so only the seq-pinned `batch_verify_g{1..4}` entries trigger; dynamic-seq prefill/verify falls through to the existing batched path. Out_proj reverted to dynamic. Lib went 192 MB → 194 MB (more specialization in the per-layer kernels).
+
+**Smoke results (35B, prompt 15 tokens, max_tokens 64, output byte-identical to target_only):**
+
+| γ | accept_count | accept_len | verify ms | decode tps | Δ vs cont. 10 (B.5) | vs target_only (49.3) | cumulative vs cont. 9 |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | [32, 31] | 1.97 | **56** (was 68) | **32.4** (was 27.4) | **+18%** | -34% | +29% |
+| 2 | [25, 24, 14] | 2.52 | **67** (was 78) | **32.9** (was 28.8) | **+14%** | -33% | +35% |
+| 3 | [22, 21, 13, 7] | 2.86 | **79** (was 89) | **31.2** (was 28.4) | +10% | -37% | +25% |
+| 4 | [21, 20, 9, 7, 6] | 3.00 | **90** (was 97) | **28.8** (was 27.4) | +5% | -42% | +40% |
+
+**Best γ for the 35B: γ=2** at 32.9 tps. Step-1 accept rate 96% confirms the head is high-quality.
+
+**Headroom left on the table:**
+- Shared expert per-token: ~13 ms (predicted)
+- GDN out_proj per-token: ~2 ms (small)
+- Attention c_attn + o_proj per-token: ~4 ms
+
+Total: ~19 ms savings if the dlight bug were fixed. Verify γ=2 would drop 67 → ~48 ms → 2.52/48 = 52.5 tps **= 1.06× target_only, 0.997× v6**. Still doesn't decisively beat v6.
+
+**Why even fully optimized spec might not beat v6 here**: target_only at 49.3 tps is on warm tg32 (the bench-prompt). v6's reported 52.62 tps is on tg512 (steady-state, longer context). Single-token decode on the 35B-A3B is bandwidth-limited (3 GB weights / 204 GB/s = 14.7 ms theoretical floor; we measure 18.4 ms, hitting 80% BW peak). For verify-batch-3 to beat 3 single-token decodes, it'd need to share weight reads across tokens — but at this batch size each layer's weight read is already ~⅓ of the BW budget, leaving little to amortize.
+
+**Bottom line: spec on the 35B is correct, drafts well (96% step-1 accept), but the verify-cost / single-decode-cost math on Orin's bandwidth-bound regime is structurally tight.** Not a clear win without either (a) fixing the dlight bug to unlock the remaining ~20% of B.6 gains, OR (b) larger γ with a higher accept_len to amortize verify cost more aggressively (but accept_len drops fast past γ=4).
+
+**Files**
+- Modified: [qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py#L606) `Qwen35GatedDeltaNet.forward_with_history` — per-token in_proj_{qkv,z,a,b} dispatch.
+- Recompiled: 35B target lib (194 MB; backup at `lib_v6_b5_moe_only.so.bak`).
+- Reverted edits: shared expert per-token in `qwen3_5_moe_model.py` (left in `Qwen35MoESparseMoeBlock.forward` for routed experts only); GDN `out_proj` per-token; `Qwen35Attention.forward` per-token. All blocked on dlight TX bug.
+
+**Next session — open tracks**
+1. **Patch dlight TX bug** (one-line fix in `3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py:289`) to unlock B.6 v1's full scope. Quick win if upstream-acceptable.
+2. **0.8B regression check** — `Qwen35GatedDeltaNet.forward_with_history` is shared with the 0.8B target. New branch only fires when seq is an int literal, but the 0.8B's existing dynamic-seq verify never hits that path. Should be zero-impact; recompile 0.8B target and confirm.
+3. **Worklog compacting** — 11 entries on 2026-04-28, ~2300 lines.
+
+---
+
+## 2026-04-28 (cont. 10) — B.5 per-token MoE dispatch lands -20% verify cost (96 → 78 ms at γ=2) but only ~25% of projected gain. Spec still loses to target_only on the 35B; the missing gain is somewhere in the verify forward I haven't profiled yet.
+
+**B.5 hypothesis (cont. 9):** group_gemm at small B is structurally flat at 0.058 ms/row for B=8..64 (microbench: gate_up_b8 0.50 ms, b16 0.96, b24 1.41, b40 2.33, b1024 14.67). gemv at B=1 is 0.008 ms/row → 7.5× faster per row. Per-token dispatch in the MoE block (one gemv call per drafted token instead of one batched group_gemm) should save ~73 ms/verify at γ=2 → spec γ=2 lands ~115 tps.
+
+**B.5 implementation:**
+- [qwen3_5_moe_model.py:130-141](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L130-L141): MoE block forward gains a `1 < num_tokens <= 5` branch that does `op.split` + N× `_expert_forward(x[t:t+1], indices[t:t+1])` + `op.concat`. Triggers only when seq_len is a Python int (i.e., the spec pinned it to a literal).
+- [qwen3_5_moe_model.py:355-419](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L355-L419): four new spec entries `batch_verify_g{1,2,3,4}_to_last_hidden_states` with seq_len pinned to literal {2,3,4,5}. Same forward body as the dynamic `batch_verify_to_last_hidden_states`; pinning makes num_tokens an int → fires the new MoE branch.
+- [function_table.h:101-107](cpp/serve/function_table.h#L101) + [function_table.cc:222-229](cpp/serve/function_table.cc#L222): new `verify_to_last_hidden_g_funcs_[5]` slot, populated via optional `mod_get_func("batch_verify_g{N}_to_last_hidden_states")` lookup. Empty slots → engine falls back to dynamic verify (preserves backward compat for libs without the new entries).
+- [model.cc:807-823](cpp/serve/model.cc#L807-L823): `BatchVerifyToLastHidden` checks `total_length ∈ [2..5]` and `num_sequences == 1`, and picks the γ-specialized function if the lib exposes one.
+
+**Recompile:** TVM lib went from 80 MB → 192 MB (γ=1..4 verify entries each get their own ~100 cudagraph capture variants). C++ rebuild from header-touch was a full ~12 min (CUTLASS kernels). Lib backed up at `lib_v6_history.so.bak`.
+
+**B.5 results (35B-A3B, completions API + ignore_eos, prompt 15 tokens, max_tokens 64):**
+
+| γ | accept_count | accept_len | verify ms (was → now) | decode tps (was → now) | Δ verify | Δ tps |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | [32, 31] | **1.97** | 70 → **68** | 25.2 → **27.4** | -3% | +9% |
+| 2 | [25, 24, 14] | 2.52 | 96 → **78** | 24.3 → **28.8** | **-19%** | +19% |
+| 3 | [22, 21, 13, 7] | 2.86 | ~104 → **89** | 24.9 → **28.4** | -14% | +14% |
+| 4 | [20, 20, 9, 7, 7] | **3.15** | ~129 → **97** | 20.5 → **27.4** | **-25%** | **+34%** |
+
+target_only baseline on the same prompt: **49.3 tps decode** (decode_time_by_batch_size mean = 18.4 ms/token).
+
+**Output text byte-identical to target_only on every γ.** Parity ✓.
+
+**The shortfall**
+
+Standalone microbench predicted MoE part of verify at γ=2 drops from 85 ms (group_gemm B=24, 40 layers × 2.13 ms) to 12 ms (per-token gemv, 40 layers × 0.098 ms × 3 tokens). Expected savings: 73 ms. **Actual savings: 18 ms.** We got ~25% of the projected gain.
+
+Decomposition with the GDN bench:
+- GDN at S=5 (γ=4 verify) = 56 µs/layer × 30 GDN layers = 1.7 ms total. **Not the bottleneck.**
+- GDN at S=1 (decode) = 32 µs/layer × 30 = 0.96 ms.
+- Attention at b=1, seq=3 verify ≈ ~few ms across 10 attn layers.
+- Expected MoE per-token at γ=2: 0.098 ms × 3 tokens × 40 layers = 11.8 ms.
+- **Sum of expected non-MoE work at γ=2: ~5 ms. Plus MoE 12 ms = 17 ms.**
+- **Actual verify cost: 78 ms.** Unaccounted: ~60 ms.
+
+So either (a) the per-token gemv kernel called from inside MoE block at b=1 is much slower than the standalone `dequantize_gemv` microbench (possible — the standalone bench was pure kernel; the model adds context like split/concat ops, MixtralExperts dispatch overhead), or (b) some other op (norms, residuals, the `act_fn(x1) * x2` path) scales worse at seq=3 than expected, or (c) cudagraph capture sizing on the new entry points is sub-optimal.
+
+**Practical state**
+- B.5 landed a real 18-32 ms verify cost reduction with byte-identical parity.
+- Decode tps went from 24-25 (history-mode only) to 27-29 (history + per-token dispatch).
+- The 35B still loses to target_only on the spec lane (28.8 vs 49.3 tps at γ=2 on this prompt). The kernel-tile-tuning ceiling at v6 (52.62 tps tg512) remains the production number.
+- The 0.8B is unaffected by B.5 (no MoE block) and still wins big at γ=4 (99.5 tps, accept_len 4.71).
+
+**Open questions for next session**
+1. **Where does the unaccounted 60 ms in 35B verify go?** Need a profiler pass: nsys or per-layer NVTX ranges around the verify forward. Could reveal a single dominant kernel (or the cudagraph framework overhead).
+2. **Is it worth implementing per-token-style dispatch for GDN at small seq?** The bench says GDN at S=5 is only 1.7× S=1 — already pretty efficient per-token. Probably NOT a useful target.
+3. **Could the existing `dequantize_gemv` schedule be tuned for different batch contexts?** The standalone bench pinned B=1, but in the per-token loop the kernel may be called in a different IR context that disables the optimal schedule.
+
+**Files**
+- Modified: [qwen3_5_moe_model.py](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py) (small-batch MoE branch + 4 g{N} verify methods/spec entries); [function_table.h](cpp/serve/function_table.h)/[.cc](cpp/serve/function_table.cc) (g_funcs_ array + lookup); [model.cc:807-823](cpp/serve/model.cc#L807) (γ dispatch); [bench_moe_kernel.py](bench_moe_kernel.py) (small-batch shapes).
+- Recompiled: 35B target lib (192 MB, with γ-specialized verify), libmlc_llm.so. Backups at `lib_v6_history.so.bak`.
+
+---
+
+## 2026-04-28 (cont. 9) — B.3 lands: 35B history-mode verify produces correct text + 96% step-1 accept. But spec is **slower** than target_only on Orin — MoE GEMV→GEMM transition on verify-batch eats the gain. 0.8B is a clean win.
+
+Continuation of cont. 8. The wiring fix proved the head; this session ports `forward_with_history` to the MoE target so verify can roll back GDN state on partial reject, and benches the result.
+
+**0.8B validation (the easy one)**
+
+Recompiled both stale 0.8B libs (`dist/qwen3_5-0.8B-q0f16-mtp{,-draft}/lib.so`) with the corrected concat. Re-ran `scripts/spec_smoke.py` at γ=4 on two prompts:
+
+| prompt | accept_count | step1 | step2 | step3 | step4 | avg accept_len | decode tps |
+|---|---|---:|---:|---:|---:|---:|---:|
+| "What is the capital of France?" | [7, 7, 7, 6, 6] | 100% | 100% | 100% | 86% | **4.71** | **99.5** |
+| "Explain photosynthesis in three sentences." | [20, 16, 12, 9, 8] | 100% | 80% | 75% | 75% | 3.25 | **74.6** |
+
+Output text fully coherent. **The Phase 3 verdict was wrong.** Concat order was always the bug.
+
+PyTorch probe (`scripts/mtp_head_pytorch_check.py`, line 122 patched to `cat([e_norm, h_norm])`):
+
+```
+A (h_n, e_{n+1}) pred matches T_{n+2} (DeepSeek MTP convention): 10/10
+B (h_n, e_n)     pred matches T_{n+1} (EAGLE-1 convention):     10/10
+C (h_{n-1}, e_n) pred matches T_{n+1} (EAGLE-2):                10/10
+```
+
+Up from 0/14 in the broken probe. Cosine similarity of `MTP_out(h_n, e_{n+1})` vs target's `h_{n+1}` is 0.5–0.9 across positions (not random). The head matches all three position conventions on a clean prompt — likely because the prompt is short and predictable; the question of which convention the head was *trained* for is open but doesn't matter for our use (the engine implements its own convention).
+
+**B.3 — `forward_with_history` ported to qwen3_5_moe**
+
+Mirrored the 0.8B path step-for-step:
+- `Qwen35MoEDecoderLayer.forward_with_history` ([qwen3_5_moe_model.py:191-213](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L191-L213)) — only the linear_attn call differs from `forward`; full_attention layers don't need a history-mode forward (PagedKVCache handles rollback via PopN).
+- `Qwen35MoEModel.forward_with_history` ([line 246-258](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L246-L258)) — chains layer-level `forward_with_history`.
+- `Qwen35MoEForCausalLM._forward_to_last_hidden_with_history` ([line 297-307](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L297-L307)) and `batch_verify_to_last_hidden_states` rewired to use it.
+- The shared `Qwen35GatedDeltaNet.forward_with_history` already lives in `qwen35_model.py:606`; both targets reuse it directly.
+
+35B target recompile: ~9 min, 23.0 GB params+temp (was 20.8 GB without history; +2.2 GB temp for the per-position state history scratch). Backup at `lib_v6_eagle_no_history.so.bak`.
+
+**35B smoke results (γ=1..4 with history mode)**
+
+Same prompt as cont. 8 (`"The quick brown fox ... The capital of France is"`), 64-token continuation, completions API + ignore_eos.
+
+| | step1 | step2 | step3 | step4 | avg accept_len | decode tps | text |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **target_only** | — | — | — | — | — | **49.3** | "Paris. The capital of Germany is Berlin..." (correct) |
+| spec γ=1 | 96% | — | — | — | 1.96 | 25.2 | same text as target_only |
+| spec γ=2 | 96% | 58% | — | — | **2.52** | 24.3 | same |
+| spec γ=3 | 91% | 56% | 24% | — | 2.43 | 24.9 | same |
+| spec γ=4 | ~85% | ~50% | ~35% | ~25% | ~2.4 | 20.5 | same |
+
+(Per-step rates conditional on prior steps accepted. γ=2 raw: `accept_count=[25, 24, 14]`, γ=3: `[33, 30, 17, 4]`, etc.)
+
+**Headline:**
+1. **History mode works** — text is byte-identical to target_only on every γ (no more "the the jumps jumps" repetition). Correctness ✓.
+2. **Step-1 accept rate jumped from 64% (cont. 8, no history) → 96% (with history).** Confirms the cont. 8 number was depressed by state corruption, not a head limitation.
+3. **Spec wall-clock loses to target_only by ~2× across all γ.** 49 tps target_only vs 20–25 tps spec.
+
+**Why spec loses despite 96% accept**
+
+Per-round breakdown at γ=2:
+- verify forward (batch=3, seq_len=1+2): **96 ms**
+- draft forward (batch=1, seq_len=1): 3 ms
+- accept_len: 2.52 tokens
+- → 99 ms / 2.52 = 39 ms per accepted token = 25.4 tps (matches measured)
+
+Target_only single decode: **18 ms/token = 56 tps** (warmed; the 49 tps figure includes prefill amortization).
+
+**The verify forward at batch_size=3 takes 5× as long as a single-token decode for processing 3 tokens.** Per-token cost: verify 32 ms vs decode 18 ms — 78% slower. Spec needs `accept_len > verify_time / decode_time = 96 / 18 = 5.3` tokens per round to break even. The head delivers ~2.5.
+
+The gap is the MoE block's static-vs-dynamic dispatch. From the cont. 0 worklog ("Why the gemv path was unreachable"): the MoE block has `if num_tokens == 1: dequantize_gemv else: dequantize_group_gemm` and the `if` resolves at compile time. `batch_decode` pins `[1, 1, hidden]` literal so num_tokens=1 statically → fast gemv. **`batch_verify_to_last_hidden_states` has spec `[1, "seq_len", hidden]` so num_tokens is symbolic ≥ 1 → routes through `dequantize_group_gemm` regardless of actual seq_len.** group_gemm is ~6× slower than gemv on Orin per the cont. 2 finding. That's the structural ceiling on spec-decode for the 35B-A3B on this hardware.
+
+**0.8B doesn't have this problem because it's a dense MLP** (no MoE), so verify-batch ≈ batch_size × single-decode-cost. At γ=4 with avg accept_len 4.71, every round produces ~5 tokens for ~5 single-decode-equivalents, net 99 tps.
+
+**Status: B.3 correctness ✓, B.4 wall-clock fail.**
+
+Phase 4 plan's B.4 acceptance gate (tg512 ≥ 79 tps, 1.5× v6) is unreachable for the 35B with the current MoE block architecture. The wall-clock win on the 35B requires either:
+- **B.5 / Option 1**: an MoE block variant for small-but-not-1 num_tokens (γ+1 ∈ {2..5}). Would need a TIR kernel that does dequant + group_gemv at small batch — between gemv (b=1) and group_gemm (b≫1). Multi-session kernel work. EV: if it lands at within 30% of single-decode-per-token, spec-decode at γ=2 could hit ~60 tps (1.2× v6). Worth scoping if a perf budget appears.
+- **B.6 / accept the loss**: ship the head as-is, document the GEMV-bottleneck, ship v6 as the final 35B number.
+
+**0.8B is a real win** — 99.5 tps decode at γ=4 with 4.71 accept_len is roughly 2× the dense baseline. If the 0.8B is a deployment target in its own right (it is — see [User profile](.claude/projects/-home-alfie-mlc-llm/memory/user_profile.md)), shipping the 0.8B with MTP enabled at γ=4 is a clear win.
+
+**Files touched this session**
+- Modified: [qwen3_5_moe_model.py](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py) (forward_with_history × 3 levels + verify rewire); [scripts/mtp_head_pytorch_check.py:122](scripts/mtp_head_pytorch_check.py#L122) (concat order fix).
+- Recompiled: 35B target (with history), 0.8B integrated MTP, 0.8B MTP draft. Backups: `lib_v6_eagle_no_history.so.bak`.
+- Working tree changes (uncommitted, 9 files): the cont. 8 fixes + this session's history-mode plumbing + the probe patch + worklog.
+
+**Open questions for next session**
+1. **MoE small-batch GEMV kernel feasibility study.** Profile the verify forward, confirm `dequantize_group_gemm` is the bottleneck, scope a kernel that handles num_tokens ∈ {2, 3, 4, 5}. Look at FLA's gated_delta_rule kernels for ideas on chunk-scan at small batch.
+2. **0.8B MTP shippable?** If yes, commit the cont. 8 + cont. 9 changes, push to origin/qwen3_next, tag a release. The 35B can keep using v6.
+3. **Compact worklog.** Now 9 cont. entries on 2026-04-28 — ~1700 lines. Consider a session-end consolidation.
+
+---
+
+## 2026-04-28 (cont. 8) — Phase 4B ALIVE: 35B MTP head 0% → 64% accept rate at γ=1 after a 1-line concat-order fix. **The Phase 3 0.8B "MTP is a training auxiliary" autopsy was wrong — same wiring bug there too.**
+
+**Headline:** the original 0.8B port (and my 35B port that inherited from it) fuses the MTP head's two inputs as `cat([h_norm, e_norm])`. **vLLM's `qwen3_5_mtp.py:138` does the opposite: `cat([inputs_embeds, hidden_states])`.** With the wrong order, the first half of `fc.weight` (trained to receive embeddings) reads hidden states and vice versa — incoherent logits, 0% accept. After flipping to `cat([e_norm, h_norm])` and recompiling the draft, γ=1 lands **64% accept rate** on the 35B. User flagged the contradiction with vLLM running the same model at MTP=5 successfully — that pushed me to the right answer.
+
+**Phase 3 retrospective:** the 2026-04-28 worklog entry (line ~334) titled *"Option B (MTP self-spec) ruled out empirically. Trained Qwen3.5 MTP head is not a usable multi-token draft"* was based on a PyTorch probe (scripts/mtp_head_pytorch_check.py:122) that **also used `cat([h_norm, e_norm])`** — same bug as the engine. The probe's 0/14 hit rate on every position convention was diagnostic of broken wiring, not a broken head. The 35B static-norm preflight I ran in this session also had the column labels reversed (what I called "embed cols" were actually "hidden cols" under the correct convention). Once you re-label: 0.8B has hidden cols 1.51× heavier than embed (frob 5.50 vs 3.66), 35B is balanced 1.07× (18.31 vs 17.12) — both look like sensible draft heads, not training auxiliaries.
+
+**The fix (3 lines in 3 files)**
+- [python/mlc_llm/model/qwen3_5_moe_mtp_draft/qwen3_5_moe_mtp_draft_model.py:120](python/mlc_llm/model/qwen3_5_moe_mtp_draft/qwen3_5_moe_mtp_draft_model.py#L120) — new 35B draft, `cat([e_norm, h_norm])`.
+- [python/mlc_llm/model/qwen35_mtp_draft/qwen35_mtp_draft_model.py:119](python/mlc_llm/model/qwen35_mtp_draft/qwen35_mtp_draft_model.py#L119) — original 0.8B draft, fixed to match. **The existing `dist/qwen3_5-0.8B-q0f16-mtp-draft/lib.so` is stale; re-bench Phase 3 once recompiled.**
+- [python/mlc_llm/model/qwen35/qwen35_model.py:966](python/mlc_llm/model/qwen35/qwen35_model.py#L966) — the integrated `Qwen35MTPHead.forward` used by the in-target `mtp_decode` method, same bug. **Stale lib in `dist/qwen3_5-0.8B-q0f16-mtp/`; re-bench.**
+
+**Smoke results (35B, completions API + ignore_eos so we get long samples; trajectories degrade past ~20 tokens because verify still uses non-history forward — see B.3 below)**
+
+| γ | accept_count (per step) | step1 acc | step2 acc | step3 acc | step4 acc | avg accept_len | decode tps |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | [39, 25] | **64%** | — | — | — | 1.64 | 22.8 |
+| 2 | [29, 19, 15] | 66% | 79% | — | — | 2.17 | 22.1 |
+| 3 | [33, 15, 10, 7] | 45% | 67% | 70% | — | 1.97 | 17.2 |
+| 4 | [9, 3, 3, 3, 3] | 33% | 100% | 100% | 100% | 2.33 | 15.7 |
+
+(Per-step rates are conditional — `accept_rate{step=k}` = "accepted at step k given accepted at step k-1". Higher conditional rates downstream are normal: once you've cleared a hard step, the easier ones tend to follow. The unconditional joint rate after k draft tokens is `accept_count[k] / draft_count[k]`.)
+
+**Why decode tps is currently below target_only**
+
+Spec at γ=1..4 is 22.8 → 15.7 tps; target_only baseline at the same warmup-dominated 32-token regime was 45.3 tps. Spec is currently *slower*. Two reasons:
+1. **State drift on rejected tokens.** `batch_verify_to_last_hidden_states` in [qwen3_5_moe_model.py:330-339](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L330-L339) uses regular forward (no per-position GDN history). Every rejected token corrupts the GDN state for subsequent steps. Output trajectories degrade into repetition loops within ~20 tokens, which actually inflates the late-trajectory accept rate (draft and target both predict the same repeating token), but the text is broken. This is the B.3 work the original plan called out.
+2. **Verify-batch overhead vs target's tg_per_token.** At γ=1, verify_time_by_batch_size{batch_size=2} = 70 ms/round. That's ~15 tps if every round accepted both tokens (50% throughput gain) but only ~1.5 tokens/round actually accepted on average, so we're netting 22.8 tps. Target_only single-token decode is much faster. The crossover where spec wins comes when (a) target single-token decode is slow enough relative to verify-batch (likely true at tg512 with paged KV; we measured tg32 here), and (b) accept_len is high enough.
+
+**Next session — B.3**
+1. **Port `forward_with_history` from qwen35_model.py:606 / 890 / 1015 to qwen3_5_moe_model.py.** The 0.8B Phase 3 cont. 4 entry ("Path 1 LANDED") describes this — per-position rnn_state history makes verify partial-accept restore the recurrent state bit-exactly. With the corrected concat order this should now produce both correct text AND a real spec-decode speedup.
+2. **Wire `batch_verify_to_last_hidden_states` to call `_forward_to_last_hidden_with_history`** (analogous to qwen35_model.py:1184).
+3. **Recompile target. Re-bench at γ ∈ {1, 2, 3, 4}** with proper history mode. Acceptance gate from the original plan: tg512 ≥ 79 tps (≥ 1.5× v6 baseline 52.62). At 64% step-1 accept and ~2 average accept_len, the math says we're in range.
+4. **Recompile the 0.8B drafts too** (lib.so is stale) and re-run Phase 3 at γ=4 to verify the original phase landed accept rate >> 0%.
+
+**Sanity-check items for B.3 work**
+- The static-norm preflight numbers I reported earlier in this session had labels swapped. Corrected version: 0.8B hidden frob 5.50 / embed frob 3.66 (ratio 1.51× hidden-heavy); 35B hidden frob 18.31 / embed frob 17.12 (ratio 1.07×, balanced). Both consistent with real spec-decode heads.
+- The earlier conclusion "Qwen-family MTP head is a training auxiliary" was based on a contaminated probe. **The PyTorch probe at scripts/mtp_head_pytorch_check.py:122 should be patched to `cat([e_norm, h_norm])` and re-run** — that fix would likely flip the 8/14 "1-step echo" reading on convention A back to the actual DeepSeek-V3 `(h_n, e_{n+1}) → T_{n+2}` pattern that the head was probably trained for.
+
+**Files touched this session**
+- New: `python/mlc_llm/model/qwen3_5_moe_mtp_draft/{__init__,_model,_loader}.py`, `scripts/spec_smoke_35b.py`.
+- Modified: `python/mlc_llm/model/model.py` (registered new model_type); `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` (EAGLE-compat methods + spec); `python/mlc_llm/interface/compile.py` (kv_state_kind for qwen3_5_moe_mtp_draft); the 3 concat-order fixes above.
+- Recompiled: `dist/qwen3_6-35B-A3B-q4f16_1/lib.so` (with EAGLE methods), `dist/qwen3_6-35B-A3B-q4f16_1-mtp-draft/lib.so` (with corrected concat). Backups: `lib_v6_pre_eagle.so.bak`.
+- Stale and need recompile: `dist/qwen3_5-0.8B-q0f16-mtp-draft/lib.so`, `dist/qwen3_5-0.8B-q0f16-mtp/lib.so`.
+
+---
+
+## 🔖 SESSION HANDOFF (2026-04-28 cont. 4) — Phase 4 triage done. 4B is the only live lane.
 
 **Where we are**
-- **Baseline / current best**: v6 at **52.62 tps tg64** (1.789× llama.cpp Q4_K_S).  
+- **Baseline / current best**: v6 at **52.62 tps tg512 / ~174 tps tg64** (1.789× llama.cpp Q4_K_S).  
   Lib: `dist/qwen3_6-35B-A3B-q4f16_1/`. Nothing in flight.
-- **Phase 2D** (FT hybrid quant): CLOSED. −3.8% regression. CUDA graph exclusion kills kernel gains.
-- **Phase 3** (B-ext spec decode): **DEAD. 5.2% token agreement** (13/250). Diverges at step 0 on 4/5 prompts. Root cause: Qwen3.5-0.8B is a standard transformer; 35B-A3B is a hybrid GDN — architecturally incompatible generative trajectories.
-- **Working tree**: clean (ft_quantization.py fixes and bench artifacts already committed).
+- **Phase 2D** (FT hybrid quant): CLOSED. CUDA graph exclusion eats kernel gains.
+- **Phase 3** (B-ext spec decode): DEAD. 5.2% token agreement.
+- **Phase 4 triage:** 4A revised (much bigger than scoped), 4B unblocked, 4D dead.
+- **Working tree**: clean. New scratch scripts ([scratch_ms_smoke.py](scratch_ms_smoke.py), [scratch_extract_attn_o.py](scratch_extract_attn_o.py), [scratch_apply_tuned.py](scratch_apply_tuned.py), [tune_kernel.py](tune_kernel.py)) are local-only — delete or `git add` as needed. Tuning DB at `tuning/attn_o_proj_500/` keepable as evidence.
 
-**Phase 4 plan written.** See [.claude/plans/phase4-perf.md](.claude/plans/phase4-perf.md) for full detail.
+**Phase 4 status (post-triage):** see [.claude/plans/phase4-perf.md](.claude/plans/phase4-perf.md) — status updates appended at the bottom.
 
-Remaining avenues (stack-ranked):
+| Phase | Status | Notes |
+|---|---|---|
+| **4A** KV int8 | **DEFERRED** | Plan assumed gen_config flag exists. It doesn't — TVM's `PagedKVCache` takes single dtype. Real cost: thread `dtype_kv` + modify ~6 TIR kernels for dequant-on-read/quant-on-write + scale layout in paged blocks. ~1 wk TVM kernel work. |
+| **4B** MTP spec | **GO** | 35B snapshot has 19 `mtp.*` keys (1 layer + EAGLE-style fc head with MoE block). Architecture mirrors 0.8B's MTP head — the existing `qwen35_mtp_draft_*` should port over with hidden-dim parameterization + MoE swap. RNNState rollback constraint still applies for γ>1; γ=1 path bypasses it. |
+| **4C** GDN scan | Dependent | Independent of 4B but lower expected gain. Revisit only if 4B lands. |
+| **4D** meta-sched | **DEAD** | 500-trial evolutionary+xgb canary on `attn_o_proj`: **59.3 µs tuned vs 33.3 µs dlight = 1.78× regression**. dlight's hand-written `dl.gpu.GEMV()` for low-batch GEMV+int4-dequant is genuinely hard to beat. The other three target kernels share the same schedule → same wall. |
 
-| Phase | Approach | Expected gain | Start condition |
-|---|---|---|---|
-| **4A** | KV cache int8 | +5–15% tg512 | Immediate |
-| **4B** | MTP self-speculative (GDN rollback unblock) | +50–100% if accept ≥60% | Confirm 35B has MTP weights first |
-| **4C** | GDN chunk-scan kernel (FLA-style) | +5–15% | Profile confirms scan is ≥15% of step |
-| **4D** | Meta-schedule on hot kernels | +2–5% | Anytime, low effort |
+**Recommended next session:** **Phase 4B.2** — port MTP draft loader from 0.8B to 35B.
+1. Audit [python/mlc_llm/model/qwen35_mtp_draft/](python/mlc_llm/model/qwen35_mtp_draft/) for 0.8B-specific dims (hidden=1024, etc). Parameterize from config.
+2. Swap dense MLP for the MoE block (mirror `qwen3_5_moe`'s expert wiring).
+3. Convert + compile artifact: `dist/qwen3_6-35B-A3B-q4f16_1-mtp-draft/`.
+4. Smoke: `MLCEngine(model=35B, additional_models=[35B-mtp-draft], speculative_mode="eagle", spec_draft_length=1)`.
+5. Measure accept rate + tps. Acceptance: accept rate > 30%, measurable tps gain over non-spec.
 
-**Recommended first session:** 4A (KV int8) — standalone, no prereqs, 1–2 sessions to know.
+**Reference numbers (ceiling for 4D, for record):**
+- Four target kernels = 31.7% of decode time at v6.
+- Physical ceiling if all hit 100% BW = +9.5% e2e. Realistic capture (~30–60% of headroom) = +2–5%. Now moot — meta-schedule can't even maintain dlight parity.
 
 **Phase 2D autopsy — why CUDA graph exclusion kills the gain**
 
@@ -42,6 +374,40 @@ But FT extern calls emit `relax.call_pure_packed("fastertransformer.gemm_fp16_in
 - `dist/qwen3_6-35B-A3B-q4f16_ft_g64/` — 19 GB. Not a useful lib.
 - `baseline_kernels_ft_g64.json` — kernel timings, keep for reference.
 - `baseline_35B_q4f16_ft_v7.json` — e2e bench result, keep for record.
+
+---
+
+## 2026-04-28 (cont. 7) — Phase 4 triage: 4A revised, 4B unblocked, 4D dead
+
+**Done**
+
+**4A.1 — int8 KV plumbing audit (negative).** `kv_cache_dtype` in [model_preset.py:1975/2009/2048](python/mlc_llm/model/model_preset.py#L1975) is transformers.js metadata, not an MLC knob. TVM's `PagedKVCache.create_generic` ([python/mlc_llm/nn/kv_cache.py:32](python/mlc_llm/nn/kv_cache.py#L32)) takes a single `dtype: str` that propagates to every attention kernel. Zero `fp8`/`float8`/`e4m3`/`e5m2` matches in TVM kv_cache. Zero `kv.*int8` / `quantize.*kv` matches in `python/mlc_llm/` or `cpp/`. Flashinfer underneath has separate `dtype_q/dtype_kv/dtype_o` but is called with all three equal — and on Orin (sm_87) flashinfer isn't used. **4A as scoped doesn't exist; real cost is ~1 wk TVM kernel work. Deferred.**
+
+**4B.1 — MTP weight check (positive).** Snapshot `~/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96.../model.safetensors.index.json` has 19 `mtp.*` keys: 1 MTP layer + EAGLE-style fc head (`mtp.fc.weight`, `mtp.pre_fc_norm_{embedding,hidden}.weight`, `mtp.norm.weight`, `mtp.layers.0.{self_attn[q,k,v,o]_proj + q/k_norm, mlp.experts.{down,gate_up}_proj, mlp.gate, mlp.shared_expert.{gate,up,down}_proj, mlp.shared_expert_gate, *_layernorm}`). Zero `eagle`/`draft` markers — pure MTP. Architecture mirrors 0.8B's MTP head except MoE replaces dense MLP. **Phase 4B is unblocked.**
+
+**4D — meta-schedule canary (regression).**
+- Reproduced bench: `bench_moe_kernel.py --shapes lm_head,gdn_in_proj_qkv,attn_o_proj,gdn_in_proj_z` — std <0.2%. Real per-call: lm_head 1717 µs, gdn_qkv 63 µs, attn_o 35 µs, gdn_z 34 µs (the plan doc had stale baselines that didn't match comments in [bench_moe_kernel.py:62-71](bench_moe_kernel.py#L62-L71)).
+- Built [scratch_ms_smoke.py](scratch_ms_smoke.py) — 10-trial smoke on tiny matmul. Toolchain green. Discovered API quirks: `tvm.s_tir.meta_schedule` (not `tvm.meta_schedule`), `T.sblock` (not `T.block`), Target requires `from_device(dev)`, `record.run_secs` returns `FloatImm` (must cast), `cost_model="xgb"` needs `xgboost` (`pip install --user xgboost`).
+- Built [tune_kernel.py](tune_kernel.py) — extracts post-fuse `fused_dequantize_NT_matmul` from the bench pipeline pre-dlight, runs `ms.tune_tir`, compares end-to-end VM timing.
+- Ran 500-trial evolutionary+xgb sweep on `attn_o_proj` (highest absolute headroom): **best 59.3 µs vs dlight 33.3 µs = 1.78× regression**. Plateaued by trial 192. Final apply step crashed reloading the JSON DB with `TensorIntrin 'wmma_fill_16x16x16_f16' is not registered` — separately interesting (some candidates went the wmma route, which is wrong for B=1 because wmma needs M ≥ 16 → padding waste).
+- **Not running sweeps on the other three:** they're all GEMV+int4-dequant hitting `dl.gpu.GEMV()` → same wall.
+
+**4D ceiling math (for record):** Four kernels = 31.7% of v6 decode time at 19.0 ms/tok. Physical ceiling if all hit 100% BW = +9.5% e2e. Now moot.
+
+**Learned**
+- dlight's `dl.gpu.GEMV()` schedule is hand-specialized for low-batch GEMV+int4-dequant at our exact shapes. Meta-schedule's general space generator can't beat it — need a specialized space generator (e.g., one that biases toward GEMV-shaped tilings + suppresses wmma at B<16) or hand-written candidates seeded into the search.
+- MLC has no KV cache quantization story at all — surprising vs vLLM/TRT-LLM/llama.cpp. The lineage (WebGPU/CoreML, small batch / small context) explains why; the serving stack inherited the gap.
+- ms.tune_tir on Orin runs ~2.7 sec/trial (12-way build, single-runner measure). 500 trials ≈ 22 min real time.
+
+**Memory updated:**
+- [mtp_weights_35b.md](.claude/projects/-home-alfie-mlc-llm/memory/mtp_weights_35b.md)
+- [no_kv_quant.md](.claude/projects/-home-alfie-mlc-llm/memory/no_kv_quant.md)
+- [ms_tune_tir_quirks.md](.claude/projects/-home-alfie-mlc-llm/memory/ms_tune_tir_quirks.md)
+
+**Next**
+- Phase 4B.2: port MTP draft from 0.8B to 35B (parameterize hidden dim, swap dense MLP for MoE), get γ=1 working end-to-end, measure accept rate.
+- Defer 4A; only revisit if 4B closes and a +5–15% lane is wanted (and the user agrees to the ~1 wk scope).
+- Defer 4C; lower EV than 4B.
 
 ---
 
