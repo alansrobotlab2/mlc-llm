@@ -50,7 +50,9 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:  # noqa: UP00
     assert isinstance(args[16], (relax.Constant, relax.PrimValue))
     assert isinstance(args[17], relax.DataTypeImm)
     if len(args) == 19:
-        assert isinstance(args[18], relax.DataTypeImm)
+        # Phase 7: dtype_kv is a StringImm (was DataTypeImm in Phase 6) so that
+        # the "mxfp4" sentinel — which is not a real DLDataType — can pass through.
+        assert isinstance(args[18], (relax.StringImm, relax.DataTypeImm))
 
     return {
         "attn_kind": attn_kind,

@@ -6,6 +6,77 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-29 — **Phase 7 (mxfp4 KV cache) shipped end-to-end but a wall-clock LOSS on Orin: −12% to −51% across pp 128 → 8192. LUT-chain dequant cost dominates the BW saving. Same failure mode as Phase 5 fp8, worse magnitude. Functional and round-trip-correct; opt-in only.**
+
+User asked to dig into Phase 7 (plan: [.claude/plans/phase7-mxfp4-kv-cache.md](.claude/plans/phase7-mxfp4-kv-cache.md)) and rescoped to "regressions up to 8K context" after seeing that the existing fp16 baseline already covers the model's full 256K context window. Delivered all kernels + alloc + lib in one session; bench shows the throughput regression cleanly tracks KV-read volume.
+
+### What landed
+
+- **TIR kernels** — mxfp4 paths gated on `dtype_kv == "mxfp4"` (Phase 6 pattern, sibling to `use_int8_kv`). Pages stored as packed-u4 in int8 (last dim `head_dim/2`); scales fp32 per-block-32 (5D scales tensor with extra trailing axis `head_dim/32`).
+  - [_page_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_page_kernels.py) — `_kv_cache_transpose_append` (per-block max-abs + E2M1 quant + nibble pack), `_kv_cache_debug_get_kv` (nibble unpack + LUT + per-block scale), plus `_copy_single_page` and `_compact_kv_copy` with adjusted shape bounds.
+  - [_decode_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_decode_kernels.py) — `_attention_decode` K/V load: serial sub-loop pre-computes dequant into a per-thread local register buffer, then vectorized loop writes to smem (vectorized loops can't introduce typed let-bindings — see lessons).
+  - [_prefill_kernels.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/_prefill_kernels.py) — `_attention_prefill` K/V load uses a Python helper `_mxfp4_dequant_expr(...)` that returns a single TIR expression (helper-locals are inlined at construct time, so no spurious let-bindings).
+  - [tree_attn.py](3rdparty/tvm/python/tvm/relax/frontend/nn/llm/tree_attn.py) — `tree_attn_with_paged_kv_cache` shares the same helper.
+- **C++ runtime** ([paged_kv_cache.cc](3rdparty/tvm/src/runtime/vm/paged_kv_cache.cc)) — added `bool is_mxfp4_kv_` member; entry-point intercept detects `"mxfp4"` sentinel string and sets the flag without remapping `page_dtype` globally (critical: LinearAttn/GDN layers MUST keep `init->dtype` for state storage; only MHA layers get int8 packed-u4 + 5D fp32 scales). Per-layer alloc branches on `is_mxfp4_kv_ && (kMHA || kMHASliding)`.
+- **Plumbing** ([kv_cache.py](python/mlc_llm/nn/kv_cache.py), [dispatch_kv_cache_creation.py](python/mlc_llm/compiler_pass/dispatch_kv_cache_creation.py)) — `dtype_kv` now passed as `rx.StringImm` (was `DataTypeImm` in Phase 6); `"mxfp4"` is not a real DLDataType so the StringImm dodges `StringToDLDataType`'s "unknown dtype" error. Dispatch assertion accepts either StringImm or DataTypeImm for back-compat.
+- **fp4 LUT spike** ([scratch_phase7_lut_spike.py](scratch_phase7_lut_spike.py)) — verified the E2M1 grid (`[0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0]`), per-block-32 max-abs reduction, and nibble pack/unpack all compose cleanly in TIR. Bit-perfect vs numpy reference.
+- **Round-trip test** ([scratch_phase7_round_trip.py](scratch_phase7_round_trip.py)) — append + debug_get_kv on toy shapes (ntoken=8, kv_heads=2, head_dim=256, page_size=16). Scales: 0.0 max abs err vs py-ref; packed bytes: exact match; dequant: 0.0 max abs err vs py-ref; quant noise vs original fp16 ≤ `0.5 * max_block_scale` (E2M1 bound). **PASS.**
+- **Smoke test** — engine loads (377s first time, ~30s once kernels are JIT-cached), generates coherent text (`'Thinking Process:\n\n1.  **Analyze the Request:** The user'` for "The capital of France is").
+
+### Numbers — 35B-A3B on Orin AGX, sm_87, mxfp4 KV vs Phase 6 fp16-TIR baseline
+
+| pp / tg | fp16-TIR (tps) | mxfp4 (tps) | delta |
+|---:|---:|---:|---:|
+| 128 / 256 | 51.24 | 45.23 | **−11.7 %** |
+| 512 / 256 | 46.34 | 36.76 | **−20.7 %** |
+| 4 096 / 256 | 24.45 | 13.33 | **−45.5 %** |
+| 8 192 / 256 | 15.88 | 7.72  | **−51.4 %** |
+
+The drop tracks KV-read volume: at long context, every decode step reads the full KV through the dequant LUT. The 16-entry E2M1 LUT (7-deep `T.if_then_else` chain on magnitude + sign decode + per-block scale multiply) is **per element** — multiplied across head_dim=256, 2 KV heads, 2 (K+V), 10 MHA layers, all KV tokens read per decode step. Several thousand if-then-else evaluations per decode token.
+
+**Greedy parity (5 prompts × 50 tokens, fp16-TIR vs mxfp4)**: **0/5 EXACT** (gate was ≥2/5; below the bar). Earliest divergence at char 0 on prompt [2] ("def fibonacci(n):"); other prompts diverge at chars 15, 25, 76, 120. Worse: prompt [3] ("Once upon a time in a small village,") produced cmp output starting `'The user wants a Python function to calculate the nth Fibonacci number...'` — semantically wrong, suggesting the 4-bit K/V noise is severe enough that attention can no longer reliably attend to the right tokens across prompts. Compare Phase 6 int8 at 2/5 EXACT with 100-155 char common prefix — the int8 outputs were coherent and on-topic; mxfp4 outputs are sometimes off-topic.
+
+### Why mxfp4 loses on sm_87
+
+Different mechanism than Phase 5 fp8 (where `<cuda_fp8.h>` software conversion was the killer), but identical shape on the bench. fp4 storage is fine — `(byte >> 4) & 0xF` is one cycle. The cost is the **value lookup**: nibble (4 bits) → fp32 magnitude is an inherently irregular table (`[0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]` — gaps at 2.5, 3.5, 4.5, 5.0). On native fp4 hardware (Blackwell sm_120+ MX MMA), this is a single-instruction conversion. On sm_87, it's a chain of compares.
+
+The plan's optimistic prediction ("3-5 cycles per element on sm_87, vs fp8's 5-8 in a software lookup") was wrong. The actual cost is closer to fp8's: each element pays 7 compares + branch tree for magnitude, 1 compare for sign, 2 multiplies for sign+scale. ~10-12 cycles per element on sm_87.
+
+This is **structural for sm_87**. Phase 6 int8 is throughput-neutral because `cvt.rn.f16.s8` is a single hardware SASS instruction (existed since Pascal). For mxfp4, the equivalent hardware path is sm_120+ only.
+
+### Decision
+
+**Close Phase 7 on Orin.** Land the plumbing as opt-in (the .so at [dist/qwen3_6-35B-A3B-q4f16_1_kvmxfp4/lib.so](dist/qwen3_6-35B-A3B-q4f16_1_kvmxfp4/lib.so) is preserved as a reference). Don't enable mxfp4 KV by default for Qwen3.5/3.6 on Orin.
+
+The dtype-split refactor + StringImm plumbing + per-layer mxfp4 alloc are regression-clean and reusable for any future port to sm_89+ hardware. The function_table.cc fix from Phase 6 (RNN-state setup hoisted out of the FlashInfer branch) is what makes hybrid+mxfp4 boot at all; that fix earns its keep again.
+
+Capacity is by construction ~3.2× int8's bytes-per-token (160 B vs 512 B per token-K-or-V-head at head_dim=256 fp16; mxfp4 = 128 B packed + 32 B scales = 160 B). On Orin in interactive mode the fp16 baseline already covers the full 256K context window, so single-sequence capacity is moot. The win-on-paper for server-mode batching (1.3M total seqlen baseline → ~5M with mxfp4) wasn't measured.
+
+### Files
+
+- New: [scratch_phase7_lut_spike.py](scratch_phase7_lut_spike.py), [scratch_phase7_round_trip.py](scratch_phase7_round_trip.py), [scratch_phase7_parity.py](scratch_phase7_parity.py).
+- Modified TVM (vendored fork): 4 TIR kernel files + paged_kv_cache.cc, ~410 LoC across 5 files.
+- Modified MLC: [python/mlc_llm/nn/kv_cache.py](python/mlc_llm/nn/kv_cache.py) (StringImm), [python/mlc_llm/compiler_pass/dispatch_kv_cache_creation.py](python/mlc_llm/compiler_pass/dispatch_kv_cache_creation.py) (loosen assertion).
+- Saved libs: [dist/qwen3_6-35B-A3B-q4f16_1_kvmxfp4/lib.so](dist/qwen3_6-35B-A3B-q4f16_1_kvmxfp4/lib.so) (196 MB).
+
+### Lessons
+
+- **TIR vectorized loops can't introduce typed let-bindings.** Inside `for vec in T.vectorized(VEC_SIZE):`, intermediate `byte_k: T.int32 = ...` assignments leak as undefined free vars (caught by `MakePackedAPI`'s "variables [...] are used, but are not passed in as API arguments"). Two workarounds work: (a) pre-compute into a per-thread local register buffer in a serial sub-loop, then vectorized-write to smem (used in decode), or (b) Python helper that returns a single composed TIR expression (used in prefill / tree_attn). Don't use `if/else` for the same — the parser interprets it as TIR if.
+- **Python `if/else` inside `@T.prim_func` is parsed as TIR if-statement, not Python-time branching.** Variables defined in only one branch are scoped to that branch and unavailable after. Workaround: use Python ternary (`(...) if cond else (...)`) for shape literals, or define separate `@T.prim_func` bodies (the int8/fp16 transpose_append pattern from Phase 6).
+- **`is_mxfp4_kv` MUST be scoped per-layer, not a global page-dtype remap.** The first version of the C++ alloc set `page_dtype = DataType::Int(8)` at the entry point intercept, which corrupted the LinearAttn/GDN layer alloc (those layers store recurrent state in fp16, not packed-u4). Engine deadlocked at first prefill — all 26 threads in `futex_wait_queue_me` with no CPU activity for 6+ minutes — because writes to a wrong-typed page tensor stalled the GPU silently. Fix: leave `page_dtype = init->dtype`, branch per-layer in the alloc loop on `is_mxfp4_kv_ && (kMHA || kMHASliding)`.
+- **Engine first-load is slow (~6 min) for the mxfp4 lib.** First-pass JIT compile of the LUT chains in 5 kernels through PTX/cubin. Subsequent loads are normal (~30s, JIT cache warm). Worth flagging if anyone tries this lib for the first time and thinks it's hung.
+- **The `"mxfp4"` sentinel approach (StringImm, not DataTypeImm) is the right pattern for non-IEEE storage formats.** TVM's `StringToDLDataType` is gatekept on canonical names — adding `"mxfp4"` to the dtype enum would touch many files. Sending it as a string and intercepting at the runtime constructor + kernel factories is much smaller blast radius.
+
+### Follow-up checks (post-handoff)
+
+If anyone wants to revive mxfp4 on Orin, the LUT chain is the only knob worth tuning:
+1. **Larger block (64 or 128) instead of 32** — reduces scale-tensor BW slightly but doesn't change the per-element LUT cost. Marginal.
+2. **E8M0 scale instead of fp32** — saves 4× on scale tensor. Doesn't help unpack cost.
+3. **Hand-written LUT via `__byte_perm` or polynomial approximation** — could plausibly cut the 7-compare chain to 2-3 cycles. Worth ~2-3× speedup IF the rest of the math doesn't dominate. Speculative.
+4. **Wait for sm_89+ hardware.** The clean win lives there.
+
+---
+
 ## 2026-04-29 — **Phase 6 (int8 KV cache) shipped end-to-end. Throughput-neutral on Orin (within ±2% at tg512/tg8192). Parity 2/5 EXACT — semantic drift only, not catastrophic.**
 
 User asked to dig into Phase 6 (plan: [.claude/plans/phase6-int8-kv-cache.md](.claude/plans/phase6-int8-kv-cache.md)). Delivered all five stages in one batched implementation pass. The key result: int8 KV with per-token symmetric quant on sm_87 is **throughput-neutral**, validating the plan's prediction (`cvt.rn.f16.s8` is a single hardware SASS instruction since Pascal, so the dequant cost that killed Phase 5 fp8 simply doesn't exist for int8).

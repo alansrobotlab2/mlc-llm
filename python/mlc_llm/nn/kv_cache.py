@@ -88,7 +88,11 @@ class PagedKVCache(TVMPagedKVCache):
                 rx.PrimValue(rotary_dim),
                 rx.PrimValue(int(enable_disaggregation)),
                 rx.DataTypeImm(dtype),
-                rx.DataTypeImm(dtype_kv if dtype_kv is not None else dtype),
+                # Phase 7: dtype_kv is a free string ("int8", "mxfp4", "float8_e4m3fn", or
+                # the qkv dtype). "mxfp4" is not a real DLDataType — we send it as a
+                # StringImm so the downstream dispatch / runtime constructor can
+                # recognize the storage format.
+                rx.StringImm(dtype_kv if dtype_kv is not None else dtype),
                 sinfo_args=rx.ObjectStructInfo(),
             ),
             _name=name,
