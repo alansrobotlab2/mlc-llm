@@ -51,6 +51,17 @@ class PrefixCacheMatchedResult {
    * \brief The number of tailing tokens to be popped from the reused sequence.
    */
   size_t reused_seq_pop_last_tokens = 0;
+  /*!
+   * \brief The parent sequence's length at the moment of fork. Only valid when
+   * forked_seq_id != -1; zero otherwise. Hybrid models need this to roll the
+   * child's GDN recurrent state back from the parent's current position
+   * (`forked_parent_seq_length`) to the matched-prefix boundary
+   * (`prefilled_offset`) via PopNFromRNNStateOnly. The PagedKVCache fork honors
+   * `fork_pos` directly and does not need this; the rnn_state's ForkSequence
+   * copies the parent's full history slab unchanged, so the engine has to
+   * adjust the child Sequence struct itself.
+   */
+  size_t forked_parent_seq_length = 0;
 };
 
 class PrefixCacheObj : public Object {

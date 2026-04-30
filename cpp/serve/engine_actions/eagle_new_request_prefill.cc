@@ -157,8 +157,14 @@ class EagleNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
                                                  /*batch_size*/ 1, /*seq_len*/ cum_prefill_length);
         }
         // hidden_states: (b * s, h)
+        // See new_request_prefill.cc for the cache_prefill rationale: drive the
+        // prefill through the per-position-history forward when the radix
+        // prefix cache is active and the lib supports it. No-op for pure-attn
+        // models (draft head) and disabled when prefix-caching is off.
+        bool cache_prefill = estate->prefix_cache->Mode() != PrefixCacheMode::kDisable &&
+                             models_[model_id]->IsCachePrefillSupported();
         ObjectRef hidden_states = models_[model_id]->BatchPrefillToLastHidden(
-            embedding_or_hidden_states, request_internal_ids, prefill_lengths);
+            embedding_or_hidden_states, request_internal_ids, prefill_lengths, cache_prefill);
         RECORD_EVENT(trace_recorder_, request_ids, "finish prefill");
 
         if (model_id == 0) {
@@ -445,6 +451,18 @@ class EagleNewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
           for (int i = 0; i < models_.size(); ++i) {
             models_[i]->ForkSequence(result.forked_seq_id, rsentry->mstates[0]->internal_id,
                                      result.prefilled_offset - 1);
+            // EAGLE forks at (prefilled_offset - 1) per the shift-by-1 trick documented
+            // above. For hybrid models the rnn_state's ForkSequence ignores fork_pos, so
+            // bring the child to the same boundary by popping
+            // (parent_seq_length - (prefilled_offset - 1)) history slots. See
+            // new_request_prefill.cc for the broader rationale.
+            if (models_[i]->IsCachePrefillSupported() &&
+                result.forked_parent_seq_length + 1 > result.prefilled_offset) {
+              size_t pop_n =
+                  result.forked_parent_seq_length - (result.prefilled_offset - 1);
+              models_[i]->PopNFromRNNStateOnly(rsentry->mstates[0]->internal_id,
+                                               static_cast<int>(pop_n));
+            }
             // Enable sliding window for the sequence if it is not a parent.
             if (rsentry->child_indices.empty()) {
               models_[i]->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);

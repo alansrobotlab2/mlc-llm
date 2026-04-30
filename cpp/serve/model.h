@@ -148,10 +148,18 @@ class ModelObj : public Object {
    * \param embeddings The embedding of the input to be prefilled.
    * \param seq_id The id of the sequence in the KV cache.
    * \param lengths The length of each sequence to prefill.
+   * \param cache_prefill If true, drive the prefill through the history-bearing
+   *   forward (`batch_prefill_with_history`) so per-position GDN state is
+   *   scattered into RNNState history slots. The radix prefix cache can then
+   *   roll the recurrent state back to any intermediate position via PopN on
+   *   a later cache hit. Requires the model lib to expose the
+   *   `..._with_history` variant; falls back to the standard prefill (with a
+   *   warning) if not. No-op for non-hybrid models. The flag must be matched
+   *   by `IsCachePrefillSupported()` to avoid silent fallback in production.
    * \return The logits for the next token.
    */
   virtual Tensor BatchPrefill(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
-                              const std::vector<int>& lengths) = 0;
+                              const std::vector<int>& lengths, bool cache_prefill = false) = 0;
 
   /*!
    * \brief Batch prefill function. Input hidden_states are computed from
@@ -159,11 +167,23 @@ class ModelObj : public Object {
    * \param hidden_states The hidden_states of the input to be prefilled.
    * \param seq_id The id of the sequence in the KV cache.
    * \param lengths The length of each sequence to prefill.
+   * \param cache_prefill See BatchPrefill above; same semantics for the
+   *   to-last-hidden path used by spec decoding's draft prefill.
    * \return The hidden_states for the next token.
    */
   virtual ObjectRef BatchPrefillToLastHidden(const ObjectRef& hidden_states,
                                              const std::vector<int64_t>& seq_ids,
-                                             const std::vector<int>& lengths) = 0;
+                                             const std::vector<int>& lengths,
+                                             bool cache_prefill = false) = 0;
+
+  /*!
+   * \brief Whether this model supports the prefix-cacheable prefill path.
+   * True only on hybrid GDN models whose lib was compiled with the
+   * `batch_prefill_with_history` and `batch_prefill_to_last_hidden_states_with_history`
+   * functions exposed. Pure-attention models report false (the radix prefix
+   * cache there has always worked and doesn't need this path).
+   */
+  virtual bool IsCachePrefillSupported() const = 0;
 
   /*!
    * \brief Batch decode function. Embedding in, logits out.

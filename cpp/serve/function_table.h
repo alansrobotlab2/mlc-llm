@@ -95,6 +95,15 @@ struct FunctionTable {
   Function decode_func_;
   Function extend_func_;
   Function verify_func_;
+  // Prefix-cacheable prefill variants for hybrid GDN models. They drive the
+  // GDN forward through `forward_with_history`, scattering per-position
+  // recurrent state into RNNState history slots so the radix prefix cache
+  // can roll the state back to any intermediate position via PopN. Null on
+  // models / libs that don't expose them; engine falls back to the standard
+  // `prefill_func_` / `prefill_to_last_hidden_func_` and disables hybrid
+  // prefix caching for that model.
+  Function prefill_with_history_func_;
+  Function prefill_to_last_hidden_with_history_func_;
   Function single_batch_prefill_to_last_hidden_func_;
   Function single_batch_decode_to_last_hidden_func_;
   Function prefill_to_last_hidden_func_;

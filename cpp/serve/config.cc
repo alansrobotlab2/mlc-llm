@@ -656,21 +656,41 @@ Result<MemUsageEstimationResult> EstimateMemoryUsageOnMode(
     const std::vector<tvm::ffi::json::Object>& model_configs,  //
     const std::vector<ModelMetadata>& model_metadata,          //
     ModelConfigLimits model_config_limits,                     //
-    InferrableEngineConfig init_config, bool verbose) {
+    InferrableEngineConfig init_config, bool verbose,
+    SpeculativeMode speculative_mode, int spec_draft_length) {
   std::ostringstream os;
   InferrableEngineConfig inferred_config = init_config;
+  // Speculative decoding admits a request only when batch_prefill_base.cc::CanPrefill
+  // sees `(running + new) * (γ + 1) <= min(max_num_sequence, prefill_chunk_size)`.
+  // With γ = spec_draft_length, the smallest workable batch slot is `γ + 1`. If we
+  // default max_num_sequence to 1 (interactive) and the user has spec on, the
+  // engine silently rejects every prefill and the request never starts —
+  // observed as a deadlock at first request, all threads in futex_wait. Bump
+  // the auto-config default so this combo just works.
+  int64_t spec_min_batch = (speculative_mode != SpeculativeMode::kDisable)
+                               ? static_cast<int64_t>(spec_draft_length + 1)
+                               : 1;
   // - 1. max_num_sequence
   if (!init_config.max_num_sequence.has_value()) {
     if (mode == EngineMode::kLocal) {
       inferred_config.max_num_sequence =
           std::min(static_cast<int64_t>(4), model_config_limits.model_max_batch_size);
     } else if (mode == EngineMode::kInteractive) {
-      inferred_config.max_num_sequence = 1;
+      inferred_config.max_num_sequence = std::max<int64_t>(1, spec_min_batch);
     } else {
       inferred_config.max_num_sequence = model_config_limits.model_max_batch_size;
     }
     os << "max batch size will be set to " << inferred_config.max_num_sequence.value() << ", ";
   } else {
+    if (init_config.max_num_sequence.value() < spec_min_batch) {
+      LOG(WARNING) << "Speculative decoding (γ=" << spec_draft_length << ") requires "
+                   << "max_num_sequence >= " << spec_min_batch << " (the engine admits a "
+                   << "prefill only when batch room covers the verify step). User-specified "
+                   << "max_num_sequence=" << init_config.max_num_sequence.value()
+                   << " would deadlock at the first request; auto-bumping to " << spec_min_batch
+                   << ".";
+      inferred_config.max_num_sequence = spec_min_batch;
+    }
     os << "max batch size " << inferred_config.max_num_sequence.value()
        << " is specified by user, ";
   }
@@ -817,9 +837,19 @@ Result<InferrableEngineConfig> InferrableEngineConfig::InferForKVCache(
     EngineMode mode, Device device, double gpu_memory_utilization,
     const std::vector<tvm::ffi::json::Object>& model_configs,
     const std::vector<ModelMetadata>& model_metadata, InferrableEngineConfig init_config,
-    bool verbose) {
-  // - Check if max_history_size is not set.
-  if (init_config.max_history_size.has_value() && init_config.max_history_size.value() != 0) {
+    bool verbose, PrefixCacheMode prefix_cache_mode, int prefix_cache_max_num_recycling_seqs,
+    SpeculativeMode speculative_mode, int spec_draft_length) {
+  // - Check if max_history_size is not set, except for hybrid models where
+  //   the radix prefix cache uses it as the rnn_state PopN budget on cache hit.
+  bool any_hybrid = false;
+  for (const ModelMetadata& metadata : model_metadata) {
+    if (metadata.kv_state_kind == KVStateKind::kHybrid) {
+      any_hybrid = true;
+      break;
+    }
+  }
+  if (init_config.max_history_size.has_value() && init_config.max_history_size.value() != 0 &&
+      !any_hybrid) {
     return Result<InferrableEngineConfig>::Error(
         "KV cache does not support max_history_size, while it is set to " +
         std::to_string(init_config.max_history_size.value()) + " in the input EngineConfig");
@@ -857,13 +887,16 @@ Result<InferrableEngineConfig> InferrableEngineConfig::InferForKVCache(
   // - Infer the engine config and estimate memory usage for each mode.
   Result<MemUsageEstimationResult> local_mode_estimation_result = EstimateMemoryUsageOnMode(
       EngineMode::kLocal, device, gpu_memory_utilization, params_bytes, temp_buffer_bytes,
-      model_configs, model_metadata, model_config_limits, init_config, verbose);
+      model_configs, model_metadata, model_config_limits, init_config, verbose, speculative_mode,
+      spec_draft_length);
   Result<MemUsageEstimationResult> interactive_mode_estimation_result = EstimateMemoryUsageOnMode(
       EngineMode::kInteractive, device, gpu_memory_utilization, params_bytes, temp_buffer_bytes,
-      model_configs, model_metadata, model_config_limits, init_config, verbose);
+      model_configs, model_metadata, model_config_limits, init_config, verbose, speculative_mode,
+      spec_draft_length);
   Result<MemUsageEstimationResult> server_mode_estimation_result = EstimateMemoryUsageOnMode(
       EngineMode::kServer, device, gpu_memory_utilization, params_bytes, temp_buffer_bytes,
-      model_configs, model_metadata, model_config_limits, init_config, verbose);
+      model_configs, model_metadata, model_config_limits, init_config, verbose, speculative_mode,
+      spec_draft_length);
   // - Pick the estimation result according to the mode.
   std::string mode_name;
   Result<MemUsageEstimationResult> final_estimation_result;
@@ -877,9 +910,70 @@ Result<InferrableEngineConfig> InferrableEngineConfig::InferForKVCache(
   if (final_estimation_result.IsErr()) {
     return Result<InferrableEngineConfig>::Error(final_estimation_result.UnwrapErr());
   }
-  // - Print log message.
+  // - Pick the inferred config + memory estimate before logging so we can
+  //   fold in the hybrid-rnn_state allocation that Phase 8 added.
   MemUsageEstimationResult final_estimation = final_estimation_result.Unwrap();
   InferrableEngineConfig inferred_config = std::move(final_estimation.inferred_config);
+
+  // Hybrid models (attention + GDN linear) need a non-trivial max_history_size
+  // when the radix prefix cache is active so it can roll the recurrent state
+  // back to a matched-prefix boundary via PopN. With prefix-cache disabled we
+  // keep the original behavior (max_history_size=0 → clamped to 1 downstream),
+  // which matches every steady-state bench number recorded in worklog.md.
+  //
+  // Phase 8 stage 2 default when prefix-cache is on: 64 history slots if not
+  // explicitly set. Memory cost is
+  //   (max_num_seq + recycling_seqs) × max_history × sum_of_state_sizes_per_layer.
+  // 0.8B (18 GDN layers × 1 MiB / slot, num_seq ≈ 2) ≈ 2.3 GiB at 64 slots.
+  // 35B  (30 GDN layers × 2 MiB / slot, num_seq ≈ 2) ≈ 7.5 GiB at 64 slots.
+  // Both fit on a 64 GiB Orin alongside the model weights and KV cache. Users
+  // with longer shared prefixes pass `EngineConfig(max_history_size=N)`.
+  if (any_hybrid && prefix_cache_mode != PrefixCacheMode::kDisable) {
+    inferred_config.max_history_size = init_config.max_history_size.value_or(64);
+  } else {
+    inferred_config.max_history_size = init_config.max_history_size.value_or(0);
+  }
+
+  // - Compute rnn_state buffer for hybrid models. Mirrors the runtime
+  //   allocation in cpp/serve/model.cc::CreateKVCache (kHybrid branch):
+  //     batch slots = max_num_sequence + prefix_cache_max_num_recycling_seqs
+  //     history     = max(max_history_size, 1)              (clamp at runtime)
+  //                   bumped to max(_, spec_draft_length + 2) under spec mode
+  //     per-layer   = recurrent (n_vh*K*V, fp32) + conv ((conv_k-1)*qkv_dim, fp16)
+  //   Skip non-hybrid models — they have no rnn_state.
+  double rnn_state_bytes = 0;
+  int64_t effective_max_history =
+      std::max<int64_t>(inferred_config.max_history_size.value_or(0), 1);
+  if (any_hybrid && speculative_mode != SpeculativeMode::kDisable) {
+    effective_max_history = std::max<int64_t>(effective_max_history, spec_draft_length + 2);
+  }
+  int64_t effective_recycling_seqs = prefix_cache_max_num_recycling_seqs >= 0
+                                         ? prefix_cache_max_num_recycling_seqs
+                                         : inferred_config.max_num_sequence.value();
+  int64_t rnn_batch_slots = inferred_config.max_num_sequence.value() + effective_recycling_seqs;
+  int hybrid_num_models = static_cast<int>(model_configs.size());
+  TVM_FFI_ICHECK_EQ(hybrid_num_models, static_cast<int>(model_metadata.size()));
+  for (int i = 0; i < hybrid_num_models; ++i) {
+    if (model_metadata[i].kv_state_kind != KVStateKind::kHybrid) continue;
+    tvm::ffi::json::Object compile_time_config =
+        json::Lookup<tvm::ffi::json::Object>(model_configs[i], "model_config");
+    int64_t num_hidden = json::Lookup<int64_t>(compile_time_config, "num_hidden_layers");
+    int64_t full_attn_interval =
+        json::Lookup<int64_t>(compile_time_config, "full_attention_interval");
+    int64_t num_attn_layers = num_hidden / full_attn_interval;
+    int64_t num_linear = num_hidden - num_attn_layers;
+    int64_t K = json::Lookup<int64_t>(compile_time_config, "linear_key_head_dim");
+    int64_t V = json::Lookup<int64_t>(compile_time_config, "linear_value_head_dim");
+    int64_t n_kh = json::Lookup<int64_t>(compile_time_config, "linear_num_key_heads");
+    int64_t n_vh = json::Lookup<int64_t>(compile_time_config, "linear_num_value_heads");
+    int64_t conv_kernel = json::Lookup<int64_t>(compile_time_config, "linear_conv_kernel_dim");
+    int64_t qkv_dim = n_kh * K * 2 + n_vh * V;
+    int64_t per_slot_per_layer =
+        n_vh * K * V * 4 + (conv_kernel - 1) * qkv_dim * 2;  // fp32 recurrent + fp16 conv
+    rnn_state_bytes += static_cast<double>(per_slot_per_layer) * num_linear *
+                       rnn_batch_slots * effective_max_history;
+  }
+  final_estimation.total_memory_bytes += rnn_state_bytes;
 
   if (verbose) {
     LOG(INFO) << "The actual engine mode is \"" << EngineModeToString(mode)
@@ -887,16 +981,24 @@ Result<InferrableEngineConfig> InferrableEngineConfig::InferForKVCache(
               << ", max KV cache token capacity is "
               << inferred_config.max_total_sequence_length.value() << ", prefill chunk size is "
               << inferred_config.prefill_chunk_size.value() << ".";
-    LOG(INFO) << "Estimated total single GPU memory usage: "
-              << BytesToMegabytesString(final_estimation.total_memory_bytes)
-              << " MB (Parameters: " << BytesToMegabytesString(params_bytes)
-              << " MB. KVCache: " << BytesToMegabytesString(final_estimation.kv_cache_memory_bytes)
-              << " MB. Temporary buffer: "
-              << BytesToMegabytesString(final_estimation.temp_memory_bytes)
-              << " MB). The actual usage might be slightly larger than the estimated number.";
+    std::ostringstream est_msg;
+    est_msg << "Estimated total single GPU memory usage: "
+            << BytesToMegabytesString(final_estimation.total_memory_bytes)
+            << " MB (Parameters: " << BytesToMegabytesString(params_bytes)
+            << " MB. KVCache: " << BytesToMegabytesString(final_estimation.kv_cache_memory_bytes);
+    if (rnn_state_bytes > 0) {
+      est_msg << " MB. RNN state: " << BytesToMegabytesString(rnn_state_bytes);
+    }
+    est_msg << " MB. Temporary buffer: "
+            << BytesToMegabytesString(final_estimation.temp_memory_bytes)
+            << " MB). The actual usage might be slightly larger than the estimated number.";
+    LOG(INFO) << est_msg.str();
+    if (any_hybrid && prefix_cache_mode != PrefixCacheMode::kDisable) {
+      LOG(INFO) << "Hybrid + prefix_cache: max_history_size = "
+                << inferred_config.max_history_size.value()
+                << " (rnn_state per-position history slots used by Phase 8 cache_prefill).";
+    }
   }
-
-  inferred_config.max_history_size = 0;
   return Result<InferrableEngineConfig>::Ok(inferred_config);
 }
 

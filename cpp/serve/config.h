@@ -343,12 +343,31 @@ struct InferrableEngineConfig {
   std::optional<int64_t> prefill_chunk_size;
   std::optional<int64_t> max_history_size;
 
-  /*! \brief Infer the config for KV cache from a given initial config. */
+  /*!
+   * \brief Infer the config for KV cache from a given initial config.
+   * \param prefix_cache_mode The radix-prefix-cache mode the engine will use.
+   *   For hybrid models this controls whether we provision rnn_state history
+   *   slots: with `kDisable`, max_history_size stays at 0 (matches pre-Phase-8
+   *   behavior); with `kRadix`, the inferrer reserves a budget for cache_prefill
+   *   PopN-on-hit. Default `kDisable` keeps existing pure-attention callers
+   *   binary-compatible.
+   * \param prefix_cache_max_num_recycling_seqs Extra recycling slots for the
+   *   radix prefix cache; -1 means "default to max_num_sequence". For hybrid
+   *   models this contributes to the rnn_state allocation: the runtime sizes
+   *   the rnn_state buffer at `(max_num_sequence + recycling_seqs)` slots.
+   * \param speculative_mode / spec_draft_length For hybrid models the engine
+   *   bumps max_history to `max(max_history, spec_draft_length + 2)` when
+   *   speculative decoding is on (verify writes per-position state). Mirror
+   *   that bump here so the printed memory estimate matches the actual
+   *   allocation under MTP / EAGLE.
+   */
   static Result<InferrableEngineConfig> InferForKVCache(
       EngineMode mode, Device device, double gpu_memory_utilization,
       const std::vector<tvm::ffi::json::Object>& model_configs,
       const std::vector<ModelMetadata>& model_metadata, InferrableEngineConfig init_config,
-      bool verbose);
+      bool verbose, PrefixCacheMode prefix_cache_mode = PrefixCacheMode::kDisable,
+      int prefix_cache_max_num_recycling_seqs = -1,
+      SpeculativeMode speculative_mode = SpeculativeMode::kDisable, int spec_draft_length = 0);
   /*! \brief Infer the config for RNN state from a given initial config. */
   static Result<InferrableEngineConfig> InferForRNNState(
       EngineMode mode, Device device, double gpu_memory_utilization,

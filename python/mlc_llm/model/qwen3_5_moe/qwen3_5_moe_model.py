@@ -343,6 +343,24 @@ class Qwen35MoEForCausalLM(nn.Module):
             hidden_states = op.take(hidden_states, logit_positions, axis=1)
         return self._lm_head(hidden_states), paged_kv_cache, state
 
+    def _forward_with_history(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+        logit_positions: Optional[Tensor] = None,
+    ):
+        """Prefill-with-history forward: scatters per-position GDN state into RNNState
+        history slots so the radix prefix cache can roll the recurrent state back via
+        PopN. Engine must arm `set_use_history_mode(True)` before BeginForward."""
+        op_ext.configure()
+        hidden_states, state = self.model.forward_with_history(
+            input_embed, paged_kv_cache, state
+        )
+        if logit_positions is not None:
+            hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        return self._lm_head(hidden_states), paged_kv_cache, state
+
     def _forward_to_last_hidden(
         self,
         input_embed: Tensor,
@@ -392,6 +410,18 @@ class Qwen35MoEForCausalLM(nn.Module):
         rnn_state: RNNState,
     ):
         return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+
+    def batch_prefill_to_last_hidden_states_with_history(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        # Prefix-cacheable to-last-hidden prefill: per-position GDN state -> history slots.
+        # Engine must arm `set_use_history_mode(True)` before BeginForward.
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
 
     def batch_decode_to_last_hidden_states(
         self,
@@ -471,6 +501,19 @@ class Qwen35MoEForCausalLM(nn.Module):
         rnn_state: RNNState,
     ):
         return self._forward(input_embeds, paged_kv_cache, rnn_state, logit_positions)
+
+    def batch_prefill_with_history(
+        self,
+        input_embeds: Tensor,
+        logit_positions: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        # Prefix-cacheable prefill: emits per-position GDN state into history slots.
+        # Engine must arm `set_use_history_mode(True)` before BeginForward.
+        return self._forward_with_history(
+            input_embeds, paged_kv_cache, rnn_state, logit_positions
+        )
 
     def batch_decode(
         self,
@@ -560,6 +603,16 @@ class Qwen35MoEForCausalLM(nn.Module):
                     "effect_mode": "none",
                 },
             },
+            "batch_prefill_with_history": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
             # batch_size pinned to 1 (literal int, not SizeVar) so the MoE block's
             # `if num_tokens == 1:` resolves statically at compile time and routes
             # through `dequantize_gemv` (~6× faster than `dequantize_group_gemm` at
@@ -614,6 +667,15 @@ class Qwen35MoEForCausalLM(nn.Module):
                 },
             },
             "batch_prefill_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_prefill_to_last_hidden_states_with_history": {
                 "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "rnn_state": nn.spec.Object(object_type=RNNState),

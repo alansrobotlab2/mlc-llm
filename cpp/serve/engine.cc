@@ -945,10 +945,26 @@ class EngineImpl : public Engine {
     }
     Result<InferrableEngineConfig> inferrable_cfg_res;
     if (use_kv_cache.Unwrap()) {
-      // - Infer configuration.
+      // - Infer configuration. Pass prefix_cache_mode + recycling_seqs +
+      //   speculative-decoding info so the hybrid-model rnn_state buffer
+      //   estimate matches the runtime allocation in model.cc::CreateKVCache.
+      PrefixCacheMode prefix_cache_mode_for_infer = PrefixCacheModeFromString(
+          json::LookupOrDefault<std::string>(
+              config, "prefix_cache_mode",
+              PrefixCacheModeToString(n->prefix_cache_mode)));
+      int recycling_seqs_for_infer = static_cast<int>(json::LookupOrDefault<int64_t>(
+          config, "prefix_cache_max_num_recycling_seqs",
+          static_cast<int64_t>(n->prefix_cache_max_num_recycling_seqs)));
+      SpeculativeMode spec_mode_for_infer = SpeculativeModeFromString(
+          json::LookupOrDefault<std::string>(
+              config, "speculative_mode",
+              SpeculativeModeToString(n->speculative_mode)));
+      int spec_draft_length_for_infer = static_cast<int>(json::LookupOrDefault<int64_t>(
+          config, "spec_draft_length", static_cast<int64_t>(n->spec_draft_length)));
       inferrable_cfg_res = InferrableEngineConfig::InferForKVCache(
           mode, device_, gpu_memory_utilization, model_configs, model_metadata, inferrable_cfg,
-          verbose);
+          verbose, prefix_cache_mode_for_infer, recycling_seqs_for_infer, spec_mode_for_infer,
+          spec_draft_length_for_infer);
     } else {
       // - Infer configuration.
       inferrable_cfg_res = InferrableEngineConfig::InferForRNNState(

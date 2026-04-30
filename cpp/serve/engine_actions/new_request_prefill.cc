@@ -134,8 +134,18 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
       }
 
       RECORD_EVENT(trace_recorder_, request_ids, "start prefill");
-      Tensor logits =
-          models_[model_id]->BatchPrefill(embeddings, request_internal_ids, prefill_lengths);
+      // Drive the prefill through the per-position-history forward whenever the
+      // radix prefix cache is active and the model lib exposes the path. This
+      // populates RNNState history slots so future cache hits can PopN the
+      // recurrent state back to a matched-prefix boundary. Pure-attention
+      // models answer false to IsCachePrefillSupported so the flag is a no-op
+      // for them; the radix cache there has always worked. When the engine has
+      // prefix-cache disabled, we keep the standard path to avoid paying the
+      // history-slot scatter cost on workloads that won't reuse it.
+      bool cache_prefill = estate->prefix_cache->Mode() != PrefixCacheMode::kDisable &&
+                           models_[model_id]->IsCachePrefillSupported();
+      Tensor logits = models_[model_id]->BatchPrefill(embeddings, request_internal_ids,
+                                                      prefill_lengths, cache_prefill);
       RECORD_EVENT(trace_recorder_, request_ids, "finish prefill");
       TVM_FFI_ICHECK_EQ(logits->ndim, 3);
       TVM_FFI_ICHECK_EQ(logits->shape[0], 1);
@@ -314,6 +324,22 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
           for (Model model : models_) {
             model->ForkSequence(result.forked_seq_id, rsentry->mstates[0]->internal_id,
                                 result.prefilled_offset);
+            // For hybrid models, the rnn_state's ForkSequence copies the parent's
+            // full history slab and Sequence struct verbatim — the child ends up
+            // with seq_length = parent's seq_length. The PagedKVCache fork already
+            // honored fork_pos, so its position is `prefilled_offset`; we need to
+            // bring the child's recurrent state down to the same boundary by
+            // popping `(parent_seq_length - prefilled_offset)` history slots. This
+            // requires the parent's prior prefill to have been done with
+            // `cache_prefill=true` so those history slots actually carry the
+            // intermediate per-position state. PopNFromRNNStateOnly is a no-op on
+            // pure-attention models.
+            if (model->IsCachePrefillSupported() &&
+                result.forked_parent_seq_length > result.prefilled_offset) {
+              size_t pop_n = result.forked_parent_seq_length - result.prefilled_offset;
+              model->PopNFromRNNStateOnly(rsentry->mstates[0]->internal_id,
+                                          static_cast<int>(pop_n));
+            }
             // Enable sliding window for the sequence if it is not a parent.
             if (rsentry->child_indices.empty()) {
               model->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);

@@ -127,10 +127,21 @@ class PrefixCacheImpl : public PrefixCacheObj {
         }
       }
       if (longest_forking_offset > 0) {
+        // Capture the parent's seq length BEFORE fork; the rnn_state's
+        // ForkSequence copies the parent's full history slab unchanged, so
+        // hybrid callers need (parent_length - longest_forking_offset) to
+        // PopN the child back to the matched-prefix boundary.
+        size_t parent_seq_length = radix_tree_->GetSequenceLength(longest_forking_seq_id);
         radix_tree_->ForkSequence(seq_id, longest_forking_seq_id, longest_forking_offset);
         seq_states_.emplace(seq_id, SequenceState::kActive);
         seq_sliding_window_infos_.emplace(seq_id, sliding_window_info);
-        return PrefixCacheMatchedResult{longest_forking_offset, longest_forking_seq_id, -1, 0};
+        return PrefixCacheMatchedResult{
+            /*prefilled_offset=*/longest_forking_offset,
+            /*forked_seq_id=*/longest_forking_seq_id,
+            /*reused_seq_id=*/-1,
+            /*reused_seq_pop_last_tokens=*/0,
+            /*forked_parent_seq_length=*/parent_seq_length,
+        };
       }
     }
     // No forking from matched sequence, fallback to adding new sequence.

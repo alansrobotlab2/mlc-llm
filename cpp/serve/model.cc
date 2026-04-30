@@ -10,6 +10,7 @@
 #include <tvm/runtime/memory/memory_manager.h>
 #include <tvm/runtime/nvtx.h>
 
+#include <atomic>
 #include <fstream>
 #include <unordered_set>
 
@@ -241,7 +242,7 @@ class ModelImpl : public ModelObj {
   }
 
   Tensor BatchPrefill(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
-                      const std::vector<int>& lengths) final {
+                      const std::vector<int>& lengths, bool cache_prefill = false) final {
     TVM_FFI_ICHECK(!seq_ids.empty());
     TVM_FFI_ICHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
@@ -258,7 +259,8 @@ class ModelImpl : public ModelObj {
                      seqlen_padding_factor_;
     }
     NVTXScopedRange nvtx_scope("BatchPrefill num_seq=" + std::to_string(num_sequences) +
-                               " total_len=" + std::to_string(total_length));
+                               " total_len=" + std::to_string(total_length) +
+                               (cache_prefill ? " cache=1" : ""));
     Tensor logit_pos_nd = logit_pos_arr_.CreateView({num_sequences}, DataType::Int(32));
 
     TVM_FFI_ICHECK(ft_.prefill_func_.defined())
@@ -268,12 +270,34 @@ class ModelImpl : public ModelObj {
     TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
     TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
 
-    // Begin forward with the sequence ids and new lengths.
+    // Cache-prefill is only meaningful on hybrid models (no GDN state to checkpoint
+    // on pure-attention models — their radix cache already works). On a hybrid
+    // model whose lib lacks the with-history variant, fall back to the standard
+    // prefill path with a one-shot warning rather than crashing.
+    bool use_with_history = cache_prefill && kind == KVStateKind::kHybrid &&
+                            ft_.prefill_with_history_func_.defined();
+    if (cache_prefill && kind == KVStateKind::kHybrid && !use_with_history) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        LOG(WARNING) << "BatchPrefill: cache_prefill=true requested but model lib does not "
+                        "expose `batch_prefill_with_history`. Falling back to standard prefill; "
+                        "radix prefix cache hits on this sequence's GDN state will not be "
+                        "recoverable. Recompile the lib to enable hybrid prefix caching.";
+      }
+    }
+
+    // Begin forward with the sequence ids and new lengths. On hybrid + cache-prefill,
+    // arm the rnn_state for history-bearing append BEFORE BeginForward so EndForward
+    // advances `available_history_num` by `seq_len` (the per-position state was
+    // scattered to slots [H+1..H+seq_len] by `set_with_history`).
     IntTuple seq_ids_tuple(seq_ids);
     IntTuple lengths_tuple(lengths.begin(), lengths.end());
     ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
     if (kind == KVStateKind::kHybrid) {
       TVM_FFI_ICHECK(rnn_state_.defined()) << "RNN state has not been initialized.";
+      if (use_with_history) {
+        ft_.rnn_state_set_use_history_mode_func_(rnn_state_, true);
+      }
       ft_.kv_cache_begin_forward_func_(rnn_state_, seq_ids_tuple, lengths_tuple);
     }
 
@@ -323,8 +347,11 @@ class ModelImpl : public ModelObj {
     ObjectRef ret;
     if (kind == KVStateKind::kHybrid) {
       // Hybrid always uses batch_prefill (single_batch prefill has tensor-based GDN args).
+      // Route through the with-history variant when prefix-caching is requested.
+      Function chosen_prefill =
+          use_with_history ? ft_.prefill_with_history_func_ : prefill_func;
       ret =
-          prefill_func(embeddings_dref_or_nd, logit_pos_dref_or_nd, kv_cache_, rnn_state_, params_)
+          chosen_prefill(embeddings_dref_or_nd, logit_pos_dref_or_nd, kv_cache_, rnn_state_, params_)
               .cast<ObjectRef>();
     } else if (seq_ids.size() == 1 && !padded) {
       ret = single_batch_prefill_func(embeddings_dref_or_nd, kv_cache_, params_).cast<ObjectRef>();
@@ -363,8 +390,10 @@ class ModelImpl : public ModelObj {
 
   ObjectRef BatchPrefillToLastHidden(const ObjectRef& embedding_or_hidden_states,
                                      const std::vector<int64_t>& seq_ids,
-                                     const std::vector<int>& lengths) final {
-    NVTXScopedRange nvtx_scope("BatchPrefillToLastHidden");
+                                     const std::vector<int>& lengths,
+                                     bool cache_prefill = false) final {
+    NVTXScopedRange nvtx_scope(std::string("BatchPrefillToLastHidden") +
+                               (cache_prefill ? " cache=1" : ""));
     TVM_FFI_ICHECK(!seq_ids.empty());
     TVM_FFI_ICHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
@@ -391,17 +420,40 @@ class ModelImpl : public ModelObj {
     TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
     TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
 
-    // Begin forward with the sequence ids and new lengths.
+    // See BatchPrefill for the cache_prefill / use_with_history fallback policy.
+    // The single-batch (seq_ids.size()==1) prefill-to-last-hidden path lacks a
+    // with-history sibling in the lib (single-batch entries take tensor-typed
+    // GDN args, while batch_prefill_to_last_hidden_states_with_history is
+    // RNNState-typed). When cache_prefill is requested with batch=1, route
+    // through the batch path instead to pick up the with-history function.
+    bool use_with_history = cache_prefill && kind == KVStateKind::kHybrid &&
+                            ft_.prefill_to_last_hidden_with_history_func_.defined();
+    if (cache_prefill && kind == KVStateKind::kHybrid && !use_with_history) {
+      static std::atomic<bool> warned{false};
+      if (!warned.exchange(true)) {
+        LOG(WARNING) << "BatchPrefillToLastHidden: cache_prefill=true requested but model lib "
+                        "does not expose `batch_prefill_to_last_hidden_states_with_history`. "
+                        "Falling back to standard prefill; rnn_state checkpoints will not be "
+                        "available for spec-decode draft prefills on this sequence.";
+      }
+    }
+
+    // Begin forward with the sequence ids and new lengths. Arm history-bearing
+    // mode before BeginForward when cache-prefill is active so EndForward
+    // advances `available_history_num` by `seq_len` rather than capping at 0.
     IntTuple seq_ids_tuple(seq_ids);
     IntTuple lengths_tuple(lengths.begin(), lengths.end());
     ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
     if (kind == KVStateKind::kHybrid) {
+      if (use_with_history) {
+        ft_.rnn_state_set_use_history_mode_func_(rnn_state_, true);
+      }
       ft_.kv_cache_begin_forward_func_(rnn_state_, seq_ids_tuple, lengths_tuple);
     }
 
     // args: embeddings, logit_pos, kv_cache, params
     ObjectRef result{nullptr};
-    if (seq_ids.size() == 1) {
+    if (seq_ids.size() == 1 && !use_with_history) {
       TVM_FFI_ICHECK(ft_.single_batch_prefill_to_last_hidden_func_.defined())
           << "`single_batch_prefill_to_last_hidden_states` function is not found in the model.";
       if (kind == KVStateKind::kHybrid) {
@@ -415,8 +467,12 @@ class ModelImpl : public ModelObj {
       }
     } else {
       if (kind == KVStateKind::kHybrid) {
-        result = ft_.prefill_to_last_hidden_func_(embedding_or_hidden_states_dref_or_nd, kv_cache_,
-                                                  rnn_state_, params_)
+        Function chosen_func =
+            use_with_history
+                ? ft_.prefill_to_last_hidden_with_history_func_
+                : ft_.prefill_to_last_hidden_func_;
+        result = chosen_func(embedding_or_hidden_states_dref_or_nd, kv_cache_,
+                             rnn_state_, params_)
                      .cast<ObjectRef>();
       } else {
         result = ft_.prefill_to_last_hidden_func_(embedding_or_hidden_states_dref_or_nd, kv_cache_,
@@ -981,6 +1037,17 @@ class ModelImpl : public ModelObj {
         << "Hybrid model requires vm.builtin.rnn_state_set_use_history_mode; rebuild TVM "
            "with the rnn_state per-position history patch.";
     ft_.rnn_state_set_use_history_mode_func_(rnn_state_, use_history);
+  }
+
+  bool IsCachePrefillSupported() const final {
+    // Cache-prefill only matters for hybrid models (pure-attention prefix cache
+    // already works). Both with-history entry points must be present so the
+    // engine can drive both logits-emitting and to-last-hidden prefills through
+    // the history-bearing path.
+    return kind == KVStateKind::kHybrid &&
+           ft_.prefill_with_history_func_.defined() &&
+           ft_.prefill_to_last_hidden_with_history_func_.defined() &&
+           ft_.rnn_state_set_use_history_mode_func_.defined();
   }
 
   void EnableSlidingWindowForSeq(int64_t seq_id) final {

@@ -1080,6 +1080,7 @@ class Qwen35LMHeadModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.tensor_parallel_shards = config.tensor_parallel_shards
         self.partial_rotary_factor = config.partial_rotary_factor
+        self.kv_cache_dtype = getattr(config, "kv_cache_dtype", None) or None
         # GDN config
         self.num_linear_layers = config.num_linear_layers
         self.num_attention_layers = config.num_attention_layers
@@ -1107,6 +1108,28 @@ class Qwen35LMHeadModel(nn.Module):
         """Shared forward for batch methods using RNNState."""
         op_ext.configure()
         hidden_states, state = self.model.forward(input_embed, paged_kv_cache, state)
+        if logit_positions is not None:
+            hidden_states = op.take(hidden_states, logit_positions, axis=1)
+        logits = self._lm_head(hidden_states)
+        return logits, paged_kv_cache, state
+
+    def _forward_with_history(
+        self,
+        input_embed: Tensor,
+        paged_kv_cache: PagedKVCache,
+        state: RNNState,
+        logit_positions: Optional[Tensor] = None,
+    ):
+        """Prefill-with-history forward: scatters per-position GDN state into RNNState
+        history slots so the radix prefix cache can roll the recurrent state back to any
+        intermediate position via PopN. Pair with `set_use_history_mode(True)` on the
+        engine side before BeginForward so EndForward advances `available_history_num`
+        by `seq_len` rather than capping at 0 for the multi-token append.
+        """
+        op_ext.configure()
+        hidden_states, state = self.model.forward_with_history(
+            input_embed, paged_kv_cache, state
+        )
         if logit_positions is not None:
             hidden_states = op.take(hidden_states, logit_positions, axis=1)
         logits = self._lm_head(hidden_states)
@@ -1172,6 +1195,19 @@ class Qwen35LMHeadModel(nn.Module):
     ):
         return self._forward(input_embeds, paged_kv_cache, rnn_state, logit_positions)
 
+    def batch_prefill_with_history(
+        self,
+        input_embeds: Tensor,
+        logit_positions: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        # Prefix-cacheable prefill: emits per-position GDN state into history slots.
+        # Engine must arm `set_use_history_mode(True)` before BeginForward.
+        return self._forward_with_history(
+            input_embeds, paged_kv_cache, rnn_state, logit_positions
+        )
+
     def batch_decode(
         self,
         input_embeds: Tensor,
@@ -1195,6 +1231,18 @@ class Qwen35LMHeadModel(nn.Module):
         rnn_state: RNNState,
     ):
         return self._forward_to_last_hidden(input_embeds, paged_kv_cache, rnn_state)
+
+    def batch_prefill_to_last_hidden_states_with_history(
+        self,
+        input_embeds: Tensor,
+        paged_kv_cache: PagedKVCache,
+        rnn_state: RNNState,
+    ):
+        # Prefix-cacheable to-last-hidden prefill: per-position GDN state -> history slots.
+        # Engine must arm `set_use_history_mode(True)` before BeginForward.
+        return self._forward_to_last_hidden_with_history(
+            input_embeds, paged_kv_cache, rnn_state
+        )
 
     def batch_decode_to_last_hidden_states(
         self,
@@ -1295,6 +1343,7 @@ class Qwen35LMHeadModel(nn.Module):
             rope_theta=self.rope_theta,
             rotary_dim=rotary_dim,
             dtype=self.dtype,
+            dtype_kv=getattr(self, "kv_cache_dtype", None) or self.dtype,
         )
 
     def get_default_spec(self):
@@ -1307,6 +1356,16 @@ class Qwen35LMHeadModel(nn.Module):
                 },
             },
             "batch_prefill": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_prefill_with_history": {
                 "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
                 "logit_positions": nn.spec.Tensor(["batch_size"], "int32"),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
@@ -1360,6 +1419,15 @@ class Qwen35LMHeadModel(nn.Module):
                 },
             },
             "batch_prefill_to_last_hidden_states": {
+                "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
+                "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
+                "rnn_state": nn.spec.Object(object_type=RNNState),
+                "$": {
+                    "param_mode": "packed",
+                    "effect_mode": "none",
+                },
+            },
+            "batch_prefill_to_last_hidden_states_with_history": {
                 "input_embeds": nn.spec.Tensor([1, "seq_len", self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),
                 "rnn_state": nn.spec.Object(object_type=RNNState),

@@ -36,6 +36,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--label", default="MLC", help="Label for the summary header")
     p.add_argument("--json-out", help="Optional path to write JSON summary {pp: {pp_tps, tg_tps}}.")
     p.add_argument("--baseline", help="Path to baseline JSON; print delta vs baseline.")
+    p.add_argument(
+        "--prefix-cache",
+        choices=("radix", "disable"),
+        default="disable",
+        help="Radix prefix cache mode. Default 'disable' for back-compat with the steady-state "
+             "decode/prefill numbers in the worklog. Set 'radix' to opt into Phase 8 hybrid "
+             "prefix caching (rnn_state checkpoints via cache_prefill).",
+    )
     return p.parse_args()
 
 
@@ -90,15 +98,18 @@ def main() -> None:
     print(f"[mlc] Loading tokenizer from {model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
 
-    # Disable radix prefix caching: hybrid GDN models cannot roll back rnn_state
-    # after a multi-token prefill, so the engine's PopN-on-prefix-match path crashes.
-    print(f"[mlc] Loading engine: device={args.device} lib={lib_path}")
+    # Phase 8: hybrid prefix caching is now opt-in via --prefix-cache=radix.
+    # When 'radix', the engine drives prefill through batch_prefill_with_history
+    # (per-position GDN state landed in RNNState history slots) so that future
+    # cache hits can PopN the recurrent state to a matched-prefix boundary.
+    # Default 'disable' keeps the steady-state numbers in worklog.md reproducible.
+    print(f"[mlc] Loading engine: device={args.device} lib={lib_path} prefix_cache={args.prefix_cache}")
     engine = MLCEngine(
         model=str(model_dir),
         model_lib=lib_path,
         device=args.device,
         mode="interactive",
-        engine_config=EngineConfig(prefix_cache_mode="disable"),
+        engine_config=EngineConfig(prefix_cache_mode=args.prefix_cache),
     )
 
     pp_values = [int(x) for x in args.pp.split(",") if x.strip()]

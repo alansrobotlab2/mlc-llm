@@ -219,6 +219,11 @@ void FunctionTable::_InitFunctions() {
   this->prefill_to_last_hidden_func_ = mod_get_func("batch_prefill_to_last_hidden_states");
   this->decode_to_last_hidden_func_ = mod_get_func("batch_decode_to_last_hidden_states");
   this->verify_to_last_hidden_func_ = mod_get_func("batch_verify_to_last_hidden_states");
+  // Prefix-cacheable prefill variants. Optional; only present on hybrid GDN
+  // libs compiled with the per-position-history forward exposed.
+  this->prefill_with_history_func_ = mod_get_func("batch_prefill_with_history");
+  this->prefill_to_last_hidden_with_history_func_ =
+      mod_get_func("batch_prefill_to_last_hidden_states_with_history");
   // Optional γ-specialized verify variants. Models that don't expose them
   // leave these slots null and the engine falls back to the dynamic-seq_len
   // `verify_to_last_hidden_func_` for all γ.
