@@ -44,8 +44,7 @@ class Qwen35MoEConfig(Qwen35Config):
     num_experts: int = 0
     decoder_sparse_step: int = 1
     norm_topk_prob: bool = True
-    mrope_section: Optional[List[int]] = None  # noqa: UP006,UP007
-    mrope_interleaved: bool = False
+    # mrope_section / mrope_interleaved inherited from Qwen35Config (Phase 10).
 
 
 class Qwen35MoEMLP(nn.Module):

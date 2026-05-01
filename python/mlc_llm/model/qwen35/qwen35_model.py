@@ -19,6 +19,10 @@ from tvm.script import tirx as T
 from mlc_llm import op as op_ext
 from mlc_llm.nn import PagedKVCache, RopeMode
 from mlc_llm.nn.rnn_state import RNNState
+from mlc_llm.op.mrope import (
+    MultimodalRotaryEmbedding,
+    apply_multimodal_rotary_pos_emb,
+)
 from mlc_llm.support import logging
 from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
@@ -63,6 +67,13 @@ class Qwen35Config(ConfigBase):
     # Phase 5: dtype of the paged KV cache. None or "" -> use the model dtype.
     # Set to e.g. "float8_e4m3fn" to enable fp8 KV storage (Phase 5).
     kv_cache_dtype: Optional[str] = None
+    # Phase 10: mRoPE plumbing. Default None preserves text-only behavior
+    # (cache-internal RopeMode.NORMAL). When set, softmax-attention layers
+    # apply inline mRoPE and use raw self_attention; spec adds position_ids +
+    # mrope_deltas. The VL sibling module (qwen3_5_vl/) sets these from HF config;
+    # text-only Qwen35LMHeadModel keeps them None.
+    mrope_section: Optional[List[int]] = None  # noqa: UP006,UP007
+    mrope_interleaved: bool = False
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)  # noqa: UP006
 
     def __post_init__(self):
@@ -180,6 +191,12 @@ class Qwen35Attention(nn.Module):
         self.num_attention_heads = config.num_attention_heads // config.tensor_parallel_shards
         self.num_key_value_heads = config.num_key_value_heads // config.tensor_parallel_shards
         self.rope_theta = config.rope_theta
+        # Phase 10: when set, forward() takes (cos, sin) and applies inline mRoPE
+        # via op/mrope.apply_multimodal_rotary_pos_emb, using the raw
+        # paged_kv_cache.self_attention path (cache rope_mode=NONE). When unset,
+        # the existing attention_with_fused_qkv path runs (cache rope_mode=NORMAL).
+        self.mrope_section = config.mrope_section
+        self.mrope_interleaved = config.mrope_interleaved
 
         # c_attn: Q (2x for gate) + K + V fused projection
         self.c_attn = nn.Linear(
@@ -202,7 +219,13 @@ class Qwen35Attention(nn.Module):
                 if n and hasattr(self, n):
                     getattr(self, n).no_quantization = True
 
-    def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
+    def forward(
+        self,
+        hidden_states: Tensor,
+        paged_kv_cache: PagedKVCache,
+        layer_id: int,
+        position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,  # noqa: UP006
+    ):
         d, h_q, h_kv = self.head_dim, self.num_attention_heads, self.num_key_value_heads
         b, s, _ = hidden_states.shape
         # c_attn per-token at small static seq: same small-batch tax fix as
@@ -225,13 +248,43 @@ class Qwen35Attention(nn.Module):
         gate = op.reshape(gate, (b, s, h_q * d))
         q = self.q_norm(q)
         k = self.k_norm(k)
-        qkv = op.concat([q, k, v], dim=2)
-        output = op.reshape(
-            paged_kv_cache.attention_with_fused_qkv(
-                layer_id, qkv, self.num_attention_heads, sm_scale=self.head_dim**-0.5
-            ),
-            (b, s, h_q * d),
-        )
+
+        if position_embeddings is not None:
+            # Phase 10 inline-mRoPE path: cos/sin already computed once at the
+            # model level and broadcast to all softmax-attention layers. Cache
+            # rope_mode must be NONE in this build; the cache's f_split_rotary_
+            # skips rotation when rope_mode != kNormal, so we pre-rotate Q/K
+            # here and feed pre-rotated qkv to attention_with_fused_qkv. The
+            # cache still routes prefill→ragged kernel and decode→cached-K
+            # kernel based on cur_append_lengths_, which is what we need —
+            # `self_attention` is ragged-only and ignores the cached K's,
+            # giving decontextualized decode (Phase 10 Stage 5b diagnosis).
+            assert self.mrope_section is not None, (
+                "position_embeddings provided but mrope_section is unset on the attention "
+                "layer. Build config mismatch."
+            )
+            cos, sin = position_embeddings
+            q, k = apply_multimodal_rotary_pos_emb(
+                q, k, cos, sin, self.mrope_section,
+                unsqueeze_dim=2, interleaved=self.mrope_interleaved,
+            )
+            qkv = op.concat([q, k, v], dim=2)
+            output = op.reshape(
+                paged_kv_cache.attention_with_fused_qkv(
+                    layer_id, qkv, self.num_attention_heads, sm_scale=self.head_dim ** -0.5
+                ),
+                (b, s, h_q * d),
+            )
+        else:
+            # Existing path: cache applies 1D RoPE internally per its rope_mode setting.
+            qkv = op.concat([q, k, v], dim=2)
+            output = op.reshape(
+                paged_kv_cache.attention_with_fused_qkv(
+                    layer_id, qkv, self.num_attention_heads, sm_scale=self.head_dim ** -0.5
+                ),
+                (b, s, h_q * d),
+            )
+
         # Apply output gate: sigmoid(gate) * attn_output
         output = output * op.sigmoid(gate)
         if isinstance(s, int) and 1 < s <= 5:
@@ -906,11 +959,13 @@ class Qwen35DecoderLayer(nn.Module):
         hidden_states: Tensor,
         paged_kv_cache: PagedKVCache,
         state: RNNState,
+        position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,  # noqa: UP006
     ):
         out = self.input_layernorm(hidden_states)
         if self.layer_type == "full_attention":
-            out = self.self_attn(out, paged_kv_cache, self.category_id)
+            out = self.self_attn(out, paged_kv_cache, self.category_id, position_embeddings)
         else:
+            # GDN ignores positions; mRoPE only routes to softmax-attn layers.
             out, state = self.linear_attn.forward(out, state)
         hidden_states = self._apply_residual(out, residual=hidden_states)
         out = self.post_attention_layernorm(hidden_states)
@@ -923,11 +978,12 @@ class Qwen35DecoderLayer(nn.Module):
         hidden_states: Tensor,
         paged_kv_cache: PagedKVCache,
         state: RNNState,
+        position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,  # noqa: UP006
     ):
         """Verify-path variant that scatters per-position GDN state into history slots."""
         out = self.input_layernorm(hidden_states)
         if self.layer_type == "full_attention":
-            out = self.self_attn(out, paged_kv_cache, self.category_id)
+            out = self.self_attn(out, paged_kv_cache, self.category_id, position_embeddings)
         else:
             out, state = self.linear_attn.forward_with_history(out, state)
         hidden_states = self._apply_residual(out, residual=hidden_states)
@@ -991,6 +1047,7 @@ class Qwen35MTPHead(nn.Module):
         prev_hidden: Tensor,
         prev_embed: Tensor,
         paged_kv_cache: PagedKVCache,
+        position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,  # noqa: UP006
     ) -> Tensor:
         # vLLM's qwen3_5_mtp.py:138 fuses as cat([embeds, hidden]) — embeds in
         # the FIRST half of fc's input. Reversed order zeros accept rate.
@@ -1001,7 +1058,7 @@ class Qwen35MTPHead(nn.Module):
             kv_layer_idx = self._kv_layer_offset + i
             residual = h
             x = layer.input_layernorm(h)
-            x = layer.self_attn(x, paged_kv_cache, kv_layer_idx)
+            x = layer.self_attn(x, paged_kv_cache, kv_layer_idx, position_embeddings)
             if self._tp_shards > 1:
                 h = op.ccl_allreduce(x, "sum") + residual
             else:
@@ -1033,15 +1090,39 @@ class Qwen35Model(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.norm = nn.RMSNorm(config.hidden_size, -1, config.rms_norm_eps, bias=False)
 
+        # Phase 10: instantiate the multimodal rotary table once when mRoPE is on.
+        # rotary_dim = head_dim * partial_rotary_factor (0.8B: 256·0.25 = 64).
+        # When config.mrope_section is None the embedding is not built and
+        # forward()'s position_ids arg is ignored — existing fused-qkv path runs.
+        self.use_mrope = config.mrope_section is not None
+        if self.use_mrope:
+            rotary_dim = int(config.head_dim * config.partial_rotary_factor)
+            self.rotary_emb = MultimodalRotaryEmbedding(
+                head_dim=config.head_dim,
+                theta=float(config.rope_theta),
+                mrope_section=config.mrope_section,
+                rotary_dim=rotary_dim,
+            )
+
     def forward(
         self,
         inputs: Tensor,
         paged_kv_cache: PagedKVCache,
         state: RNNState,
+        position_ids: Optional[Tensor] = None,
     ):
         hidden_states = inputs
+        position_embeddings = None
+        if self.use_mrope:
+            assert position_ids is not None, (
+                "mRoPE build requires position_ids in Qwen35Model.forward; got None."
+            )
+            cos, sin = self.rotary_emb(hidden_states, position_ids)
+            position_embeddings = (cos, sin)
         for layer_id, layer in enumerate(self.layers):
-            hidden_states, state = layer.forward(hidden_states, paged_kv_cache, state)
+            hidden_states, state = layer.forward(
+                hidden_states, paged_kv_cache, state, position_embeddings
+            )
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
 
@@ -1050,11 +1131,19 @@ class Qwen35Model(nn.Module):
         inputs: Tensor,
         paged_kv_cache: PagedKVCache,
         state: RNNState,
+        position_ids: Optional[Tensor] = None,
     ):
         hidden_states = inputs
+        position_embeddings = None
+        if self.use_mrope:
+            assert position_ids is not None, (
+                "mRoPE build requires position_ids in Qwen35Model.forward_with_history; got None."
+            )
+            cos, sin = self.rotary_emb(hidden_states, position_ids)
+            position_embeddings = (cos, sin)
         for layer_id, layer in enumerate(self.layers):
             hidden_states, state = layer.forward_with_history(
-                hidden_states, paged_kv_cache, state
+                hidden_states, paged_kv_cache, state, position_embeddings
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states, state

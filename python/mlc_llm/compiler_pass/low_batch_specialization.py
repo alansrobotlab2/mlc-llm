@@ -21,13 +21,24 @@ class LowBatchGemvSpecialize:
                 low_batch_range = [2, 8]
                 buckets = [2, 4]
                 low_batch_funcs = []
+                skip = False
                 for bucket in buckets:
                     low_batch_mod = IRModule({})
                     low_batch_mod["main"] = func
-                    low_batch_mod = dl.ApplyDefaultSchedule(
-                        dl.gpu.LowBatchGEMV(bucket),
-                    )(low_batch_mod)
+                    try:
+                        low_batch_mod = dl.ApplyDefaultSchedule(
+                            dl.gpu.LowBatchGEMV(bucket),
+                        )(low_batch_mod)
+                    except AssertionError:
+                        # Upstream dlight rule asserts on some non-GEMV primfuncs
+                        # (e.g. the vision tower's matmul-without-batch-dim shapes
+                        # produced by Phase 10 image_embed). Gracefully skip — the
+                        # regular Matmul rule will still pick the func up below.
+                        skip = True
+                        break
                     low_batch_funcs.append(low_batch_mod["main"])
+                if skip:
+                    continue
                 if any(
                     tvm.ir.structural_equal(low_batch_func, func)
                     for low_batch_func in low_batch_funcs

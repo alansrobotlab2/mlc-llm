@@ -41,7 +41,12 @@ def _reorder_cos_sin(
     tensor: Tensor,
     split_sizes: Sequence[int],
 ) -> Tensor:
-    """Reorder cos/sin tensors so the head dimension follows T/H/W repeating sections."""
+    """Reorder cos/sin into the chunked T/H/W layout (``mrope_interleaved=False``).
+
+    Input shape ``(3, batch, seq, rotary_dim)``; output ``(batch, seq, rotary_dim)``.
+    Used by Qwen2.5-VL (``mrope_interleaved`` not set / false). For the
+    interleaved variant Qwen3.5 ships with, see ``_reorder_cos_sin_interleaved``.
+    """
 
     if not split_sizes:
         raise ValueError("split_sizes must not be empty.")
@@ -56,8 +61,74 @@ def _reorder_cos_sin(
     return op.concat(reordered, dim=-1)
 
 
+def _interleaved_axis_per_pos(
+    rotary_dim: int,
+    mrope_section: Sequence[int],
+) -> List[int]:
+    """Per-position axis (0=T, 1=H, 2=W) selector for ``mrope_interleaved=True``.
+
+    Mirrors HF Qwen3.5 ``apply_interleaved_mrope`` (modeling_qwen3_5.py:157-172):
+    start with T everywhere, then overwrite positions ``[offset, offset+3, ...]``
+    with H (offset=1) and W (offset=2) up to ``mrope_section[axis]`` slots each.
+    The pattern repeats in both halves of ``rotary_dim`` (cos/sin = ``[freqs, freqs]``).
+    """
+    if rotary_dim % 2 != 0:
+        raise ValueError(f"rotary_dim must be even, got {rotary_dim}.")
+    if len(mrope_section) != 3:
+        raise ValueError(f"mrope_section must have 3 entries, got {list(mrope_section)}.")
+    half = rotary_dim // 2
+    sec = list(mrope_section)
+    pattern: List[int] = []
+    for p in range(half):
+        r = p % 3
+        if r == 0:
+            pattern.append(0)
+        elif r == 1:
+            pattern.append(1 if (p - 1) // 3 < sec[1] else 0)
+        else:
+            pattern.append(2 if (p - 2) // 3 < sec[2] else 0)
+    return pattern + pattern  # repeats in both halves
+
+
+def _reorder_cos_sin_interleaved(
+    tensor: Tensor,
+    mrope_section: Sequence[int],
+) -> Tensor:
+    """Reorder cos/sin into the HF Qwen3.5 interleaved T/H/W layout.
+
+    Input shape ``(3, batch, seq, rotary_dim)``; output ``(batch, seq, rotary_dim)``.
+    Implementation: build per-axis masks of length ``rotary_dim`` and sum the
+    masked T/H/W slices. Equivalent to a position-wise gather along axis 0 with
+    a static index array, expressed as broadcastable mask multiplication so it
+    fuses cleanly under Relax.
+    """
+    rotary_dim_dim = tensor.shape[-1]
+    if not isinstance(rotary_dim_dim, int):
+        raise ValueError(f"rotary_dim must be a static int for interleaved mrope, got {rotary_dim_dim}.")
+    rotary_dim = int(rotary_dim_dim)
+    axis_per_pos = _interleaved_axis_per_pos(rotary_dim, mrope_section)
+
+    dtype = tensor.dtype
+    masks = []
+    for axis in (0, 1, 2):
+        mask_np = np.array([1.0 if a == axis else 0.0 for a in axis_per_pos], dtype=dtype)
+        masks.append(nn.Tensor.from_const(mask_np))
+    parts = []
+    for axis in (0, 1, 2):
+        sel = nn.Tensor.from_const(np.array([axis], dtype="int32"))
+        sliced = nn.op.squeeze(op.take(tensor, sel, axis=0), 0)
+        parts.append(op.multiply(sliced, masks[axis]))
+    return op.add(op.add(parts[0], parts[1]), parts[2])
+
+
 class MultimodalRotaryEmbedding(nn.Module):
-    """Generate cosine/sine tables for multimodal rotary embeddings."""
+    """Generate cosine/sine tables for multimodal rotary embeddings.
+
+    Supports partial-rotary models via ``rotary_dim`` (e.g. Qwen3.5 uses
+    ``head_dim=256``, ``partial_rotary_factor=0.25`` → ``rotary_dim=64``). When
+    unset, defaults to ``head_dim`` (full rotary, the Qwen2.5-VL convention).
+    The inv_freq denominator uses ``rotary_dim`` not ``head_dim`` to match HF.
+    """
 
     def __init__(
         self,
@@ -65,19 +136,31 @@ class MultimodalRotaryEmbedding(nn.Module):
         theta: float,
         mrope_section: Sequence[int],
         attention_scaling: float = 1.0,
+        rotary_dim: Optional[int] = None,
     ) -> None:
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {head_dim}.")
         self.head_dim = head_dim
+        self.rotary_dim = rotary_dim if rotary_dim is not None else head_dim
+        if self.rotary_dim % 2 != 0:
+            raise ValueError(f"rotary_dim must be even, got {self.rotary_dim}.")
+        if self.rotary_dim > head_dim:
+            raise ValueError(f"rotary_dim ({self.rotary_dim}) cannot exceed head_dim ({head_dim}).")
+        # Sanity: mrope_section doubled must match rotary_dim (T+H+W chunks each cover half)
+        if sum(mrope_section) * 2 != self.rotary_dim:
+            raise ValueError(
+                f"sum(mrope_section)*2={sum(mrope_section)*2} must equal rotary_dim={self.rotary_dim}; "
+                f"got mrope_section={list(mrope_section)}."
+            )
         self.theta = theta
         self.attention_scaling = attention_scaling
         self.mrope_section = tuple(mrope_section)
         self._inv_freq = 1.0 / (
-            theta ** (np.arange(0, head_dim, 2, dtype="float32") / np.float32(head_dim))
+            theta ** (np.arange(0, self.rotary_dim, 2, dtype="float32") / np.float32(self.rotary_dim))
         )
 
     def forward(self, reference: Tensor, position_ids: Tensor) -> Tuple[Tensor, Tensor]:  # noqa: UP006
-        """Return ``(cos, sin)`` with shape ``(3, batch, seq, head_dim)``."""
+        """Return ``(cos, sin)`` with shape ``(3, batch, seq, rotary_dim)``."""
         if len(position_ids.shape) != 3:
             raise ValueError(
                 "position_ids must be rank-3 with either "
@@ -127,16 +210,45 @@ def apply_multimodal_rotary_pos_emb(
     sin: Tensor,
     mrope_section: Sequence[int],
     unsqueeze_dim: int = 2,
+    interleaved: bool = False,
 ) -> Tuple[Tensor, Tensor]:  # noqa: UP006
-    """Apply multimodal rotary embedding to query and key tensors."""
+    """Apply multimodal rotary embedding to query and key tensors.
 
-    split_sizes = _repeat_mrope_section(mrope_section)
-    reordered_cos = _reorder_cos_sin(cos, split_sizes)
-    reordered_sin = _reorder_cos_sin(sin, split_sizes)
+    Handles partial-rotary models: if ``cos.shape[-1] < q.shape[-1]``, rotates
+    only the leading ``rotary_dim`` dims of q/k and passes the trailing dims
+    through unchanged (HF convention for ``partial_rotary_factor < 1``).
+
+    ``interleaved=True`` packs T/H/W per-position with a stride-by-3 pattern
+    (HF Qwen3.5 / ``mrope_interleaved=True``). ``interleaved=False`` keeps the
+    chunked T/H/W layout (Qwen2.5-VL).
+    """
+
+    if interleaved:
+        reordered_cos = _reorder_cos_sin_interleaved(cos, mrope_section)
+        reordered_sin = _reorder_cos_sin_interleaved(sin, mrope_section)
+    else:
+        split_sizes = _repeat_mrope_section(mrope_section)
+        reordered_cos = _reorder_cos_sin(cos, split_sizes)
+        reordered_sin = _reorder_cos_sin(sin, split_sizes)
     cos_term = op.unsqueeze(reordered_cos, dim=unsqueeze_dim)
     sin_term = op.unsqueeze(reordered_sin, dim=unsqueeze_dim)
     cos_term = cos_term.astype(q.dtype)
     sin_term = sin_term.astype(q.dtype)
+
+    # Detect partial-rotary by comparing the last dim of cos to q's head_dim.
+    # cos was built with shape (3, batch, seq, rotary_dim) → last dim = rotary_dim.
+    rotary_dim = cos.shape[-1]
+    head_dim = q.shape[-1]
+
+    if isinstance(rotary_dim, int) and isinstance(head_dim, int) and rotary_dim < head_dim:
+        # Partial rotary: rotate the leading slice, keep the trailing slice as-is.
+        q_rot, q_pass = op.split(q, [rotary_dim], axis=-1)
+        k_rot, k_pass = op.split(k, [rotary_dim], axis=-1)
+        q_rot_emb = op.add(op.multiply(q_rot, cos_term), op.multiply(_rotate_half(q_rot), sin_term))
+        k_rot_emb = op.add(op.multiply(k_rot, cos_term), op.multiply(_rotate_half(k_rot), sin_term))
+        return op.concat([q_rot_emb, q_pass], dim=-1), op.concat([k_rot_emb, k_pass], dim=-1)
+
+    # Full rotary (Qwen2.5-VL convention).
     q_embed = op.add(op.multiply(q, cos_term), op.multiply(_rotate_half(q), sin_term))
     k_embed = op.add(op.multiply(k, cos_term), op.multiply(_rotate_half(k), sin_term))
     return q_embed, k_embed

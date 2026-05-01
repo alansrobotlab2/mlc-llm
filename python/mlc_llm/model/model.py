@@ -52,6 +52,7 @@ from .qwen3_5_moe_mtp_draft import (
     qwen3_5_moe_mtp_draft_loader,
     qwen3_5_moe_mtp_draft_model,
 )
+from .qwen3_5_vl import qwen3_5_vl_loader, qwen3_5_vl_model
 from .rwkv5 import rwkv5_loader, rwkv5_model
 from .rwkv6 import rwkv6_loader, rwkv6_model
 from .stable_lm import stablelm_loader, stablelm_model
@@ -481,6 +482,18 @@ MODELS: Dict[str, Model] = {  # noqa: UP006
         },
         quantize=make_quantization_functions(
             qwen3_5_moe_mtp_draft_model.Qwen35MoEMTPDraftLM,
+        ),
+    ),
+    "qwen3_5_vl": Model(
+        name="qwen3_5_vl",
+        model=qwen3_5_vl_model.Qwen35VLLMHeadModel,
+        config=qwen3_5_vl_model.Qwen35VLConfig,
+        source={
+            "huggingface-torch": qwen3_5_vl_loader.huggingface,
+            "huggingface-safetensor": qwen3_5_vl_loader.huggingface,
+        },
+        quantize=make_quantization_functions(
+            qwen3_5_vl_model.Qwen35VLLMHeadModel,
         ),
     ),
     "qwen3_moe": Model(
