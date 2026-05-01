@@ -45,13 +45,32 @@ SNAP=$(hf download Qwen/Qwen3.6-35B-A3B --local-dir-use-symlinks True | tail -1)
     --quantization q4f16_1 --conv-template qwen3_5 \
     -o dist/qwen3_6-35B-A3B-q4f16_1                                # 3 sec; auto-picks model_type=qwen3_5_moe
 
-.venv/bin/python -m mlc_llm compile dist/qwen3_6-35B-A3B-q4f16_1 \
+MLC_MOE_GEMM_V2=1 .venv/bin/python -m mlc_llm compile dist/qwen3_6-35B-A3B-q4f16_1 \
     --device cuda \
-    --opt "flashinfer=0;cublas_gemm=1;cudagraph=1;cutlass=1" \
-    -o dist/qwen3_6-35B-A3B-q4f16_1/lib.so                         # ~5 min, 196 MB sm_87 lib
+    --opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1" \
+    -o dist/qwen3_6-35B-A3B-q4f16_1/lib.so                         # ~25 min, 202 MB sm_87 lib
 ```
 
-`flashinfer=0` is **mandatory** on Orin — the prebuilt FlashInfer cache lacks sm_87 and the JIT path segfaults. The `cudagraph=1;cutlass=1` flags are what let us reach the shipped 52.62 tps tg64 number.
+Two flags matter here:
+- **`MLC_MOE_GEMM_V2=1`** (env var, Phase 9b) — opts the int4 MoE GEMM into the
+  dispatch-table + hand-tensorized wmma m16n8k16 kernel. **2.52× pp512** vs
+  the persistent-loop v1 (Stage 9.2 baseline 207.95 → 523.67 tps). Decode
+  (b=1) is unaffected — still routes through `dequantize_gemv` shortcut.
+- **`flashinfer=1`** (compile opt) — links FlashInfer's paged-decode +
+  paged-prefill kernels. **+21 % tg512** at pp=512 KV depth (44.88 → 54.35).
+  FlashInfer compiles cleanly on Orin sm_87 since the Phase 6 ABI fix; the
+  earlier "FlashInfer cache lacks sm_87" claim is stale (was a JIT issue
+  fixed in vendored TVM). `--model-lib` is still recommended at runtime to
+  bypass the JIT cache lookup.
+
+Combined, this lib hits **pp512 = 561.16 / tg512 = 54.35** on the Orin AGX
+MAXN bench — past every Phase 9 gate including the 450-tps "parity to
+llama.cpp" stretch. `cudagraph=1;cutlass=1` are the long-standing
+Orin-tuned flags from prior phases.
+
+A FlashInfer-off / v1-only build of the same dir is preserved at
+[lib_phase9_cta1024_pre_v2.so](dist/qwen3_6-35B-A3B-q4f16_1/lib_phase9_cta1024_pre_v2.so)
+for apples-to-apples regression checks.
 
 ### 2.4 Run
 
@@ -92,7 +111,7 @@ source .envrc.local && .venv/bin/python bench_mlc.py \
 
 | Build | Use case | Notes |
 |---|---|---|
-| [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/) | **default**, max throughput | Phase 6 fp16 KV with FlashInfer plumbed (FlashInfer auto-skips on sm_87) |
+| [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/) | **default**, max throughput | Phase 9b v2 (MoE dispatch + wmma m16n8k16) + FlashInfer (paged-decode/prefill linked). pp512 = 561.16 / tg512 = 54.35 on Orin AGX |
 | [dist/qwen3_6-35B-A3B-q4f16_1_tir/](dist/qwen3_6-35B-A3B-q4f16_1_tir/) | apples-to-apples vs int8 | fp16 KV, FlashInfer hard-disabled in compile flags |
 | [dist/qwen3_6-35B-A3B-q4f16_1_kvint8/](dist/qwen3_6-35B-A3B-q4f16_1_kvint8/) | capacity-bound (~2× context) | int8 KV; throughput-neutral but byte-divergent from fp16 (parity 2/5 EXACT, semantic drift only) |
 | [dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/](dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/) | reference for sm ≥ 89 port | fp8 KV; -25% on Orin (software fp8 dequant), preserved for Blackwell port |
