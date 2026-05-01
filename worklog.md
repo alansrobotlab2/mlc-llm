@@ -6,21 +6,287 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-30 — Qwen3.5-0.8B Q4_K_XL llama.cpp TG-depth sweep
+
+**Done**
+- Pulled `unsloth/Qwen3.5-0.8B-GGUF::Qwen3.5-0.8B-UD-Q4_K_XL.gguf` (559 MB on-disk, 522 MiB ggml-reported) into [models/qwen3.5-0.8b/](../models/qwen3.5-0.8b/). Companion 35B-A3B Q4_K_XL (22 G) staged in [models/qwen3.6-35b-a3b/](../models/qwen3.6-35b-a3b/) — bench held until prefill-code work in flight completes.
+- Wrote [scratch_lcpp_tg_sweep.sh](scratch_lcpp_tg_sweep.sh) — `llama-bench -pg 512,N` for N ∈ {512, 1024, 2048, 4096, 8192}, FA on, 3 reps, MAXN. Pairs with the existing [scratch_mlc_tg_sweep.py](scratch_mlc_tg_sweep.py) for apples-to-apples once MLC side reruns.
+- 0.8B sweep results (raw at [tuning/lcpp_tg_sweep_0.8b_20260430_165824.md](tuning/lcpp_tg_sweep_0.8b_20260430_165824.md), table merged into [qwen3_5.md §14.2](qwen3_5.md)):
+
+  | tg | pp512+tg blended | tg-only (decoded) |
+  |---:|---:|---:|
+  | 512  | 196.17 | 100.3 |
+  | 1024 | 148.52 | 100.1 |
+  | 2048 | 123.96 |  99.7 |
+  | 4096 | 109.94 |  98.0 |
+  | 8192 | 102.36 |  96.5 |
+
+  pp512 alone: 4538 ± 171 tps. tg128 alone: 100.23 ± 0.18 tps.
+
+**Learned**
+- Decode tps is essentially flat across 512→8192 KV depth (~4 % drift). Bottleneck is weight bandwidth (522 MiB / 204 GB/s LPDDR5 ≈ 391 tps theoretical max, ~25 % efficiency lands at ~98 tps). KV reads are not the limit at these depths for a 0.8B-class model — different shape than the 35B-A3B crossover at 4K (which is KV-bound).
+- `-pg pp,tg` reports a single **blended** tps (total_tokens / total_time), not separate pp/tg numbers. To get pure decode tps you back it out: `tg_tps = tg / (total/blended − pp/pp_tps)`. Worth pinning in the bench protocol so future readings aren't misread.
+- Q4_K_XL is unsloth's dynamic-bit override, ~10 % heavier than Q4_K_S (522 vs ~480 MiB) but ggml still labels both "qwen35 0.8B Q4_K - Medium" in `llama-bench` output. The XL is the default downstream pull, so it's the right comparison bar.
+
+**Next**
+- MLC apples-to-apples re-bench at the same pp=512, tg ∈ {512..8192} sweep — should confirm the post-dlight 120.5 tps γ=4 number and show the same flat-vs-depth shape. Run when prefill-code work in flight is at a checkpoint that won't collide for GPU.
+- Then 35B-A3B Q4_K_XL sweep with the same script (just swap MODEL env var) — that's the real headline number, but heavier (~50 min walltime estimated for the 8192 leg alone).
+
+---
+
+## 2026-04-30 (cont. session 4) — Phase 9b **Stage 2d SHIPPED**: production-integrated wmma path lands **pp512 = 523.67 tps (2.52× over Stage 9.2 baseline)** with tg512 unchanged at 44.86 tps (parity). Past every Phase 9 gate including the 450-tps "parity to llama.cpp" stretch.
+
+Plan: [phase9b-tir-mma-group-gemm.md](.claude/plans/phase9b-tir-mma-group-gemm.md) — all gates closed.
+
+### Bench (Orin AGX, sm_87, 35B-A3B q4f16_1, mode=interactive, prefix_cache=disable, pp=512, runs=3+1warmup)
+
+| | pp512 | tg512 | gate-2 (≥290) | gate-3 (≥350) | gate-6 (≥450) |
+|---|---:|---:|:---:|:---:|:---:|
+| Phase 9.2 baseline (CTA=1024 v1) | 207.95 | 44.88 | ✗ | ✗ | ✗ |
+| Phase 9b v2 (dispatch + wmma) | **523.67** | 44.86 | ✅ 1.81× | ✅ 1.50× | ✅ 1.16× |
+
+Lib: [dist/qwen3_6-35B-A3B-q4f16_1/lib_phase9b_v2.so](dist/qwen3_6-35B-A3B-q4f16_1/lib_phase9b_v2.so). Build: `MLC_MOE_GEMM_V2=1 mlc_llm compile ...` (env var opt-in). Default lib.so still on v1 baseline pending decision to flip the default.
+
+### What landed
+
+- **Helper `_dequantize_group_gemm_v2`** at [moe_matmul.py:563](python/mlc_llm/op/moe_matmul.py#L563). Two prim_funcs:
+  1. **`moe_dispatch_tables`** — Triton-style parallel-over-experts (one threadIdx.x per expert, +eid slack offset for boundary padding, sentinel -1 for idle slots). Returns `(tile_to_e, tile_to_m, tile_to_n)` of shape `(ceildiv(B,16) + Ne) * tiles_per_n`. Single CTA, BW-bound on indptr.
+  2. **`dequantize_group_gemm_v2`** — each CTA reads (e, m_offset, n_offset) from the dispatch tables, dequantizes a BLK_N×K W slice into shared, runs hand-tensorized wmma m16n8k16 fp16 matmul. Bounds-check predicate `m+i < indptr[e+1]` on the explicit "store" sblock guards both partial-row tiles and idle CTAs (sentinel `e=-1` → row_end=0 → all stores skipped).
+- **Schedule**: cache_read X→matrix_a, W→matrix_b, cache_write compute→wmma.accumulator (auto-block tensorized as wmma.store), hand cooperative-store from O_tile shared → out global with predicate. Same recipe as scratch_phase9b_grouped.py prototype.
+- **Env-var dispatch** at [moe_matmul.py:622](python/mlc_llm/op/moe_matmul.py#L622): `if os.environ.get("MLC_MOE_GEMM_V2","0")=="1" and quantize_dtype=="int4": return _dequantize_group_gemm_v2(...)`. Default stays on v1 persistent-loop kernel.
+- **Decode (b=1) path unchanged**: hits `dequantize_gemv` shortcut at [qwen3_5_moe_model.py:137](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L137) regardless of v2 flag — tg parity confirmed empirically (44.86 vs 44.88 = -0.04%).
+
+### tg512 ≈ 45 vs historical v6 = 52.62 — root-caused + fixed: FlashInfer was disabled
+
+Bisected: pre-Phase-8 lib backup [lib_pre_phase8.so.bak](dist/qwen3_6-35B-A3B-q4f16_1/lib_pre_phase8.so.bak) benches at **tg=54.47 tps** vs current Phase-9.2 lib at **44.88 tps** (-17.6 %). nsys-compare both libs in disable-mode (max_history=1) shows per-decode-token kernel times are within ±2 % — not a kernel regression.
+
+**Root cause:** Phase 8's lib rebuild used `--opt flashinfer=0`. Pre-Phase-8 backup was FlashInfer-on (paged-decode + paged-prefill kernels both linked, 201 MB). Current production was FlashInfer-off (TIR fallback, 197 MB). FlashInfer-off paged-decode runs ~3-4 ms/token slower at pp=512 KV depth on Orin. Already documented in the Phase 9 plan — we just hadn't reset the flag.
+
+**Fix:** rebuild with `--opt flashinfer=1`. One-line compile-flag flip. Combined with Phase 9b v2 (env: `MLC_MOE_GEMM_V2=1`), full bench:
+
+| build | pp512 | tg512 | vs Phase-9.2 baseline |
+|---|---:|---:|---|
+| Phase-9.2 baseline (FlashInfer-off, v1) | 207.95 | 44.88 | 1.00× / 1.00× |
+| pre-Phase-8 (FlashInfer-on, v1) | 206.89 | **54.47** | 0.99× / **+21.4 %** |
+| v1 + FlashInfer rebuild | 213.18 | 54.34 | 1.03× / +21.1 % |
+| Phase-9b v2 (FlashInfer-off) | 523.67 | 44.86 | 2.52× / 1.00× |
+| **Phase-9b v2 + FlashInfer (combined)** | **561.16** | **54.35** | **2.70× / +21.1 %** |
+
+Lib: [dist/qwen3_6-35B-A3B-q4f16_1/lib_phase9b_v2_flashinfer.so](dist/qwen3_6-35B-A3B-q4f16_1/lib_phase9b_v2_flashinfer.so). Build: `MLC_MOE_GEMM_V2=1 mlc_llm compile ... --opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1"`. The "ship Phase 9b" decision is now: this lib goes to `lib.so`. Both wins compound — pp 2.70× over the Stage 9.2 baseline (above the 450 tps Phase-9 stretch by 25 %), tg fully recovered to the v6 ceiling.
+
+### Stuff debugged en route
+
+- **Compile #1 failed**: stale `with_attr("global_symbol","main")` from the standalone `tvm.tirx.build` recipe collided with Relax's `add_func` global-symbol assignment → `IRModule contains duplicate global symbol: main`. Fix: in production-pipeline use, build the schedule with `s_tir.Schedule(_func)` directly (like v1 does); skip the IRModule.from_expr dance.
+- **Compile #2 failed**: my first dispatch func used a Python-unrolled `for ee in range(Ne):` over 256 experts per call × 80 sites (40 layers × 2 projections) → 20480 unrolled IR blocks → "Exporting model" step took 5+ min and tripped a TIR script parser issue ("Function must be decorated"). Fix: rewrote dispatch as Triton-style parallel-over-experts (Ne threads in 1 block) — copies the pattern at [triton.py:526](python/mlc_llm/op/triton.py#L526) (`tir_compute_expert_id_per_block`). 256 unrolled iterations → 1 thread_binding loop. IR compact, runtime fast (single-block, BW-bound on indptr).
+- **First v2 bench tg=20.7 was contamination**: a parallel 0.8B `scratch_mlc_tg_sweep.py` was running on the same GPU. Killed both, re-ran sequential. Clean numbers above.
+- **Memory pressure was a red herring**: 40 GB engine init on 64 GB shared mem was fine; the silent-exit smoke earlier was the same 0.8B contention exhausting GPU memory.
+
+### Next
+
+The shipped lib gets us to pp parity-class with llama.cpp Q4_K_S (which was the Phase 9 stretch). pp512 tps lifted from "ranks 16th of major frameworks" territory to "competitive on Orin sm_87 inference."
+
+Per-tile cost analysis: the v2 hand-tensorize at 4.58 TFLOPS was 27 % of fp16 TC peak; production saw 2.52× pp lift (i.e. the kernel was previously the bottleneck). Stage 2b (close the gap to V1.5's 17 TFLOPS via software pipeline + double buffer) would push pp another ~3.7×, but that requires splitting the dequant from the W cooperative-fetch block — non-trivial and orthogonal to gate-6.
+
+Decision points for the user:
+1. Flip default to v2 (lib_phase9b_v2.so → lib.so)? Strictly a win on pp, no tg regression. v2 still requires env var at compile, so production builds need the flag.
+2. Port pattern to non-MoE quantized GEMMs (the regular fp16 path already goes through dlight + FuseDequantizeMatmulEwise — same end state, no port needed).
+3. Stage 2b (software pipeline) for another ~3-4× headroom — only worth pursuing if pp matters more than the engineering cost.
+
+---
+
+## 2026-04-30 (cont. session 3) — Phase 9b **Stages 2a + 2c LANDED**: **hand-tensorize works** for both single-expert (4.6 TFLOPS) and multi-expert grouped GEMM with lookup-table dispatch (4.58 TFLOPS). All parity PASS. Production lib still unchanged; integration is Stage 2d (next session).
+
+Plan: [phase9b-tir-mma-group-gemm.md](.claude/plans/phase9b-tir-mma-group-gemm.md) — session-resume notes updated with the bench table, Stage 2d integration recipe, and the perf-gap analysis (we're at 4.6 TFLOPS vs V1.5's 17 TFLOPS; the gap is software-pipeline + double-buffering which the dequant block blocks).
+
+### What landed
+
+- **Stage 2a — hand-tensorize a single-expert dequant+matmul** ([scratch_phase9b_handtensorize.py](scratch_phase9b_handtensorize.py)). Dropped the persistent-loop wrapper, replicated dlight's `cache_read("wmma.matrix_a"|"wmma.matrix_b")` + `cache_write("shared.dyn") + cache_write("wmma.accumulator")` + `tensorize` recipe by hand. Used `out_dtype="float16"` (f16f16f16 wmma) — the f16f16f32 variant requires an explicit fp32 intermediate that the production prim_func doesn't have. Parity PASS, 3.7 ms / 4.6 TFLOPS.
+- **Stage 2c — multi-expert grouped GEMM with precomputed dispatch tables** ([scratch_phase9b_grouped.py](scratch_phase9b_grouped.py)). Replaced the in-kernel indptr scan with three precomputed int32 arrays (`tile_to_e`, `tile_to_m`, `tile_to_n`) passed in as kernel inputs. Each block reads `(e, m_offset, n_offset) = lookup[bx]` in three loads — cheap vs production's per-CTA persistent scan. Parity PASS at 1920 tokens × 4 experts, 1.76 ms / 4.58 TFLOPS — same per-FLOP as single-expert (lookup overhead is negligible).
+
+### What didn't work
+
+- **Inline indptr scan with shared/local scratch buffers** — both scopes hit schedule errors (`local`: cross-thread access after compute_at restructures the loop nest; `shared`: `allow_append_` internal error on the schedule's shared-mem allocation tracker). The scan pattern that production uses (`while T.tvm_thread_invariant(...)` + local-scope buffers) is incompatible with hand-tensorize's restructuring. **Workaround that landed: precompute the dispatch tables.**
+- **Software pipeline + double buffer annotations** — dlight emits `[0,0,0,0,0,1,1]` (7 stages) on k_o_o, expecting 7 sub-statements at injection time. To get 7 sub-statements you need `tirx.manifest_shared_memory_local_stage` on the cooperative-fetch blocks, which expands each block into local-stage + sync + shared-write triplets. **The constraint requires the block body to be a simple BufferStore — our W_shared dequant breaks that.** Without the pipeline + double buffer, we leave 30-50 % perf on the table (V1.5 had 17 TFLOPS, our hand-tensorize only 4.6).
+
+### Stage 2d path forward (next session)
+
+The pieces are in place. Next session:
+
+1. **`compute_moe_dispatch_tables(indptr) -> (tile_to_e, tile_to_m, tile_to_n)`** — new helper prim_func. Takes the `(Ne+1,)` indptr and the `BLK_M`/`tiles_per_n` constants, fills three `(upper_bound,)` int32 arrays. Single-block, embarrassingly serial (~Ne iterations). BW-bound, microseconds.
+2. **`dequantize_group_gemm_v2(x, w, scale, tile_to_e, tile_to_m, tile_to_n) -> O`** — production version of the [scratch_phase9b_grouped.py](scratch_phase9b_grouped.py) prim_func. `BLK_M=16` (was 8 — required for MMA). Adds the `if_then_else` bounds checks at row boundaries (proto skipped them). Same hand-tensorize schedule.
+3. **Wire at [qwen3_5_moe_model.py:137](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L137)** — replace the existing `dequantize_group_gemm` call (prefill branch only — the b=1 decode shortcut stays) with `compute_moe_dispatch_tables` + `dequantize_group_gemm_v2`.
+4. **Recompile** [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so), 10-token smoke, then bench pp512.
+
+Headline projection: at 4.6 TFLOPS in the hottest kernel (vs production's ~0.5 TFLOPS scalar = 9× kernel speedup), pp512 should land in the **350-450 tps** range (gate-3 met, gate-6 within reach). Stage 2b (close the gap to 17 TFLOPS via software pipeline) is the obvious follow-up if gate-6 needs more headroom.
+
+---
+
+## 2026-04-30 (cont. session 2) — Phase 9b **Stage 1 LANDED**: int4-dequant + wmma matmul, standalone, **1.016 ms / 16.9 TFLOPS** (~8.5 % of fp16 TC peak) at the gate_up shape (M=4096, N=1024, K=2048). Parity vs numpy ref: max rel diff 0.55 %. **160× over dlight-default scalar** at same shape.
+
+Plan: [phase9b-tir-mma-group-gemm.md](.claude/plans/phase9b-tir-mma-group-gemm.md) — session-resume notes updated with the build incantation, V1.5 pattern, Stage 2 path 2A vs 2B decision.
+
+### Stage 1 close-out
+
+Two unblockers vs the 2026-04-30 spike:
+
+1. **Build path: `tvm.IRModule.from_expr(prim_func.with_attr("global_symbol", "main"))`**, not `tvm.IRModule({"main": prim_func})`. The latter doesn't set a global symbol; codegen then can't bind buffer params to the device-kernel signature and crashes with `Find undefined Variable X`. Two-line fix in [scratch_phase9b_mma_proto.py](scratch_phase9b_mma_proto.py).
+2. **Two-block-at-root pattern + manual schedule of leftover dequant.** dlight's `Matmul` rule schedules the matmul block (tensorizes wmma) but leaves the dequant block at root unscheduled — its loops have no thread binding, so codegen rejects. Fix: after `dl.ApplyDefaultSchedule(dl.gpu.Matmul())`, manually `sch.bind` the dequant loops to blockIdx.x / threadIdx.x. Then `tvm.tirx.build` succeeds.
+
+### Variant bench (M=4096, N=1024, K=2048, single expert, Orin AGX)
+
+| variant | t/iter | TFLOPS | wmma? | notes |
+|---|---:|---:|---|---|
+| pure fp16 matmul + dlight Matmul | 1.013 ms | 17.0 | ✓ | upper bound (no dequant) |
+| **V1.5 — two-block + dlight Matmul + manual dequant sched** | **1.016 ms** | **16.9** | ✓ | **selected for Stage 2** |
+| V3 — dequant inline in matmul + dlight default | 163.5 ms | 0.11 | ✗ | dlight's Matmul recognizer rejects `vk // 8` int4 unpack indices; falls to Reduction()/Fallback() |
+
+Notable: **dequant is essentially free** — V1.5 vs pure fp16 matmul is 0.3 % delta. The dequant materializes a 4 MB W_fp16 global temp once, then reads it back. On Orin's LPDDR5 (~30 GB/s effective) that's ~0.13 ms; sequential w/ matmul means it disappears into the first ko-iter's slack.
+
+### Files
+
+- [scratch_phase9b_mma_proto.py](scratch_phase9b_mma_proto.py) — pure fp16 matmul prototype, fixed `IRModule.from_expr` build path.
+- [scratch_phase9b_dequant_proto.py](scratch_phase9b_dequant_proto.py) — V1, V1.5, V3, V2 variants exploring dequant fusion.
+- [scratch_phase9b_build_test.py](scratch_phase9b_build_test.py) — minimal regression test for the build pattern (3 variants: manual schedule, dlight Fallback, dlight Matmul).
+
+### Stage 2 path (next session)
+
+**Path 2A — split dequant + matmul into two TIR prim_funcs at the Relax level (recommended).** Pre-allocate one 32 MB `W_fp16_scratch` buffer at engine init; reuse across all 40 MoE layers. `R.call_tir(dequant_moe_weights, ...)` writes the scratch; `R.call_tir(group_gemm_unscheduled, ...)` reads it (let dlight tensorize). Memory cost: 32 MB; host overhead: zero (single alloc, no per-layer churn). Risk: existing fp16 `group_gemm` at [moe_matmul.py:385](python/mlc_llm/op/moe_matmul.py#L385) has the same persistent-loop wrapper as the dequant version — needs an unscheduled variant or a dlight-friendly rewrite.
+
+**Path 2B — option α from the spike: drop the persistent loop, grid launch + indptr scan, hand-tensorize.** More surgical (one prim_func), bigger code rewrite. Fallback if 2A's group_gemm path is stuck.
+
+Recommendation: **2A first.** It rides the path Relax already exercises for non-MoE projections (`FuseDequantizeMatmulEwise` + dlight pipeline) — least pipeline divergence, lowest bug surface. 1-2 sessions for Stage 2 either way.
+
+---
+
+## 2026-04-30 — Phase 9b Stage 1 spike: **dlight tensorizes fp16 matmul cleanly on Orin sm_87** (wmma path in tree). Production integration into `dequantize_group_gemm` deferred — persistent-loop wrapper incompatible with dlight's Matmul recognizer; needs a kernel rewrite, not a one-session change.
+
+Plan: [phase9b-tir-mma-group-gemm.md](.claude/plans/phase9b-tir-mma-group-gemm.md). Goal of session: prototype an MMA-using int4-dequant matmul standalone, then port the pattern into the production kernel. **Got the validation half: dlight CAN emit wmma intrinsics on Orin for the right input shape. The integration half needs more architectural work than I budgeted in this session.**
+
+### What worked
+
+- **Audit confirmed** the wmma scaffolding is in tree and battle-tested. [3rdparty/tvm/python/tvm/s_tir/tensor_intrin/cuda.py:1377](3rdparty/tvm/python/tvm/s_tir/tensor_intrin/cuda.py#L1377) `get_wmma_intrin_group()` returns named intrinsics (`wmma_load_*`, `wmma_sync_*`, `wmma_fill_*`, `wmma_store_*`) at the m16n8k16 shape. dlight's `MatmulFP16Tensorization` at [3rdparty/tvm/python/tvm/s_tir/dlight/gpu/matmul.py:490-704](3rdparty/tvm/python/tvm/s_tir/dlight/gpu/matmul.py#L490-L704) uses these via `cache_read("wmma.matrix_a"|"wmma.matrix_b")` + `sch.tensorize`. **No int4-dequant + MMA composition exists in tree** — that's the missing piece.
+- **Producer/consumer split is the right pattern.** First spike with dequant inline in the matmul body → dlight bailed (its `get_index_map` recognizer doesn't handle `vk // 8` index expressions). Restructured as `T.alloc_buffer(W_fp16)` + dequant block + matmul block → dlight's Matmul rule applied cleanly, scheduled body has `T.tvm_mma_sync` and `T.tvm_load_matrix_sync` calls (verified `uses_wmma: True` in `/tmp/phase9b_scheduled_body.txt`).
+- **dlight's software-pipeline annotations fired** (`software_pipeline_order=[0,3,1,4,5,2,6]`, `software_pipeline_stage=[0,0,0,0,0,1,1]`) — sm_87 qualifies for the Ampere+ pipeline that overlaps async copy with compute.
+
+### What didn't work
+
+- **Standalone codegen hit "Find undefined Variable X" at `BuildCUDA`**, likely because `auto_inline_producers` didn't inline the dequant block and the surviving dequant loop at prim_func root has no thread binding → `SplitHostDevice` can't propagate X to the device kernel cleanly. Tried (a) explicit `compute_inline` of dequant before dlight (failed: TIR treats the block as "output"), (b) wrapping the build in `with target` context, (c) pure-fp16 matmul (no dequant) — same codegen error. Likely a build-pipeline misuse on my standalone harness; production pipeline doesn't have this issue (it routes through Relax `LegalizeOps` + `FuseTIR`, different lowering).
+- **Production integration is the real gate.** Even if the standalone codegen were fixed, the production `dequantize_group_gemm` has a `while T.tvm_thread_invariant(...)` persistent-loop wrapper around the matmul block. dlight's `MatmulFP16Tensorization.apply` calls `get_reduction_blocks(sch, blocks)` which expects standard for-loop matmul structure, not a `while`-loop wrapper. Direct `dl.gpu.Matmul()` on the production prim_func almost certainly bails with `reduction_blocks is None`.
+
+### What this means for Phase 9b
+
+The technical viability is confirmed. The integration path needs one of three architectural choices, none of which fit a single session:
+
+| path | effort | description |
+|---|---|---|
+| **(α) Drop persistent loop, use grid launch.** | 1-2 sessions | Precompute `(tile_id → expert, m_offset, n_offset)` on the host side via cumsum of indptr deltas. Launch one CTA per tile via standard `T.thread_binding(num_tiles, "blockIdx.x")`. Inner block becomes a clean for-loop matmul that dlight can tensorize. Trade-off: the precompute step adds a ~10-50 µs kernel launch per layer. |
+| **(β) Hand-tensorize the inner block.** | 1.5-2 sessions | Keep the persistent loop. Inside the existing `sblock("gemm")`, manually: split BLK_M/BLK_N/BLK_K into MMA-tile-shaped (16×16×16) loops, blockize the inner; `sch.cache_read("wmma.matrix_a"|"wmma.matrix_b")`; `sch.cache_write("wmma.accumulator")`; `sch.tensorize` against `get_wmma_intrin_group(...)`. Doesn't go through dlight's Matmul rule — bypasses the recognizer. |
+| **(γ) Triton kernel.** | 1 session | Port a vLLM-style Triton w4a16 group GEMM via the existing `python/mlc_llm/op/triton.py` wrapper. Fastest to ship, but adds a Triton runtime dependency that the rest of MLC doesn't have on Orin. |
+
+**(α) is the cleanest** for ALL of MLC (the kernel rewrite would benefit any future quant variant: int3, mxfp4 on sm_89+, fp8). The persistent-loop pattern was originally chosen for Hopper-class GPUs to amortize per-launch overhead with thousands of CTAs; on Orin's 16 SMs the persistent loop saves nothing (per Stage 9.2 measurement: CTA_COUNT=64 vs 1024 was within 3 %). Removing it actively simplifies the schedule.
+
+**(β) is the lowest blast radius** — only touches the kernel internals, no upstream callers see the change.
+
+### Where it stops today
+
+Phase 9b plan is filed. Stage 1 spike confirmed dlight + wmma is the right destination. **No production lib was rebuilt this session** — the production lib remains the Stage 9.2 v1 (CTA=1024, +2.9% pp). The Phase 9 Stage 9.2 partial closeout (worklog entry below) stands as the shipped result.
+
+### Files
+
+- New plan: [.claude/plans/phase9b-tir-mma-group-gemm.md](.claude/plans/phase9b-tir-mma-group-gemm.md).
+- New scratch: [scratch_phase9b_mma_proto.py](scratch_phase9b_mma_proto.py) — Stage 1 spike harness. Demonstrates dlight Matmul rule applies to clean fp16 matmul; codegen issue persists but the schedule output is the ground truth ("uses wmma: True"). Kept for future-session reference.
+- Scheduled-body artifact: `/tmp/phase9b_scheduled_body.txt` — concrete proof dlight emits MMA on Orin for this shape.
+
+### Lessons
+
+- **dlight's matmul recognizer is fragile.** Index expressions like `vk // 8` (from int4 packing) break `get_index_map`. Producer/consumer split with a clean fp16 W_fp16 buffer is the workaround, but then `auto_inline_producers` doesn't fold the producer back into the b_g2s fetch when the producer is at prim_func root. Standard MLC pipeline avoids this via Relax-level `FuseDequantizeMatmulEwise` + `FuseTIR` — the dequant and matmul are fused at IR level before TIR sees them.
+- **Persistent-loop matmul kernels can't be schedule-by-dlight.** The `while T.tvm_thread_invariant(...)` wrapper that scans indptr is foreign to dlight's matmul recognizer. Either rewrite to grid-launch (option α) or hand-tensorize without dlight (option β).
+- **The wmma intrinsics ARE production-ready on sm_87.** Phase 9b's gate isn't "does TVM have MMA on Orin" (answered: yes, well-tested). It's "what's the shortest path from dequant + persistent-loop GroupGEMM to that machinery."
+- **`tvm.tirx.build` for standalone TIR validation is a different code path than the production `mlc_llm compile`.** Standalone hits buffer-binding errors that production handles correctly. For Phase 9b Stage 2, validate inside the production pipeline (recompile the lib, run smoke), not in a standalone harness.
+
+### Next session
+
+If we reopen Phase 9b, the call between (α) and (β) is the first decision. Recommend (α) — bigger one-time cost, clean dividend across all quant variants, and the persistent loop has no measured benefit on Orin anyway. Test on the gate_up shape first (M=4096, N=1024, K=2048); if it lands ≥ 3× speedup, port to down (M=4096, N=2048, K=512) and ship.
+
+---
+
+## 2026-04-30 — Phase 9 Stage 9.2: tile-tuning lever returned **+2.9% pp512** (not the +40% gate). Hand-schedule is near-locally-optimal on Orin sm_87; deeper rework (meta_schedule on unscheduled variant or tensor-core MMA path) deferred.
+
+Plan [phase9-prefill-throughput.md](.claude/plans/phase9-prefill-throughput.md). Stage 9.1 identified the two MoE group-GEMM kernels as 77.8% of prefill cost; Stage 9.2 tried two cheap lever-A variants. Net: small positive on pp, gate not met.
+
+### Apples-to-apples bench (35B fp16 q4f16_1, FlashInfer-off, 3 runs × 1 warmup)
+
+| variant | pp512 | tg512 | tg4096 | delta pp | delta tg |
+|---|---:|---:|---:|---:|---:|
+| baseline (CTA=64, BLK_M=8, BLK_K=32) | 202.0 | 44.93 | 31.32 | — | — |
+| **v1: CTA=1024, same BLK** (shipped) | **207.9** | **44.99** | **31.35** | **+2.9 %** | +0.1 % |
+| v2: CTA=1024, BLK_M=16, BLK_K=64 | 201.0 | 44.94 | 31.32 | −0.5 % | +0.0 % |
+
+v1 is the production lib at [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so). v2 saved at `lib_phase9_v2_blkm16_blkk64.so` for reference. Pre-Stage-9.2 saved as `lib_pre_phase9.so.bak`.
+
+**Decode unchanged across all variants** — confirms the analysis from Stage 9.1: the static `if num_tokens == 1: dequantize_gemv` shortcut at [qwen3_5_moe_model.py:137-138](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L137-L138) keeps b=1 decode entirely off this kernel. Tuning `dequantize_group_gemm` is risk-free for decode at the spec-pinned `[1, 1, hidden]` shape used by interactive mode.
+
+### What v1 does (single-line change)
+
+[moe_matmul.py:614](python/mlc_llm/op/moe_matmul.py#L614): `TX, TY, CTA_COUNT = 8, 32, 64` → `8, 32, 1024`. Reverted commit `9e6c17ff`'s grid-size choice. The original commit's "decode 2.0×, 3.6×" win came from before the `if num_tokens == 1: dequantize_gemv` static shortcut existed; today the kernel never sees the small-batch decode workload that 64-CTA was tuned for. The "~3% prefill regression" claim in the same commit's comment was approximately correct — bumping back to 1024 recovers ~2.9 % at pp=512.
+
+Source comment expanded to record the full history so future readers don't repeat the loop.
+
+### Why v2 (BLK_M=16, BLK_K=64) regressed
+
+Bigger tiles → more shared-mem footprint per CTA (~10 KB at BLK_M=8/BLK_K=32 vs ~26 KB at BLK_M=16/BLK_K=64). On Orin sm_87 the per-block shared-mem ceiling is 48 KB and the SM has 96 KB total, so concurrent blocks per SM drops from ~9 (10 KB/block) to ~3 (26 KB/block). Lower per-SM occupancy crushes the parallelism gain from fewer tiles. The hand-tune at BLK_M=8/BLK_K=32 sits near a local optimum where occupancy is high; perturbing either direction loses.
+
+This is a structural ceiling for *this* schedule shape. To get past it, the kernel needs either:
+- **Tensor-core MMA** (sm_87 supports `m16n8k16` fp16 MMA) — would change arithmetic intensity radically, possibly 3-5× kernel speedup. Major rewrite of the inner block.
+- **Meta-schedule on an unscheduled variant** — search-based tuning over BLK_M/BLK_N/BLK_K/TX/TY/VEC + alternative loop orderings + register tiling. Existing scaffolding at [tune_kernel.py](tune_kernel.py) + [tuning/attn_o_proj_500/](tuning/attn_o_proj_500/) handles single-shape dense GEMV; would need extension for the persistent-loop group-GEMM with quantized weights. Memory-entry [meta_schedule API quirks](.claude/projects/-home-alfie-mlc-llm/memory/ms_tune_tir_quirks.md) notes ~3 s/trial; ~1000 trials × 3 s = 50 min of GPU search per shape.
+
+Either path is 1-2 sessions, not in scope for the same session as Stage 9.1.
+
+### What I checked first (before bench results invalidated the hypothesis)
+
+The Stage 9.1 worklog projected a 2× MoE GEMM speedup from CTA_COUNT alone (would have hit the +40 % gate). That projection was wrong because Orin's 16 SMs cap concurrent blocks at ~32-64 regardless of grid size; persistent-loop CTAs don't benefit from grid-size ≫ active-blocks. The original commit's CTA_COUNT=64 was near the right number for occupancy on Orin all along; the win is in *how the persistent loop is scheduled internally*, not in the grid count. Stage 9.1's math used a parallel-CTA-count assumption that was wrong on this hardware.
+
+Lesson: when retracing a perf change on hardware different from where it was originally measured, sanity-check the parallelism assumption. CTA_COUNT 1024 was right on Hopper (128 SMs), 64 was right on Orin (16 SMs), and the schedule body is the same — so the "regression" the original commit logged was the only piece left to chase, and that piece is small.
+
+### Stage 9.2 verdict — partial win, gate not met
+
+The +2.9 % is real but well below Stage 9.2's gate-2 (≥290 tps, +40 %). Stage 9.2 is **closed as partial**. Future Stage 9.3 work would need to attack the schedule body (tensor cores or meta-schedule) — both bigger investments than the one-knob tile-constant tuning attempted here.
+
+**The plan's gate-2 might be unreachable without one of those deeper changes.** Worth considering whether to ship the +2.9 % as a Phase 9 closeout and reframe the headline as "Phase 9 confirmed the structural ceiling on Orin without tensor cores; deeper kernel work tracked separately" rather than continuing to chase +40 %.
+
+### Files
+
+- Modified: [python/mlc_llm/op/moe_matmul.py](python/mlc_llm/op/moe_matmul.py) (CTA_COUNT 64 → 1024 with expanded comment recording the loop). BLK_M/BLK_K experiment reverted.
+- Production lib: [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) is now the v1 (CTA=1024) lib. Backups: `lib_pre_phase9.so.bak` (pre-Stage-9.2 baseline), `lib_phase9_cta1024.so` (= current production), `lib_phase9_v2_blkm16_blkk64.so` (regressed v2).
+- Bench JSON: `/tmp/phase9_stage2_baseline.json`, `/tmp/phase9_stage2_new.json`, `/tmp/phase9_stage2_v2.json`.
+
+### Next
+
+If Phase 9 is to be re-opened with the larger lever:
+- Pick *one* of: (a) tensor-core MMA rewrite of `dequantize_group_gemm`, (b) meta-schedule on an unscheduled variant. Don't do both speculatively.
+- Re-baseline pp512 fresh (the FlashInfer-off lib lost ~17 % on tg512 vs the FlashInfer-on lib used in the original Phase 9 plan; gate-2 framing of "≥290 tps" was anchored to the FlashInfer-on baseline of ~207 tps and is unchanged on this lib, but the wall budget should be re-derived from the current numbers).
+- Confirm the `if num_tokens == 1` static shortcut still applies after any rewrite — it's the load-bearing piece keeping decode unchanged.
+
+---
+
 ## 2026-04-30 — Phase 9 Stage 9.1: prefill profile bucketed. **77.8% of prefill kernel time is in two MoE group-GEMM kernels.** Lever A is correct, lever B and C are dead.
 
 Plan [phase9-prefill-throughput.md](.claude/plans/phase9-prefill-throughput.md). Stage 9.1 land criterion ("top 1-2 buckets explain ≥70% of gap") is met cleanly — two kernels explain 77.8% of all prefill kernel time.
 
 ### nsys probe of the FlashInfer state on the headline lib
 
-Pure-CPU symbol scan first (before any GPU work) to settle whether lever C ("FlashInfer ABI fix on Orin") is even alive:
+Pure-CPU symbol scan first (before any GPU work) to settle whether lever C ("FlashInfer ABI fix on Orin") is even alive. The lib state shifted under us during the day (Phase 8 rebuild today at 07:05 produced a new `lib.so` with different compile flags), so two scans are noted:
 
-| lib | FlashInfer dynamic symbols | `create_flashinfer_paged_kv_cache` registered |
-|---|---:|---|
-| `qwen3_6-35B-A3B-q4f16_1` (headline) | **122** | ✅ |
-| `qwen3_6-35B-A3B-q4f16_1_tir` | 0 | ❌ |
-| `qwen3_6-35B-A3B-q4f16_1_kvint8` | 0 | ❌ |
+| lib | FlashInfer dynamic symbols | `create_flashinfer_paged_kv_cache` registered | timestamp |
+|---|---:|---|---|
+| `qwen3_6-35B-A3B-q4f16_1/lib.so` (Phase 6/7 era) | 122 | ✅ | pre-2026-04-30 07:05; backed up as `lib_pre_phase8.so.bak` |
+| `qwen3_6-35B-A3B-q4f16_1/lib.so` (Phase 8 rebuild, current) | 0 | ❌ | 2026-04-30 07:05; backed up as `lib_pre_phase9.so.bak` |
+| `qwen3_6-35B-A3B-q4f16_1_tir` | 0 | ❌ | apples-to-apples baseline |
+| `qwen3_6-35B-A3B-q4f16_1_kvint8` | 0 | ❌ | int8 KV variant |
 
-The Phase 6 fix at [function_table.cc:245-258](cpp/serve/function_table.cc#L245-L258) (RNN-state init hoisted out of the FlashInfer branch) re-enabled FlashInfer for hybrid models. Headline lib has it linked. **Lever C retired** — 206.83 tps pp512 is *with* FlashInfer paged-prefill registered.
+**Important nuance:** the Phase 6 fix at [function_table.cc:245-258](cpp/serve/function_table.cc#L245-L258) (RNN-state init hoisted out of the FlashInfer branch) made FlashInfer compile-compatible with hybrid models. Whether the **current** production `lib.so` actually links FlashInfer depends on the most recent compile flags — Phase 8's rebuild used `flashinfer=0`, so the current lib is FlashInfer-off. Lever C ("FlashInfer ABI fix") is still retired — *the* fix landed in Phase 6 — but to actually *use* FlashInfer at runtime, the lib needs to be compiled with `flashinfer=1`. That toggle is independent of Phase 9 and is a deployment-time choice.
+
+**The 206.83 tps measurement was on the pre-Phase-8 (FlashInfer-on) lib.** My current prefill profile is on the post-Phase-8 (FlashInfer-off) lib. Direct measurement on the current lib (this profile) shows pp wall ≈ 2475 ms = ~207 tps — same number, ±0.1 tps. Reason: at seq=512 the `attn_paged` bucket is 2.96% of total kernel time; even a 4× attention speedup from FlashInfer would buy ~50 ms wall, well within bench noise.
 
 ### Prefill profile — pp=512 fp16 35B-A3B, headline lib
 

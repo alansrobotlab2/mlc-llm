@@ -631,6 +631,22 @@ The 4K regression has the same shape as the 35B-A3B crossover — KV-cache read 
 
 Best practical lib for the 0.8B is the spec-decode build at [dist/qwen3_5-0.8B-q0f16-mtp/](dist/qwen3_5-0.8B-q0f16-mtp/) + draft at [dist/qwen3_5-0.8B-q0f16-mtp-draft/](dist/qwen3_5-0.8B-q0f16-mtp-draft/) — γ=4 lands 120.5 tps decode with byte-identical parity to target_only. The integrated lib does not need separate compile flags.
 
+**Q4_K_XL TG-depth sweep (2026-04-30, llama.cpp standalone, FA on, MAXN, 3 reps).** Bench is `llama-bench -pg 512,N -fa 1` for N ∈ {512, 1024, 2048, 4096, 8192}; weights file [models/qwen3.5-0.8b/Qwen3.5-0.8B-UD-Q4_K_XL.gguf](../models/qwen3.5-0.8b/Qwen3.5-0.8B-UD-Q4_K_XL.gguf) (522 MiB, ggml labels it "qwen35 0.8B Q4_K - Medium" — `XL` is unsloth's dynamic-bit override, not a base ggml quant). Run script: [scratch_lcpp_tg_sweep.sh](scratch_lcpp_tg_sweep.sh); raw output [tuning/lcpp_tg_sweep_0.8b_20260430_165824.md](tuning/lcpp_tg_sweep_0.8b_20260430_165824.md).
+
+| test            | reported tps | tg-only tps¹ |
+|-----------------|---:|---:|
+| pp512 (prefill) | 4538.5 ± 171 | — |
+| tg128 (no pp)   | 100.23 ± 0.18 | 100.2 |
+| pp512 + tg512   | 196.17 ± 0.05 | 100.3 |
+| pp512 + tg1024  | 148.52 ± 0.05 | 100.1 |
+| pp512 + tg2048  | 123.96 ± 0.03 | 99.7 |
+| pp512 + tg4096  | 109.94 ± 0.47 | 98.0 |
+| pp512 + tg8192  | 102.36 ± 0.71 | 96.5 |
+
+¹ Pure decode tps backed out of the blended `-pg` measurement: `tg_tps = tg / (total/blended − pp/pp_tps)`.
+
+Decode is essentially flat across 0.5K → 8K depth (~4 % drift). The ~100 tps ceiling is weight-bandwidth bound (522 MiB / ~204 GB/s ≈ 391 tps theoretical, ~25 % achieved efficiency = ~98 tps). KV cache at 16 layers × small head dim is well under bandwidth at these depths. MLC parity bench against this Q4_K_XL baseline is the next step (the existing §14.2 table is Q4_K_S and is now superseded as the comparison bar — Q4_K_XL is the unsloth default that downstream users actually pull).
+
 ### 14.3 KV-cache dtype variants (35B-A3B)
 
 Phase 5 (fp8) and Phase 6 (int8) shipped the dtype-split refactor. fp8 is structurally a loss on Orin (software dequant); int8 is throughput-neutral but byte-divergent from fp16. Apples-to-apples (TIR kv_cache for both, FlashInfer disabled in fp16 lib for fair compare):

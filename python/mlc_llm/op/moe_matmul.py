@@ -1,5 +1,6 @@
 """Mixture of Experts operators"""
 
+import os
 from typing import Literal, Optional, Tuple  # noqa: UP035
 
 from tvm import DataType, DataTypeCode, s_tir, tirx
@@ -559,6 +560,274 @@ def group_gemm(x: Tensor, w: Tensor, indptr: Tensor):
     )
 
 
+def _dequantize_group_gemm_v2(
+    x: Tensor,
+    w: Tensor,
+    scale: Tensor,
+    indptr: Tensor,
+    quantize_dtype: str,
+    indptr_dtype: str,
+    group_size: int,
+) -> Tensor:
+    """v2 path — dispatch tables + hand-tensorized wmma matmul.
+
+    Phase 9b. Replaces the persistent-loop kernel with two prim_funcs:
+    1. compute_moe_dispatch_tables: walks indptr, fills (tile_to_e, tile_to_m,
+       tile_to_n) lookup tables sized to upper bound. Idle entries get
+       sentinel tile_to_e = -1.
+    2. dequantize_group_gemm_v2: each CTA reads its (e, m, n) from the
+       lookup, dequantizes a BLK_N×K W slice into shared, and runs a
+       hand-tensorized wmma.m16n8k16 matmul. Bounds-checked X reads + O
+       writes guard against unaligned per-expert token counts.
+
+    Selected via env var MLC_MOE_GEMM_V2=1; default stays on the v1
+    persistent-loop kernel.
+    """
+    assert quantize_dtype == "int4", "v2 currently restricted to int4 quant (35B-A3B)"
+    (_, in_features), model_dtype = x.shape, x.dtype
+    (num_local_experts, out_features, _), storage_dtype = w.shape, w.dtype
+    quantize_dtype_bits = DataType(quantize_dtype).bits
+    num_elem_per_storage = DataType(storage_dtype).bits // quantize_dtype_bits
+    num_group = (in_features + group_size - 1) // group_size
+    num_storage = group_size // num_elem_per_storage * num_group
+
+    Ne, N, K = num_local_experts, out_features, in_features
+    BLK_M, BLK_N, BLK_K = 16, 128, 32  # BLK_M=16 required for wmma m16n8k16
+    MICRO = 16
+    tiles_per_n = (N + BLK_N - 1) // BLK_N
+    assert N % BLK_N == 0, "v2 requires N % BLK_N == 0 (no col padding)"
+
+    B = x.shape[0]
+    upper = (tirx.ceildiv(B, BLK_M) + Ne) * tiles_per_n
+
+    # ---------- prim_func 1: dispatch-table compute ----------
+    # Triton-style parallel-over-experts dispatch. Each thread handles one
+    # expert: it walks its own run of m-tiles in the 1D grid (with a +eid
+    # slack offset that gives every expert at least 1 padding tile worth of
+    # private indices), then fans m-tiles into n-tiles and writes (te,tm,tn).
+    # Slack tiles between consecutive experts get sentinel te=-1.
+    @T.prim_func(private=True)
+    def _dispatch_func(
+        indptr_buf: T.Buffer((Ne + 1,), indptr_dtype),
+        var_te: T.handle,
+        var_tm: T.handle,
+        var_tn: T.handle,
+    ):
+        T.func_attr({"tirx.is_scheduled": 1, "tirx.noalias": True})
+        UPPER = T.int32(is_size_var=True)
+        te = T.match_buffer(var_te, (UPPER,), "int32")
+        tm = T.match_buffer(var_tm, (UPPER,), "int32")
+        tn = T.match_buffer(var_tn, (UPPER,), "int32")
+
+        with T.sblock("root"):
+            for eid in T.thread_binding(0, Ne, thread="threadIdx.x"):
+                sb: T.int32 = T.ceildiv(indptr_buf[eid], BLK_M) + eid
+                nb: T.int32 = T.ceildiv(indptr_buf[eid + 1] - indptr_buf[eid], BLK_M)
+                sb_next: T.int32 = T.ceildiv(indptr_buf[eid + 1], BLK_M) + eid + 1
+                for tmi in T.serial(nb):
+                    for tni in T.serial(tiles_per_n):
+                        te[(sb + tmi) * tiles_per_n + tni] = eid
+                        tm[(sb + tmi) * tiles_per_n + tni] = indptr_buf[eid] + tmi * BLK_M
+                        tn[(sb + tmi) * tiles_per_n + tni] = tni * BLK_N
+                for sl in T.serial(sb_next - (sb + nb)):
+                    for tni in T.serial(tiles_per_n):
+                        te[(sb + nb + sl) * tiles_per_n + tni] = -1
+                        tm[(sb + nb + sl) * tiles_per_n + tni] = 0
+                        tn[(sb + nb + sl) * tiles_per_n + tni] = 0
+
+    te_t, tm_t, tn_t = op.tensor_ir_op(
+        _dispatch_func,
+        "moe_dispatch_tables",
+        args=[indptr],
+        out=(
+            Tensor.placeholder([upper], "int32"),
+            Tensor.placeholder([upper], "int32"),
+            Tensor.placeholder([upper], "int32"),
+        ),
+    )
+
+    # ---------- prim_func 2: dispatch-driven dequant + tensorized matmul ----------
+    zero_f16 = T.float16(0.0)
+
+    @T.prim_func(private=True)
+    def _gemm_v2_func(
+        var_x: T.handle,
+        W_q: T.Buffer((Ne, N, num_storage), storage_dtype),
+        Scale: T.Buffer((Ne, N, num_group), model_dtype),
+        indptr_buf: T.Buffer((Ne + 1,), indptr_dtype),
+        var_te: T.handle,
+        var_tm: T.handle,
+        var_tn: T.handle,
+        var_o: T.handle,
+    ):
+        T.func_attr({"tirx.noalias": True})
+        Bv = T.int32(is_size_var=True)
+        UPPER = T.int32(is_size_var=True)
+        X = T.match_buffer(var_x, (Bv, K), model_dtype)
+        out = T.match_buffer(var_o, (Bv, N), model_dtype)
+        te = T.match_buffer(var_te, (UPPER,), "int32")
+        tm = T.match_buffer(var_tm, (UPPER,), "int32")
+        tn = T.match_buffer(var_tn, (UPPER,), "int32")
+
+        for _bx in T.thread_binding(UPPER, thread="blockIdx.x"):
+            with T.sblock("CTA"):
+                bx = T.axis.spatial(UPPER, _bx)
+                T.reads(X[:, :], W_q[:, :, :], Scale[:, :, :], indptr_buf[:],
+                        te[:], tm[:], tn[:])
+                T.writes(out[:, :])
+
+                X_tile = T.sblock_alloc_buffer((BLK_M, K), model_dtype, scope="shared.dyn")
+                W_tile = T.sblock_alloc_buffer((BLK_N, K), model_dtype, scope="shared.dyn")
+                O_tile = T.sblock_alloc_buffer((BLK_M, BLK_N), model_dtype, scope="shared.dyn")
+
+                e_v = te[bx]
+                m_offset = tm[bx]
+                n_offset = tn[bx]
+                row_end = T.if_then_else(e_v >= 0, indptr_buf[e_v + 1], 0)
+                e_safe = T.if_then_else(e_v >= 0, e_v, 0)
+
+                for a0, a1 in T.grid(BLK_M, K):
+                    with T.sblock("X_shared"):
+                        i, j = T.axis.remap("SS", [a0, a1])
+                        X_tile[i, j] = T.if_then_else(
+                            m_offset + i < row_end,
+                            X[m_offset + i, j],
+                            zero_f16,
+                        )
+
+                for a0, a1 in T.grid(BLK_N, K):
+                    with T.sblock("W_shared"):
+                        i, j = T.axis.remap("SS", [a0, a1])
+                        shift = T.Cast(storage_dtype, (j % num_elem_per_storage) * quantize_dtype_bits)
+                        w_int = T.Cast(
+                            model_dtype,
+                            T.bitwise_and(
+                                T.shift_right(
+                                    W_q[e_safe, n_offset + i, j // num_elem_per_storage],
+                                    shift,
+                                ),
+                                T.Cast(storage_dtype, (1 << quantize_dtype_bits) - 1),
+                            ),
+                        )
+                        W_tile[i, j] = (w_int - T.Cast(model_dtype, (1 << (quantize_dtype_bits - 1)) - 1)) * Scale[
+                            e_safe, n_offset + i, j // group_size
+                        ]
+
+                for a0, a1, a2 in T.grid(BLK_M, BLK_N, K):
+                    with T.sblock("compute"):
+                        i, j, k = T.axis.remap("SSR", [a0, a1, a2])
+                        with T.init():
+                            O_tile[i, j] = zero_f16
+                        O_tile[i, j] = O_tile[i, j] + X_tile[i, k] * W_tile[j, k]
+
+                for a0, a1 in T.grid(BLK_M, BLK_N):
+                    with T.sblock("store"):
+                        i, j = T.axis.remap("SS", [a0, a1])
+                        if m_offset + i < row_end:
+                            out[m_offset + i, n_offset + j] = O_tile[i, j]
+
+    # ---------- schedule: hand-tensorize wmma m16n8k16 ----------
+    def _schedule_v2():
+        from tvm.s_tir.tensor_intrin.cuda import get_wmma_intrin_group
+
+        sch = s_tir.Schedule(_gemm_v2_func)
+
+        TY = BLK_N // MICRO
+        WARP = 32
+        VEC = 4
+
+        main_block = sch.get_sblock("compute")
+        i, j, k = sch.get_loops(main_block)
+        i_o, i_i = sch.split(i, factors=[None, MICRO])
+        j_o, j_i = sch.split(j, factors=[None, MICRO])
+        k_o, k_i = sch.split(k, factors=[None, MICRO])
+        sch.reorder(i_o, j_o, k_o, i_i, j_i, k_i)
+
+        block_inner = main_block
+        block_outer = sch.blockize(i_i)
+
+        k_o_o, k_o_i = sch.split(k_o, factors=[None, BLK_K // MICRO])
+        sch.reorder(i_o, j_o, k_o_o, k_o_i)
+        sch.bind(j_o, "threadIdx.y")
+
+        x_shared = sch.get_sblock("X_shared")
+        w_shared = sch.get_sblock("W_shared")
+
+        def _coop(blk):
+            sch.compute_at(blk, k_o_o, preserve_unit_loops=True)
+            loops = sch.get_loops(blk)[-2:]
+            fused = sch.fuse(*loops)
+            _, fy, fx, fv = sch.split(fused, factors=[None, TY, WARP, VEC])
+            sch.bind(fy, "threadIdx.y")
+            sch.bind(fx, "threadIdx.x")
+            sch.vectorize(fv)
+            sch.storage_align(blk, 0, axis=-2, factor=16, offset=8)
+
+        _coop(x_shared)
+        _coop(w_shared)
+
+        A_mat = sch.cache_read(block_outer, 0, "wmma.matrix_a")
+        B_mat = sch.cache_read(block_outer, 1, "wmma.matrix_b")
+        sch.compute_at(A_mat, k_o_i)
+        sch.compute_at(B_mat, k_o_i)
+
+        # cache_write: compute writes into wmma.accumulator, auto-block stores
+        # accumulator → O_tile (shared.dyn). The explicit "store" sblock copies
+        # O_tile → out global with bounds-check predicate.
+        acc_blk = sch.cache_write(block_outer, 0, "wmma.accumulator")
+        sch.reverse_compute_at(acc_blk, j_o)
+
+        si, sj = sch.get_loops(acc_blk)[-2:]
+        si0, si1 = sch.split(si, factors=[None, MICRO])
+        sj0, sj1 = sch.split(sj, factors=[None, MICRO])
+        sch.reorder(si0, sj0, si1, sj1)
+
+        store_block = sch.get_sblock("store")
+        sch.reverse_compute_at(store_block, j_o, preserve_unit_loops=True)
+        s_loops = sch.get_loops(store_block)[-2:]
+        s_fused = sch.fuse(*s_loops)
+        _, s_fx, s_fv = sch.split(s_fused, factors=[None, WARP, VEC])
+        sch.bind(s_fx, "threadIdx.x")
+        sch.vectorize(s_fv)
+
+        block_init_c = sch.decompose_reduction(block_outer, k_o_o)
+        block_init_c_inner = sch.get_child_blocks(block_init_c)[0]
+
+        intrin_group = get_wmma_intrin_group(
+            load_scope="shared.dyn", store_scope="shared.dyn",
+            in_dtype="float16", out_dtype="float16", trans_b=True,
+        )
+
+        ai, aj = sch.get_loops(A_mat)[-2:]
+        ai0, ai1 = sch.split(ai, factors=[None, MICRO])
+        aj0, aj1 = sch.split(aj, factors=[None, MICRO])
+        sch.reorder(ai0, aj0, ai1, aj1)
+        sch.unroll(ai0)
+        sch.unroll(aj0)
+        sch.tensorize(ai1, intrin_group["load_a"])
+
+        bi, bj = sch.get_loops(B_mat)[-2:]
+        bi0, bi1 = sch.split(bi, factors=[None, MICRO])
+        bj0, bj1 = sch.split(bj, factors=[None, MICRO])
+        sch.reorder(bi0, bj0, bi1, bj1)
+        sch.unroll(bi0)
+        sch.unroll(bj0)
+        sch.tensorize(bi1, intrin_group["load_b"])
+
+        sch.tensorize(sch.get_loops(block_init_c_inner)[-2], intrin_group["init"])
+        sch.tensorize(sch.get_loops(acc_blk)[-2], intrin_group["store"])
+        sch.tensorize(sch.get_loops(block_inner)[-3], intrin_group["compute"])
+
+        return sch.mod["main"]
+
+    return op.tensor_ir_op(
+        _schedule_v2(),
+        "dequantize_group_gemm_v2",
+        args=[x, w, scale, indptr, te_t, tm_t, tn_t],
+        out=Tensor.placeholder([x.shape[0], out_features], model_dtype),
+    )
+
+
 def dequantize_group_gemm(
     x: Tensor,
     w: Tensor,
@@ -601,6 +870,16 @@ def dequantize_group_gemm(
     out : Tensor
         Output tensor of shape (batch_size, out_features).
     """
+    # Phase 9b — opt-in to dispatch-table + tensor-core kernel via env var.
+    # Default stays on the v1 persistent-loop kernel until v2 ships.
+    if os.environ.get("MLC_MOE_GEMM_V2", "0") == "1" and quantize_dtype == "int4":
+        return _dequantize_group_gemm_v2(
+            x, w, scale, indptr,
+            quantize_dtype=quantize_dtype,
+            indptr_dtype=indptr_dtype,
+            group_size=group_size,
+        )
+
     (_, in_features), model_dtype = x.shape, x.dtype
     (num_local_experts, out_features, _), storage_dtype = w.shape, w.dtype
     quantize_dtype_bits = DataType(quantize_dtype).bits
@@ -619,12 +898,31 @@ def dequantize_group_gemm(
 
     Ne, N, K = num_local_experts, out_features, in_features
     BLK_M, BLK_N, BLK_K = 8, 128, 32
-    # CTA_COUNT was 1024 (saturates Hopper-class GPUs). On Orin AGX at b=1
-    # top-8 decode the work is only ~64-128 tiles, so 1024 CTAs waste >90% of
-    # launches scanning the indptr to exit. 64 matches gate_up decode work-set;
-    # persistent loop still handles prefill. Decode: gate_up 2.0×, down 3.6×.
-    # Prefill: ~3% regression. Tuned at Qwen3.6-35B-A3B q4f16_1, top_k=8.
-    TX, TY, CTA_COUNT = 8, 32, 64
+    # CTA_COUNT history (Orin AGX, sm_87, 35B-A3B q4f16_1, top_k=8):
+    #   1024 — Hopper default. Used pre-9e6c17ff.
+    #     64 — 9e6c17ff (Phase 4) tuned for b=1 top-8 MoE GEMM at ~64-128
+    #          tiles. Comment claimed "decode 2.0×/3.6×, prefill ~3% regression."
+    #          The decode claim is now stale — qwen3_5_moe added a static
+    #          `if num_tokens == 1: dequantize_gemv` shortcut so b=1 decode
+    #          never reaches this kernel (see qwen3_5_moe_model.py:137-138).
+    #   1024 (current) — restored 2026-04-30 in Phase 9 Stage 9.2. Bench
+    #          measured pp512 +2.9% (202.0 → 207.9 tps), tg512 unchanged
+    #          (decode shortcut keeps it off this kernel). The original
+    #          "~3% prefill regression" claim was approximately right.
+    #
+    # Tile-constant ceiling on Orin: this hand-schedule sits near a local
+    # optimum where shared-mem footprint (~10 KB / CTA at BLK_M=8/BLK_K=32)
+    # gives ~9 active blocks / SM. Bigger tiles regress (BLK_M=16/BLK_K=64
+    # bumps to ~26 KB / CTA → ~3 blocks / SM, −3.4% pp vs CTA=1024 baseline,
+    # measured 2026-04-30). Bigger CTA grids don't help because Orin's 16 SMs
+    # cap concurrent blocks at ~32-64 regardless of grid size — over-subscribed
+    # CTAs queue serially through the persistent loop.
+    #
+    # The +40% prefill gap to llama.cpp is *not* reachable through tile-constant
+    # tuning of this kernel. Real lever is tensor-core MMA (sm_87 supports
+    # m16n8k16 fp16 MMA) or meta-schedule on an unscheduled variant. Phase 9
+    # closed as partial; see worklog 2026-04-30 for the full bench tables.
+    TX, TY, CTA_COUNT = 8, 32, 1024
     VEC_X, VEC_W, VEC_O, VEC_DOT = 1, 1, 1, 1
     UNROLL = 64
     STORAGE_ALIGN = False
