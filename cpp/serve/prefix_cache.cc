@@ -25,10 +25,13 @@ class PrefixCacheImpl : public PrefixCacheObj {
    * \param max_num_recycling_seqs The maximum number of sequences in prefix cache.
    * \param remove_callback The optional callback function to call when removing a sequence.
    */
-  explicit PrefixCacheImpl(size_t max_num_recycling_seqs, PrefixCacheRemoveCallback remove_callback)
+  explicit PrefixCacheImpl(size_t max_num_recycling_seqs,
+                           PrefixCacheRemoveCallback remove_callback,
+                           PrefixCacheCanRollbackCallback can_rollback_callback)
       : radix_tree_(PagedRadixTree::Create()),
         max_num_recycling_seqs_(max_num_recycling_seqs),
-        remove_callback_(std::move(remove_callback)) {
+        remove_callback_(std::move(remove_callback)),
+        can_rollback_callback_(std::move(can_rollback_callback)) {
     recycling_seq_lrus_.clear();
     reversed_recycling_seq_lrus_.clear();
     seq_states_.clear();
@@ -99,15 +102,24 @@ class PrefixCacheImpl : public PrefixCacheObj {
         }
       }
       if (shortest_recycling_seq_id != -1 && matched_offset > shortest_recycling_seq_length * 0.9) {
-        ReuseRecyclingSequence(shortest_recycling_seq_id);
-        if (shortest_recycling_seq_length > matched_offset) {
-          // Recycling sequence is longer than new sequence, rolling back the redundant trailing
-          // tokens, to match the new sequence.
-          radix_tree_->RollBackSequence(shortest_recycling_seq_id,
-                                        shortest_recycling_seq_length - matched_offset);
+        // For hybrid (GDN) models the trailing-tail rollback also touches the rnn_state,
+        // which has a hard ring-buffer ceiling. Skip the reuse if the engine cannot
+        // recover the tail; we'll fall through to either forking another candidate or
+        // adding a fresh sequence below.
+        size_t reuse_pop_n = shortest_recycling_seq_length - matched_offset;
+        if (can_rollback_callback_ == nullptr ||
+            can_rollback_callback_(shortest_recycling_seq_id,
+                                   static_cast<int64_t>(reuse_pop_n))) {
+          ReuseRecyclingSequence(shortest_recycling_seq_id);
+          if (shortest_recycling_seq_length > matched_offset) {
+            // Recycling sequence is longer than new sequence, rolling back the redundant trailing
+            // tokens, to match the new sequence.
+            radix_tree_->RollBackSequence(shortest_recycling_seq_id,
+                                          shortest_recycling_seq_length - matched_offset);
+          }
+          return PrefixCacheMatchedResult{matched_offset, -1, shortest_recycling_seq_id,
+                                          shortest_recycling_seq_length - matched_offset};
         }
-        return PrefixCacheMatchedResult{matched_offset, -1, shortest_recycling_seq_id,
-                                        shortest_recycling_seq_length - matched_offset};
       }
       // No reusage of recycling sequence, fallback to forking matched sequence. Currently, we only
       // fork from sequence without sliding window, due to current paged KVCache implementation.
@@ -118,6 +130,15 @@ class PrefixCacheImpl : public PrefixCacheObj {
             seq_sliding_window_infos_.at(matched_seq_id);
         if (matched_seq_sliding_window_size != -1) {
           continue;
+        }
+        // For hybrid models, the fork's rnn_state needs `(parent_length - matched_offset)`
+        // history slots to roll the child down to the matched-prefix boundary. Skip
+        // candidates whose rollback would exceed the ring buffer; otherwise PopN fires.
+        if (can_rollback_callback_ != nullptr) {
+          size_t fork_pop_n = radix_tree_->GetSequenceLength(matched_seq_id) - matched_offset;
+          if (!can_rollback_callback_(matched_seq_id, static_cast<int64_t>(fork_pop_n))) {
+            continue;
+          }
         }
         // If the matched is not enabled with sliding window, we can fork within matched offset
         // tokens arbitrarily.
@@ -328,6 +349,12 @@ class PrefixCacheImpl : public PrefixCacheObj {
    */
   PrefixCacheRemoveCallback remove_callback_ = nullptr;
   /*!
+   * \brief Predicate for whether a fork/reuse candidate is recoverable on the recurrent state.
+   * When non-null, candidates that would require popping more rnn_state history than the
+   * ring buffer holds are filtered out before being returned by InsertSequence.
+   */
+  PrefixCacheCanRollbackCallback can_rollback_callback_ = nullptr;
+  /*!
    * \brief The map from sequence to its sequence states.
    */
   std::unordered_map<int64_t, SequenceState> seq_states_;
@@ -435,10 +462,11 @@ class NoPrefixCache : public PrefixCacheObj {
   PrefixCacheMode Mode() final { return PrefixCacheMode::kDisable; }
 };
 
-PrefixCache PrefixCache::CreateRadixPrefixCache(size_t max_num_recycling_seqs,
-                                                PrefixCacheRemoveCallback remove_callback) {
-  ObjectPtr<PrefixCacheImpl> n =
-      tvm::ffi::make_object<PrefixCacheImpl>(max_num_recycling_seqs, std::move(remove_callback));
+PrefixCache PrefixCache::CreateRadixPrefixCache(
+    size_t max_num_recycling_seqs, PrefixCacheRemoveCallback remove_callback,
+    PrefixCacheCanRollbackCallback can_rollback_callback) {
+  ObjectPtr<PrefixCacheImpl> n = tvm::ffi::make_object<PrefixCacheImpl>(
+      max_num_recycling_seqs, std::move(remove_callback), std::move(can_rollback_callback));
   return PrefixCache(std::move(n));
 }
 

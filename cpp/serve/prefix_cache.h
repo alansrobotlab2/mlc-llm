@@ -29,6 +29,16 @@ using namespace tvm::runtime;
 using PrefixCacheRemoveCallback = std::function<void(int64_t)>;
 
 /*!
+ * \brief Predicate the prefix cache uses to decide whether a candidate parent sequence is
+ * eligible for fork/reuse. Returns true iff the engine can roll the parent's recurrent
+ * state back by `pop_n` tokens (i.e., `pop_n <= rnn_state.available_history_num` for every
+ * model in the engine). For pure-attention engines this is always true; for hybrid (GDN)
+ * models the rnn_state ring buffer has a hard ceiling and infeasible candidates must be
+ * skipped, otherwise `PopN` will trip its bounds check and crash the background loop.
+ */
+using PrefixCacheCanRollbackCallback = std::function<bool(int64_t parent_seq_id, int64_t pop_n)>;
+
+/*!
  * \brief The matched result from prefix cache. This result describes how to pre-process the new
  * sequence, to leverage the existing data in KVCache by reusing past sequences or forking from
  * other sequences.
@@ -149,9 +159,13 @@ class PrefixCache : public ObjectRef {
    * \brief Initialization of prefix cache.
    * \param max_recycling_seqs The maximum number of recycling sequences in prefix cache.
    * \param remove_callback The optional callback function to call when removing a sequence.
+   * \param can_rollback_callback Optional predicate used to filter fork/reuse candidates by
+   *   whether the engine can roll the parent's recurrent state back to the matched-prefix
+   *   boundary. If null, all candidates are treated as feasible (pure-attention engines).
    */
-  static PrefixCache CreateRadixPrefixCache(size_t max_recycling_seqs,
-                                            PrefixCacheRemoveCallback remove_callback = nullptr);
+  static PrefixCache CreateRadixPrefixCache(
+      size_t max_recycling_seqs, PrefixCacheRemoveCallback remove_callback = nullptr,
+      PrefixCacheCanRollbackCallback can_rollback_callback = nullptr);
   /*!
    * \brief Initialization of no prefix cache.
    */

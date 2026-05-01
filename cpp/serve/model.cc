@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <fstream>
+#include <limits>
 #include <unordered_set>
 
 #include "../support/json_parser.h"
@@ -1027,6 +1028,17 @@ class ModelImpl : public ModelObj {
       return;
     }
     ft_.kv_cache_popn_func_(rnn_state_, seq_id, num_tokens);
+  }
+
+  int64_t GetRNNStateAvailableHistory(int64_t seq_id) final {
+    if (kind != KVStateKind::kHybrid) {
+      // Non-hybrid models have no rnn_state ring buffer; rollback is unconstrained.
+      return std::numeric_limits<int64_t>::max();
+    }
+    TVM_FFI_ICHECK(ft_.rnn_state_get_available_history_func_.defined())
+        << "Hybrid model requires vm.builtin.rnn_state_get_available_history; rebuild TVM "
+           "with the rnn_state available-history accessor.";
+    return ft_.rnn_state_get_available_history_func_(rnn_state_, seq_id).cast<int64_t>();
   }
 
   void SetRNNStateUseHistoryMode(bool use_history) final {

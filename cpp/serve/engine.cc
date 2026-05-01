@@ -437,6 +437,16 @@ class EngineImpl : public Engine {
             [engine_ptr = n.get()](int64_t seq_id) {
               RemoveRequestFromModel(engine_ptr->estate_, seq_id, engine_ptr->models_);
               engine_ptr->estate_->id_manager.RecycleId(seq_id);
+            },
+            [engine_ptr = n.get()](int64_t parent_seq_id, int64_t pop_n) -> bool {
+              // Fork/reuse must be feasible on every model in the engine; the strictest
+              // ring buffer wins. Pure-attention models report INT64_MAX and never veto.
+              for (const Model& model : engine_ptr->models_) {
+                if (model->GetRNNStateAvailableHistory(parent_seq_id) < pop_n) {
+                  return false;
+                }
+              }
+              return true;
             });
       } else if (engine_config->prefix_cache_mode == PrefixCacheMode::kDisable) {
         n->estate_->prefix_cache = PrefixCache::CreateNoPrefixCache();

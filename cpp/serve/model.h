@@ -306,6 +306,14 @@ class ModelObj : public Object {
   virtual void PopNFromRNNStateOnly(int64_t seq_id, int num_tokens) = 0;
 
   /*!
+   * \brief Return the maximum number of tokens that PopN-on-rnn_state can roll back for
+   * the given sequence. Used by the engine's prefix-cache fork path to filter out fork
+   * candidates whose `(parent_seq_length - matched_offset)` would exceed the ring buffer.
+   * Returns INT64_MAX for non-hybrid models (always feasible).
+   */
+  virtual int64_t GetRNNStateAvailableHistory(int64_t seq_id) = 0;
+
+  /*!
    * \brief Arm the rnn_state so the *next* BeginForward is treated as history-bearing
    * (EndForward advances `available_history_num` by `seq_len`). Must be called before
    * the verify forward when `set_with_history` is used. The flag self-clears on consumption.

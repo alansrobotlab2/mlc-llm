@@ -285,6 +285,13 @@ class JSONFFIEngine:
         """Explicitly terminate the engine"""
         self._background_loops.terminate()
 
+    def reset(self):
+        """Abort all in-flight requests and clear engine-side state (KV cache, prefix
+        cache, request queues). Required when the caller drops conversation history;
+        otherwise the prefix cache will keep matching against the prior session and
+        on hybrid (GDN) models can drive PopN past the rnn_state ring buffer."""
+        self._ffi["reset"]()
+
     def _test_reload(self):
         self._ffi["reload"](self.engine_config.asjson())
 

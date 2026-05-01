@@ -245,6 +245,11 @@ class ChatState:
         """Reset the chat history"""
         self.history = []
         self.history_window_begin = 0
+        # Also clear the engine's KV / prefix cache. Without this, the prefix cache
+        # keeps matching against the prior session, and on hybrid (GDN) models the
+        # subsequent fork tries to roll the rnn_state back further than the ring
+        # buffer holds, crashing the background loop.
+        self.engine.reset()
 
     def chat(self):
         """Start an interactive chat session."""
