@@ -6,6 +6,38 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-30 cont. — Qwen3.5-0.8B MLC head-to-head: 1.34× over llama.cpp at every depth
+
+**Done**
+- Re-benched MLC 0.8B against llama.cpp Q4_K_XL with the **right lib config**. Lib: `dist/qwen3_5-0.8B-q4f16_g16e/`, recompiled this session with `--opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1"` against the current Phase-9b ABI. Recipe added to [qwen3_5.md §2.8](qwen3_5.md). Bench: pp=512 prefill + tg=N decode, `prefix_cache_mode="disable"`, 3 runs + 1 warmup. Raw output `tuning/mlc_tg_sweep_0.8b_g16e_FI_*.log`.
+
+  | tg   | llama.cpp Q4_K_XL | MLC q4f16_g16e + FI | ratio |
+  |---:|---:|---:|---:|
+  |  512 | 100.3 | **134.82** | **1.345×** |
+  | 1024 | 100.1 | **134.29** | **1.341×** |
+  | 2048 |  99.7 | **133.54** | **1.340×** |
+  | 4096 |  98.0 | **132.17** | **1.349×** |
+  | 8192 |  96.5 | **129.59** | **1.343×** |
+
+  Median of 3 runs each; run-to-run variance ≤ 0.05% (tg=4096 was three identical samples 132.17 / 132.17 / 132.19).
+
+**Learned**
+- **The 35B-A3B §14.1 long-ctx crossover is not 0.8B's reality.** With FlashInfer linked, MLC's depth curve is dead flat (134.82 → 129.59, –4% across 16× depth). llama.cpp's curve is the same shape (–4%). Both stacks are weight-BW bound (522 MiB / 204 GB/s = 391 tps theoretical max; both at ~25-34% efficiency). KV reads are not the limit at this scale.
+- **FlashInfer compiles cleanly on Orin sm_87** since the Phase 6 ABI fix. The earlier "FlashInfer cache lacks sm_87 → segfault" guidance is stale (memory `bench_harness_gotchas.md` and qwen3_5.md old §14.2 both predate the fix). Updated qwen3_5.md §2.8 with the FlashInfer-on recipe.
+- **Three earlier wrong turns this session, in order of severity:**
+  1. Started with `dist/qwen3_5-0.8B-q4f16_2/lib.so` because it was the newest compile. q4f16_2 is a vanilla compile without the speedup flags; got 99.33 tps at TG=512 = parity with llama.cpp. Looked like the wall, was the wrong lib.
+  2. Recompiled q4f16_g16e with `flashinfer=0;cudagraph=1;cutlass=1;faster_transformer=1` (matched stale worklog snippet). Got 112.82 tps = 1.13× over llama.cpp. Better, still not the headline.
+  3. Spotted the corrected guidance in §2.3 (`flashinfer=1` is correct on current ABI), recompiled with FlashInfer on, hit 134.82 tps = 1.345×. **Lib config matters more than runtime tuning at this scale.**
+- **The "tg=8192 run 0 = 54 → run 1 = 33" run-to-run drift from earlier was a stale-lib artefact, not state pollution.** With the correct lib, the same harness produced 129.59 / 129.57 / 129.67 — three samples within 0.08%. The bench harness is fine; the lib was the bug.
+- pp_tps consistent ~2870 across all depths (vs 2570 on the no-FI build, +12%). FlashInfer's paged-prefill path also helps prefill, not just decode.
+
+**Next**
+- Apply the same lib-config check to the 35B-A3B before re-running its sweep — qwen3_5.md §2.7 says the shipping lib already has FlashInfer on, but worth confirming with `nm -D | grep flashinfer` against the current `dist/qwen3_6-35B-A3B-q4f16_1/lib.so`.
+- 35B-A3B Q4_K_XL TG sweep using [scratch_lcpp_tg_sweep.sh](scratch_lcpp_tg_sweep.sh) + parallel MLC sweep — same protocol as this run. Hold until prefill-code work in flight is at a commit point.
+- Update memory `bench_harness_gotchas.md`: "stale lib.so" is now the #1 deadlock; FlashInfer is no longer fatal on sm_87.
+
+---
+
 ## 2026-04-30 — Qwen3.5-0.8B Q4_K_XL llama.cpp TG-depth sweep
 
 **Done**

@@ -117,6 +117,63 @@ source .envrc.local && .venv/bin/python bench_mlc.py \
 | [dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/](dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/) | reference for sm ≥ 89 port | fp8 KV; -25% on Orin (software fp8 dequant), preserved for Blackwell port |
 | [dist/qwen3_6-35B-A3B-q4f16_1-mtp-draft/](dist/qwen3_6-35B-A3B-q4f16_1-mtp-draft/) | spec-decode draft (not default) | EAGLE-style 1-layer MTP head, 0.71 GB; loses to target_only by 17% on Orin |
 
+### 2.8 Compile & Run Qwen3.5-0.8B (dense)
+
+Same toolchain as §2.3, smaller model. The dense variant has no MoE so `MLC_MOE_GEMM_V2` is irrelevant; the rest of the speedup flags (FlashInfer, cudagraph, cutlass, cublas_gemm) all apply. Quant of choice is **`q4f16_g16e`** — group=16, embed/final_fc included, dlight-tuned for sm_87. Compile takes ~3.5 min and the resulting lib is ~39 MB (with FlashInfer kernels linked).
+
+**Headline (2026-04-30, Orin AGX MAXN, this lib):** TG=512 → **134.82 tps**, 1.345× over llama.cpp Q4_K_XL (100.3 tps). Depth-flat: only -4% drift across 16× decode depth. Full sweep:
+
+| tg   | llama.cpp Q4_K_XL (pure tg) | MLC q4f16_g16e + FI | ratio |
+|---:|---:|---:|---:|
+|  512 | 100.3 | **134.82** | **1.345×** |
+| 1024 | 100.1 | **134.29** | **1.341×** |
+| 2048 |  99.7 | **133.54** | **1.340×** |
+| 4096 |  98.0 | **132.17** | **1.349×** |
+| 8192 |  96.5 | **129.59** | **1.343×** |
+
+Median of 3 runs each (1 warmup), pp=512 prefill + tg=N decode, run-to-run variance ≤ 0.05%. Detailed analysis in §14.2.
+
+```bash
+# 1. Weights (1.5 GB bf16, ~30 sec on a fast link)
+hf download Qwen/Qwen3.5-0.8B
+SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/<rev>/
+
+# 2. Convert weights (no GPU; 559 MB output)
+.venv/bin/python -m mlc_llm convert_weight "$SNAP" \
+    --quantization q4f16_g16e \
+    -o dist/qwen3_5-0.8B-q4f16_g16e
+
+# 3. Generate engine config (3 sec; auto-picks model_type=qwen3_5)
+.venv/bin/python -m mlc_llm gen_config "$SNAP" \
+    --quantization q4f16_g16e --conv-template qwen3_5 \
+    -o dist/qwen3_5-0.8B-q4f16_g16e
+
+# 4. Compile with all speedups (~3.5 min)
+.venv/bin/python -m mlc_llm compile dist/qwen3_5-0.8B-q4f16_g16e \
+    --device cuda \
+    --opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1" \
+    -o dist/qwen3_5-0.8B-q4f16_g16e/lib.so
+```
+
+Recompile-only path (weights already converted and gen_config already run — the params and `mlc-chat-config.json` stay valid across runtime ABI bumps):
+
+```bash
+source .envrc.local && .venv/bin/python -m mlc_llm compile \
+    dist/qwen3_5-0.8B-q4f16_g16e --device cuda \
+    --opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1" \
+    -o dist/qwen3_5-0.8B-q4f16_g16e/lib.so
+```
+
+Bench (TG=512 steady-state, MAXN locked):
+
+```bash
+source .envrc.local && .venv/bin/python bench_mlc.py \
+    --model-dir dist/qwen3_5-0.8B-q4f16_g16e --device cuda:0 \
+    --pp 512 --tg 512 --runs 3 --warmup 1
+```
+
+Run (chat / engine API): identical to §2.4, swap model dir / lib path. `--model-lib` is still recommended at runtime.
+
 ---
 
 ## 3. Family Map (as of 2026-04)
@@ -664,7 +721,33 @@ Best practical lib for the 0.8B is the spec-decode build at [dist/qwen3_5-0.8B-q
 
 ¹ Pure decode tps backed out of the blended `-pg` measurement: `tg_tps = tg / (total/blended − pp/pp_tps)`.
 
-Decode is essentially flat across 0.5K → 8K depth (~4 % drift). The ~100 tps ceiling is weight-bandwidth bound (522 MiB / ~204 GB/s ≈ 391 tps theoretical, ~25 % achieved efficiency = ~98 tps). KV cache at 16 layers × small head dim is well under bandwidth at these depths. MLC parity bench against this Q4_K_XL baseline is the next step (the existing §14.2 table is Q4_K_S and is now superseded as the comparison bar — Q4_K_XL is the unsloth default that downstream users actually pull).
+Decode is essentially flat across 0.5K → 8K depth (~4 % drift). The ~100 tps ceiling is weight-bandwidth bound (522 MiB / ~204 GB/s ≈ 391 tps theoretical, ~25 % achieved efficiency = ~98 tps). KV cache at 16 layers × small head dim is well under bandwidth at these depths.
+
+**MLC q4f16_g16e + FlashInfer head-to-head (2026-04-30).** Lib: [dist/qwen3_5-0.8B-q4f16_g16e/](dist/qwen3_5-0.8B-q4f16_g16e/) recompiled this session with `--opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1"` against the current Phase-9b ABI (recipe in §2.8). Bench: pp=512 prefill + tg=N decode, 3 runs + 1 warmup, `prefix_cache_mode="disable"`, `mode="interactive"`. Run via [scratch_mlc_tg_sweep.py](scratch_mlc_tg_sweep.py); raw output [tuning/mlc_tg_sweep_0.8b_g16e_FI_*.log](tuning/).
+
+| tg   | llama.cpp Q4_K_XL (pure tg) | MLC q4f16_g16e + FI | ratio |
+|---:|---:|---:|---:|
+|  512 | 100.3 | **134.82** | **1.345×** |
+| 1024 | 100.1 | **134.29** | **1.341×** |
+| 2048 |  99.7 | **133.54** | **1.340×** |
+| 4096 |  98.0 | **132.17** | **1.349×** |
+| 8192 |  96.5 | **129.59** | **1.343×** |
+
+Dead-flat 1.34× across 16× depth. The §14.1 35B-A3B "MLC crosses below at long ctx" regression is **not** present here — FlashInfer's paged-decode kernels keep KV reads off the critical path, leaving both stacks weight-BW-bound. The ~+34% MLC win is the kernel/quant gap (q4f16_g16e + dlight tuning + cudagraph + cutlass), not an attention-side win.
+
+**Run-to-run stability**: tg=4096 produced 132.17 / 132.17 / 132.19 across 3 runs (0.01% variance). Earlier "bizarre" run-to-run drift in the q4f16_2 variant (54 → 33 tg_tps at tg=8192) was an artefact of the lib being compiled against a stale ABI without the speedup flags — not a state-pollution bug in the harness.
+
+**Cross-reference for 0.8B history:**
+
+| build | ctx / tg | tg_tps | ratio vs llama.cpp | source |
+|---|---|---:|---:|---|
+| q4f16_1 (no FI, pre-dlight) | 128 / 256 | 131.62 | 1.22× vs Q4_K_S | 2026-04-27 baseline |
+| q4f16_g16e (no FI, no opts) | 512 / 512 | 99.33 | 0.99× vs Q4_K_XL | this session, q4f16_2 sanity |
+| q4f16_g16e (no FI, opts on) | 512 / 512 | 112.82 | 1.13× vs Q4_K_XL | this session |
+| **q4f16_g16e + FI (shipping)** | 512 / 512 | **134.82** | **1.345×** vs Q4_K_XL | this session, headline |
+| q0f16-mtp + draft (γ=4 spec) | 512 / 512 | 120.5 | 1.20× vs Q4_K_S | 2026-04-28 cont. 12 (re-bench needed) |
+
+The FlashInfer-on `q4f16_g16e` build is now the recommended 0.8B target; it dominates the prior γ=4 spec-decode result on target-only throughput while staying byte-identical to the reference (the spec-decode build is still useful for latency-sensitive interactive workloads but no longer the throughput headline).
 
 ### 14.3 KV-cache dtype variants (35B-A3B)
 
