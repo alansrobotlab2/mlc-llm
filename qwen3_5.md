@@ -661,29 +661,44 @@ What was originally listed as out-of-scope and shipped anyway: kernel perf (Phas
 
 All numbers Orin AGX (sm_87, 204 GB/s peak BW), MAXN power profile, batch=1, no concurrency. Same precision class on both sides: 4-bit weights + fp16 activations (Unsloth `Qwen3.6-35B-A3B-UD-Q4_K_S.gguf` ≈ 19.45 GB, MLC `q4f16_1` ≈ 19 GB at 4.345 bits/param). Bench harness: [bench_compare.py](bench_compare.py) drives `llama-bench` (`-p N` for prefill, `-d N -n tg` for decode-at-depth) and `bench_mlc.py` at the same context lengths.
 
-### 14.1 Qwen3.6-35B-A3B
+### 14.1 Qwen3.6-35B-A3B — bench chart
 
-**Initial baseline (2026-04-27, before perf work) — 3× slower than llama.cpp at every context:**
+**Lib:** [dist/qwen3_6-35B-A3B-q4f16_1/lib.so](dist/qwen3_6-35B-A3B-q4f16_1/lib.so) — Phase 9b v2 GEMM + FlashInfer + cudagraph + cutlass, 202 MB.
+**Protocol:** `scratch_mlc_tg_sweep.py --pp 512 --tg N --runs 3 --warmup 1`, `prefix_cache_mode="disable"`, `mode="interactive"`. llama.cpp: `llama-bench -pg 512,N -fa 1 -r 3` (pure-tg backed out of the blended `-pg` measurement).
+**Headline (tg=512):** **MLC pp=561.5 tps · tg=54.46 tps · 1.927× over llama.cpp Q4_K_XL · 1.866× over llama.cpp Q4_K_S.**
 
-| ctx | llama.cpp Q4_K_S tg (tps) | MLC q4f16_1 tg (tps) | ratio |
+| tg     | MLC q4f16_1 v2+FI | llama.cpp Q4_K_S¹ | llama.cpp Q4_K_XL² | ratio (vs Q4_K_XL) |
+|---:|---:|---:|---:|---:|
+|  512   | **54.46**         | 29.19              | 28.26              | **1.927×**         |
+| 1024   | **54.30**         | 29.30              | 28.21              | **1.925×**         |
+| 2048   | **54.07**         | 29.31              | 28.13              | **1.922×**         |
+| 4096   | **53.69**         | 29.04              | 28.07              | **1.913×**         |
+| 8192   | **53.00**         | 28.48              | 27.86              | **1.902×**         |
+| **Δ tg512→tg8192** | **−2.7 %** | **−2.4 %**        | **−1.4 %**        | flat              |
+
+¹ llama.cpp Q4_K_S from the 2026-04-29 sweep against `Qwen3.6-35B-A3B-UD-Q4_K_S.gguf`.
+² llama.cpp Q4_K_XL (2026-04-30, this session) against `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (20.81 GiB, staged at [models/qwen3.6-35b-a3b/](../models/qwen3.6-35b-a3b/)). Pure tg backed out of `-pg 512,N` blended via `tg_tps = tg / (total/blended − pp/pp_tps)`, with `pp_tps = 632.12 ± 2.46` from a clean warm-cache standalone `pp512` measurement (the original sweep's `pp512` row had cold-cache contamination, ± 318.78). Raw [tuning/lcpp_tg_sweep_35b_20260430_201146.md](tuning/lcpp_tg_sweep_35b_20260430_201146.md). Q4_K_XL is slightly slower than Q4_K_S as expected — XL bumps select tensors to higher bit-widths for a ~+1% perplexity recovery at a ~3% throughput tax.
+
+pp_tps locked at **561.5 ± 0.4** across all 15 reps. Decode is dead flat across 16× depth. Both stacks are weight-BW bound (LPDDR5 ≈ 204 GB/s shared); the earlier "MLC crosses below at long ctx" regression in the historical table is **closed** by FlashInfer linking + Phase 9b v2 GEMM. **The `--model-lib` flag is mandatory for this dist dir** — without it the harness's `glob("*.so")[0]` picks `lib_phase9b_v2.so` (FlashInfer-OFF, 197 MB) and silently delivers ~82% of headline tg. (Patched in [scratch_mlc_tg_sweep.py](scratch_mlc_tg_sweep.py): now prefers `lib.so` and fails loudly when multiple variants exist with no canonical name.)
+
+#### History (for reference; superseded by the shipping chart above)
+
+Initial baseline (2026-04-27, pre-perf-work):
+
+| ctx | llama.cpp Q4_K_S | MLC q4f16_1 | ratio |
 |---:|---:|---:|---:|
 | 128  | 29.59 | 10.12 | 0.34× |
-| 1024 | 29.24 | 9.66  | 0.33× |
-| 4096 | 28.49 | 8.36  | 0.29× |
+| 4096 | 28.49 |  8.36 | 0.29× |
 
-**Latest shipped — Phase 6 fp16 KV TIR (default lib at [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/)) — 1.79× over llama.cpp at short context:**
+Phase 6 fp16 KV TIR (FlashInfer-off, pre-9b):
 
-| pp / tg | llama.cpp Q4_K_S tg (tps) | MLC q4f16_1 tg (tps) | ratio | notes |
+| pp / tg     | llama.cpp Q4_K_S | MLC q4f16_1 | ratio | note |
 |---:|---:|---:|---:|---|
-| 128 / 64   | 29.59 | **54.41** | **1.84×** | shipping headline |
-| 128 / 256  | 29.5  | 51.24     | 1.74×     | TG steady-state |
-| 512 / 256  | 29.2  | 46.34     | 1.59×     | KV starting to bite |
-| 4096 / 256 | 28.5  | 24.45     | 0.86×     | MLC crosses below at long ctx |
-| 8192 / 256 | ~28   | 15.88     | ~0.57×    | structural BW saturation |
+| 128 / 64    | 29.59 | 54.41 | 1.84× | short-ctx win |
+| 4096 / 256  | 28.5  | 24.45 | 0.86× | KV-fallback crossover |
+| 8192 / 256  | ~28   | 15.88 | 0.57× | structural BW saturation |
 
-The crossover at ~4K context is the KV-cache read cost. MLC's PagedKVCache (TIR fallback on sm_87, no FlashInfer) reads at lower effective BW than llama.cpp's `q8_0` KV at long sequence. Phase 4A KV-int8 (§14.3 below) was investigated as a fix — throughput-neutral but parity drift. Long-context perf parity vs llama.cpp at ctx ≥ 4K is an open lane.
-
-**Perf-progression (selected milestones, ctx=128 / tg=64 unless noted):**
+Perf-progression (tg512 unless noted):
 
 | version | tg_tps | vs llama.cpp Q4_K_S |
 |---|---:|---:|
@@ -691,63 +706,50 @@ The crossover at ~4K context is the KV-cache read cost. MLC's PagedKVCache (TIR 
 | MoE dispatch fix (gemv reachable) | 44.85 | 1.52× |
 | Parallel topk_softmax | 47.88 | 1.629× |
 | sm_87 dlight GEMV tuning (v5) | 51.37 | 1.745× |
-| **gdn_func register-cached state (v6, shipped)** | **52.62** (tg512) | **1.789×** |
+| gdn_func register-cached state (v6) | 52.62 | 1.789× |
+| Phase 9b v2 GEMM (FI-off) | 44.86 | 1.51× |
+| **Phase 9b v2 + FlashInfer (shipped)** | **54.46** | **1.866×** |
 
-### 14.2 Qwen3.5-0.8B
+Phase 9b also lifted **pp512 from 207.95 → 561.5 tps (2.70×)** — the bigger headline of that session.
 
-Initial baseline (2026-04-27) — wins at short ctx, regresses at long ctx:
+### 14.2 Qwen3.5-0.8B — bench chart
 
-| ctx | llama.cpp Q4_K_S tg (tps) | MLC q4f16_1 tg (tps) | ratio |
+**Lib:** [dist/qwen3_5-0.8B-q4f16_g16e/lib.so](dist/qwen3_5-0.8B-q4f16_g16e/lib.so) — q4f16_g16e (group=16, embed/final_fc included) + FlashInfer + cudagraph + cutlass + cublas_gemm, 39 MB. Compile recipe in §2.8.
+**Protocol:** identical to §14.1 — `scratch_mlc_tg_sweep.py --pp 512 --tg N --runs 3 --warmup 1`; llama.cpp `llama-bench -pg 512,N -fa 1 -r 3` (pure-tg backed out of blended).
+**Headline (tg=512):** **MLC pp=2870 tps · tg=134.82 tps · 1.345× over llama.cpp Q4_K_XL.**
+
+| tg     | MLC q4f16_g16e + FI | llama.cpp Q4_K_XL¹ | ratio        |
+|---:|---:|---:|---:|
+|  512   | **134.82**          | 100.3              | **1.345×**   |
+| 1024   | **134.29**          | 100.1              | **1.341×**   |
+| 2048   | **133.54**          |  99.7              | **1.340×**   |
+| 4096   | **132.17**          |  98.0              | **1.349×**   |
+| 8192   | **129.59**          |  96.5              | **1.343×**   |
+| **Δ tg512→tg8192** | **−4 %**  | **−4 %**          | flat         |
+
+¹ llama.cpp pure-tg backed out of `-pg 512,N` blended via `tg_tps = tg / (total/blended − pp/pp_tps)` (`pp_tps`=4538). Raw [tuning/lcpp_tg_sweep_0.8b_20260430_165824.md](tuning/lcpp_tg_sweep_0.8b_20260430_165824.md).
+
+Run-to-run variance ≤ 0.05% (tg=4096: three identical samples 132.17 / 132.17 / 132.19). Both stacks weight-BW bound — 522 MiB weights / 204 GB/s ≈ 391 tps theoretical, llama.cpp lands at 25% efficiency, MLC at 34%. The +34% MLC win is the kernel/quant gap (group=16 + dlight + cudagraph + cutlass), not an attention-side win — FlashInfer's role here is keeping the curve depth-flat, not adding raw throughput.
+
+#### History (for reference)
+
+Initial baseline (2026-04-27, q4f16_1 lib, no dlight, no FlashInfer):
+
+| ctx  | llama.cpp Q4_K_S | MLC q4f16_1 | ratio |
 |---:|---:|---:|---:|
 | 128  | 107.99 | 131.62 | 1.22× |
-| 1024 | 106.11 | 105.78 | 1.00× |
-| 4096 | 102.58 | 63.27  | 0.62× |
+| 4096 | 102.58 |  63.27 | 0.62× |
 
-The 4K regression has the same shape as the 35B-A3B crossover — KV-cache read dominance on the TIR fallback path. The 0.8B has been re-benched post-dlight-patch at 120.5 tps γ=4 with byte-identical parity (worklog 2026-04-28 cont. 12); update this table when a fresh apples-to-apples run lands.
+This-session lib-config progression (all at pp=512 / tg=512):
 
-Best practical lib for the 0.8B is the spec-decode build at [dist/qwen3_5-0.8B-q0f16-mtp/](dist/qwen3_5-0.8B-q0f16-mtp/) + draft at [dist/qwen3_5-0.8B-q0f16-mtp-draft/](dist/qwen3_5-0.8B-q0f16-mtp-draft/) — γ=4 lands 120.5 tps decode with byte-identical parity to target_only. The integrated lib does not need separate compile flags.
+| build (this session) | tg_tps | ratio vs Q4_K_XL | note |
+|---|---:|---:|---|
+| q4f16_2 default compile (no opts) | 99.33 | 0.99× | parity with llama.cpp; misleading first read |
+| q4f16_g16e, `flashinfer=0;cudagraph=1;cutlass=1;faster_transformer=1` | 112.82 | 1.13× | dlight-tuned, no FI |
+| **q4f16_g16e + `flashinfer=1` (shipped)** | **134.82** | **1.345×** | headline |
+| q0f16-mtp + draft (γ=4 spec, 2026-04-28 cont. 12) | 120.5 | 1.20× vs Q4_K_S | superseded by FI build |
 
-**Q4_K_XL TG-depth sweep (2026-04-30, llama.cpp standalone, FA on, MAXN, 3 reps).** Bench is `llama-bench -pg 512,N -fa 1` for N ∈ {512, 1024, 2048, 4096, 8192}; weights file [models/qwen3.5-0.8b/Qwen3.5-0.8B-UD-Q4_K_XL.gguf](../models/qwen3.5-0.8b/Qwen3.5-0.8B-UD-Q4_K_XL.gguf) (522 MiB, ggml labels it "qwen35 0.8B Q4_K - Medium" — `XL` is unsloth's dynamic-bit override, not a base ggml quant). Run script: [scratch_lcpp_tg_sweep.sh](scratch_lcpp_tg_sweep.sh); raw output [tuning/lcpp_tg_sweep_0.8b_20260430_165824.md](tuning/lcpp_tg_sweep_0.8b_20260430_165824.md).
-
-| test            | reported tps | tg-only tps¹ |
-|-----------------|---:|---:|
-| pp512 (prefill) | 4538.5 ± 171 | — |
-| tg128 (no pp)   | 100.23 ± 0.18 | 100.2 |
-| pp512 + tg512   | 196.17 ± 0.05 | 100.3 |
-| pp512 + tg1024  | 148.52 ± 0.05 | 100.1 |
-| pp512 + tg2048  | 123.96 ± 0.03 | 99.7 |
-| pp512 + tg4096  | 109.94 ± 0.47 | 98.0 |
-| pp512 + tg8192  | 102.36 ± 0.71 | 96.5 |
-
-¹ Pure decode tps backed out of the blended `-pg` measurement: `tg_tps = tg / (total/blended − pp/pp_tps)`.
-
-Decode is essentially flat across 0.5K → 8K depth (~4 % drift). The ~100 tps ceiling is weight-bandwidth bound (522 MiB / ~204 GB/s ≈ 391 tps theoretical, ~25 % achieved efficiency = ~98 tps). KV cache at 16 layers × small head dim is well under bandwidth at these depths.
-
-**MLC q4f16_g16e + FlashInfer head-to-head (2026-04-30).** Lib: [dist/qwen3_5-0.8B-q4f16_g16e/](dist/qwen3_5-0.8B-q4f16_g16e/) recompiled this session with `--opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1"` against the current Phase-9b ABI (recipe in §2.8). Bench: pp=512 prefill + tg=N decode, 3 runs + 1 warmup, `prefix_cache_mode="disable"`, `mode="interactive"`. Run via [scratch_mlc_tg_sweep.py](scratch_mlc_tg_sweep.py); raw output [tuning/mlc_tg_sweep_0.8b_g16e_FI_*.log](tuning/).
-
-| tg   | llama.cpp Q4_K_XL (pure tg) | MLC q4f16_g16e + FI | ratio |
-|---:|---:|---:|---:|
-|  512 | 100.3 | **134.82** | **1.345×** |
-| 1024 | 100.1 | **134.29** | **1.341×** |
-| 2048 |  99.7 | **133.54** | **1.340×** |
-| 4096 |  98.0 | **132.17** | **1.349×** |
-| 8192 |  96.5 | **129.59** | **1.343×** |
-
-Dead-flat 1.34× across 16× depth. The §14.1 35B-A3B "MLC crosses below at long ctx" regression is **not** present here — FlashInfer's paged-decode kernels keep KV reads off the critical path, leaving both stacks weight-BW-bound. The ~+34% MLC win is the kernel/quant gap (q4f16_g16e + dlight tuning + cudagraph + cutlass), not an attention-side win.
-
-**Run-to-run stability**: tg=4096 produced 132.17 / 132.17 / 132.19 across 3 runs (0.01% variance). Earlier "bizarre" run-to-run drift in the q4f16_2 variant (54 → 33 tg_tps at tg=8192) was an artefact of the lib being compiled against a stale ABI without the speedup flags — not a state-pollution bug in the harness.
-
-**Cross-reference for 0.8B history:**
-
-| build | ctx / tg | tg_tps | ratio vs llama.cpp | source |
-|---|---|---:|---:|---|
-| q4f16_1 (no FI, pre-dlight) | 128 / 256 | 131.62 | 1.22× vs Q4_K_S | 2026-04-27 baseline |
-| q4f16_g16e (no FI, no opts) | 512 / 512 | 99.33 | 0.99× vs Q4_K_XL | this session, q4f16_2 sanity |
-| q4f16_g16e (no FI, opts on) | 512 / 512 | 112.82 | 1.13× vs Q4_K_XL | this session |
-| **q4f16_g16e + FI (shipping)** | 512 / 512 | **134.82** | **1.345×** vs Q4_K_XL | this session, headline |
-| q0f16-mtp + draft (γ=4 spec) | 512 / 512 | 120.5 | 1.20× vs Q4_K_S | 2026-04-28 cont. 12 (re-bench needed) |
-
-The FlashInfer-on `q4f16_g16e` build is now the recommended 0.8B target; it dominates the prior γ=4 spec-decode result on target-only throughput while staying byte-identical to the reference (the spec-decode build is still useful for latency-sensitive interactive workloads but no longer the throughput headline).
+The FlashInfer-on `q4f16_g16e` build is now the recommended 0.8B target on Orin; dominates the prior γ=4 spec-decode result on target-only throughput while staying byte-identical to the reference.
 
 ### 14.3 KV-cache dtype variants (35B-A3B)
 

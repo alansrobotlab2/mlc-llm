@@ -62,11 +62,20 @@ def main():
     if args.model_lib:
         lib_path = args.model_lib
     else:
-        so_files = list(model_dir.glob("*.so"))
-        if not so_files:
-            print(f"[mlc] No .so under {model_dir}", file=sys.stderr)
-            sys.exit(1)
-        lib_path = str(so_files[0])
+        canonical = model_dir / "lib.so"
+        if canonical.exists():
+            lib_path = str(canonical)
+        else:
+            so_files = sorted(model_dir.glob("*.so"))
+            if not so_files:
+                print(f"[mlc] No .so under {model_dir}", file=sys.stderr)
+                sys.exit(1)
+            if len(so_files) > 1:
+                names = ", ".join(p.name for p in so_files)
+                print(f"[mlc] Multiple .so files in {model_dir} but no lib.so — "
+                      f"pass --model-lib explicitly. Found: {names}", file=sys.stderr)
+                sys.exit(1)
+            lib_path = str(so_files[0])
 
     print(f"[mlc] Loading tokenizer from {model_dir}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)

@@ -6,6 +6,34 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-04-30 cont. — Qwen3.6-35B-A3B MLC TG-depth sweep on shipping v2+FI lib
+
+**Done**
+- Re-benched 35B-A3B with the Phase-9b-v2 + FlashInfer shipping lib at `dist/qwen3_6-35B-A3B-q4f16_1/lib.so` (md5-identical to `lib_phase9b_v2_flashinfer.so`). Same protocol as the 2026-04-29 sweep: pp=512, tg ∈ {512, 1024, 2048, 4096, 8192}, 3 runs + 1 warmup, `prefix_cache_mode="disable"`, `mode="interactive"`. Raw output `tuning/mlc_tg_sweep_35b_q4f16_1_FI_*.log`.
+
+  | tg   | MLC q4f16_1 v2+FI | llama.cpp Q4_K_S (2026-04-29) | ratio |
+  |---:|---:|---:|---:|
+  |  512 | **54.46** | 29.19 | **1.866×** |
+  | 1024 | **54.30** | 29.30 | 1.853× |
+  | 2048 | **54.07** | 29.31 | 1.844× |
+  | 4096 | **53.69** | 29.04 | 1.849× |
+  | 8192 | **53.00** | 28.48 | **1.861×** |
+
+  pp_tps locked at **561.5 ± 0.4** across all 15 reps. tg drift –2.7% over 16× depth (54.46 → 53.00); llama.cpp drift –2.4% over the same range. **Both stacks weight-BW bound with near-identical decay shape.**
+
+**Learned**
+- **`scratch_mlc_tg_sweep.py` has a lib-picking footgun** when the dist dir holds multiple `.so` variants. Falls back to `glob("*.so")[0]` (lib_path order is OS-dependent, not alphabetical). My first run picked `lib_phase9b_v2.so` (FlashInfer-OFF, 197 MB) and silently delivered tg=44.83 — exactly the FlashInfer-OFF row from cont. session 4's table. The user spotted that we already had the v2+FI lib shipped; explicit `--model-lib dist/qwen3_6-35B-A3B-q4f16_1/lib.so` fixed it.
+- **Confirmation that the shipped lib.so is the v2+FI build**: md5 matches `lib_phase9b_v2_flashinfer.so`; nm shows `flashinfer::DecodePlan`, `PrefillSplitQOKVIndptr` symbols. Numbers reproduce cont. session 4's headline (561.16 / 54.35) within 0.06%.
+- **The 35B's old §14.1 long-ctx crossover is closed.** Old narrative: "MLC crosses below at 4K context" with FI-off TIR fallback. New reality: with FlashInfer linked, MLC stays at 1.85× across 512 → 8192. KV-cache reads are no longer the long-ctx bottleneck.
+- Same root cause as the 0.8B confusion earlier today: **shipping libs without explicitly naming the lib path is a recurring trap** when multiple variants exist. Need to fix the scratch harness to prefer `lib.so` when present (or fail loudly if multiple .so files match).
+
+**Next**
+- Patch `scratch_mlc_tg_sweep.py`: when no `--model-lib` is passed, prefer `lib.so` if it exists; if multiple .so files are present and `lib.so` is absent, fail with a list rather than picking arbitrarily.
+- 35B-A3B Q4_K_XL sweep using [scratch_lcpp_tg_sweep.sh](scratch_lcpp_tg_sweep.sh) — gguf staged at `models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (22 GB). Will give a fresh apples-to-apples Q4_K_XL bar; expected to be slightly faster than Q4_K_S (XL bumps select tensors to higher bits, ~+5% bandwidth tax for ~+1.5% perplexity recovery — comparable shape).
+- Consider flipping the §14.1 "open lane" wording in qwen3_5.md to "closed by FlashInfer + Phase 9b v2 GEMM" since the long-ctx crossover is no longer present.
+
+---
+
 ## 2026-04-30 cont. — Qwen3.5-0.8B MLC head-to-head: 1.34× over llama.cpp at every depth
 
 **Done**
