@@ -46,51 +46,66 @@ ACHIEVABLE_GBPS = 156.0
 # params * bits/8, where bits includes the group scales (4.345 for q4f16_1 as
 # reported by convert_weight).
 # ---------------------------------------------------------------------------
+# GEMV-schedule weight kernels, as `(K, N, label)` for a K->N projection.
+#
+# N is CHECKED against launch geometry rather than trusted. The dlight GEMV schedule
+# emits `block=(16,32,1)` with one CTA per 64 output columns, so `gridX * 64` is the
+# real output width and `gridY` is the expert multiplicity (1 for dense kernels, 8 for
+# the top-8 MoE gemvs). The *observed* width is what the byte count uses; a table N that
+# disagrees prints a `!` and a warning.
+#
+# That check exists because the failure it catches already happened. These names are
+# assigned by the Relax fusion pass in emission order, so *fusing two projections
+# renumbers unrelated kernels and can reuse a name for a different weight*. After the
+# in_proj_qkvzab merge, `fused_dequantize1_NT_matmul_kernel` went on meaning "the GDN
+# input projection" but its width went 8192 -> 12352, and the stale entry reported
+# 94.2 GB/s (60% of wall) for a kernel actually running at 142 GB/s (91%) — the
+# difference between "biggest remaining headroom" and "done". Never key these on name
+# alone.
 QWEN3_6_35B_A3B = {
-    # grid, per-token, output width -> projection
-    "fused_dequantize_fused_NT_matmul9_cast4_kernel": (
-        2048 * 248320, "lm_head (2048->248320)"),
+    "fused_dequantize_fused_NT_matmul7_cast4_kernel": (
+        2048, 248320, "lm_head"),
     "moe_dequantize_gemv_kernel": (
-        8 * 2048 * 1024, "routed experts gate_up, top-8 (2048->2*512)"),
+        2048, 1024, "routed experts gate_up, top-8"),
     "moe_dequantize_gemv1_kernel": (
-        8 * 512 * 2048, "routed experts down, top-8 (512->2048)"),
+        512, 2048, "routed experts down, top-8"),
     "fused_dequantize1_NT_matmul_kernel": (
-        2048 * 8192, "GDN in_proj_qkv (2048->8192)"),
-    "fused_dequantize2_fused_NT_matmul1_silu1_multiply1_kernel": (
-        2048 * 4096, "GDN in_proj_z + silu*gate (2048->4096)"),
-    "fused_dequantize4_NT_matmul3_kernel": (
-        4096 * 2048, "GDN out_proj AND attn o_proj (4096->2048, shared kernel)"),
-    "fused_dequantize7_NT_matmul8_kernel": (
-        2048 * 9216, "attn c_attn (2048->9216)"),
-    "fused_dequantize5_NT_matmul5_kernel": (
-        2048 * 1024, "shared expert gate_up (2048->2*512)"),
-    "fused_dequantize6_fused_NT_matmul6_multiply5_add1_kernel": (
-        512 * 2048, "shared expert down + gate*add (512->2048)"),
-    "fused_dequantize3_NT_matmul2_kernel": (
-        2048 * 32, "GDN in_proj_a (2048->32)"),
-    "fused_dequantize3_fused_NT_matmul2_tir_sigmoid_cast2_kernel": (
-        2048 * 32, "GDN in_proj_b + sigmoid (2048->32)"),
-    # fp16, not quantized
-    "NT_matmul4_kernel": (2048 * 256, "MoE router gate (2048->256, fp16)"),
-    # Recurrent state traffic. Not weights: a get reads one 2 MiB state slot and
-    # writes a 2 MiB destination, so 2x the slot size moves per call.
-    "rnn_state_get_0_kernel": (2 * 32 * 128 * 128, "GDN recurrent state get (fp32 2 MiB slot)"),
-    "rnn_state_set_0_kernel": (2 * 32 * 128 * 128, "GDN recurrent state set (fp32 2 MiB slot)"),
-    "rnn_state_get_1_kernel": (2 * 3 * 8192, "GDN conv state get (3x8192)"),
-    "rnn_state_set_1_kernel": (2 * 3 * 8192, "GDN conv state set (3x8192)"),
+        2048, 12352, "GDN in_proj_qkvzab (fused qkv|z|a|b)"),
+    "fused_dequantize2_NT_matmul1_kernel": (
+        4096, 2048, "GDN out_proj AND attn o_proj (shared kernel)"),
+    "fused_dequantize5_NT_matmul6_kernel": (
+        2048, 9216, "attn c_attn"),
+    "fused_dequantize3_NT_matmul3_kernel": (
+        2048, 1024, "shared expert gate_up"),
+    "fused_dequantize4_fused_NT_matmul4_multiply5_add1_kernel": (
+        512, 2048, "shared expert down + gate*add"),
+    # fp16, not quantized — see BITS
+    "NT_matmul2_kernel": (2048, 256, "MoE router gate (fp16)"),
 }
 
-# element size in bytes for the byte estimate
+# Non-GEMV traffic, as `(bytes_per_call, label)`. No geometry check applies — these do
+# not use the GEMV schedule, so gridX*64 means nothing for them.
+STATE_TRAFFIC_35B = {
+    # A get reads one state slot and writes a same-sized destination, so 2x the slot.
+    "rnn_state_get_1_kernel": (2 * 3 * 8192 * 2, "GDN conv state get (3x8192 fp16)"),
+    "rnn_state_set_1_kernel": (2 * 3 * 8192 * 2, "GDN conv state set (3x8192 fp16)"),
+    # The in-place fused kernel reads its 2 MiB slot and writes the next one. Its time
+    # also covers the recurrence itself, so this is a floor on traffic, not a pure
+    # bandwidth measurement — read the %wall column accordingly.
+    "gdn_func_inplace_kernel": (
+        2 * 32 * 128 * 128 * 4, "GDN recurrence, in-place state (reads slot h, writes h+1)"),
+    # Pre-in-place builds only. Kept so old traces still analyze.
+    "rnn_state_get_0_kernel": (2 * 32 * 128 * 128 * 4, "GDN recurrent state get (fp32 2 MiB slot)"),
+    "rnn_state_set_0_kernel": (2 * 32 * 128 * 128 * 4, "GDN recurrent state set (fp32 2 MiB slot)"),
+}
+
+# element size in bits for the weight byte estimate
 BITS = {
-    "NT_matmul4_kernel": 16.0,
-    "rnn_state_get_0_kernel": 32.0,
-    "rnn_state_set_0_kernel": 32.0,
-    "rnn_state_get_1_kernel": 16.0,
-    "rnn_state_set_1_kernel": 16.0,
+    "NT_matmul2_kernel": 16.0,
 }
 DEFAULT_BITS = 4.345  # q4f16_1 incl. group scales
 
-MODELS = {"35b": QWEN3_6_35B_A3B}
+MODELS = {"35b": (QWEN3_6_35B_A3B, STATE_TRAFFIC_35B)}
 
 
 def main() -> None:
@@ -119,6 +134,18 @@ def main() -> None:
     kernels = cur.execute(
         "SELECT shortName, start, end FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start"
     ).fetchall()
+
+    # Launch geometry per kernel name, for the N check on GEMV-schedule kernels.
+    # Only the (16,32,1) dlight GEMV schedule has the "one CTA per 64 output columns"
+    # property; anything else is left alone.
+    geom: dict[int, tuple[int, int]] = {}
+    for sn, gx, gy, bx, by in cur.execute(
+        "SELECT shortName, gridX, gridY, blockX, blockY FROM CUPTI_ACTIVITY_KIND_KERNEL "
+        "GROUP BY shortName, gridX, gridY, blockX, blockY "
+        "ORDER BY COUNT(*) DESC"
+    ).fetchall():
+        if sn not in geom and (bx, by) == (16, 32):
+            geom[sn] = (gx * 64, gy)
     if not kernels:
         sys.exit("no kernel rows — export the .nsys-rep with `nsys export --type sqlite`")
 
@@ -160,20 +187,35 @@ def main() -> None:
         busy_ns += e - s
 
     rows = []
-    table = MODELS[args.model]
+    gemv_table, state_table = MODELS[args.model]
+    warnings: list[str] = []
     for sn, ds in agg.items():
         name = names.get(sn, str(sn))
         n = len(ds)
         tot_ms = sum(ds) / 1e6 / n_steps
         per_tok = n / n_steps
         gbps = pct = None
-        if name in table:
-            params, _desc = table[name]
+        flag = " "
+        if name in gemv_table:
+            k, n_table, _desc = gemv_table[name]
+            n_real, experts = geom.get(sn, (n_table, 1))
+            if n_real != n_table:
+                flag = "!"
+                warnings.append(
+                    f"{name}: table says N={n_table}, launch geometry says N={n_real} "
+                    f"(gridX*64). Using {n_real}. The kernel this name refers to has "
+                    f"changed — update the table."
+                )
             bits = BITS.get(name, args.bits)
-            byts = params * bits / 8 * per_tok
+            byts = k * n_real * experts * bits / 8 * per_tok
             gbps = byts / (tot_ms / 1e3) / 1e9
             pct = gbps / ACHIEVABLE_GBPS * 100
-        rows.append((name, n, per_tok, sum(ds) / n / 1e3, tot_ms, gbps, pct))
+        elif name in state_table:
+            byts_per_call, _desc = state_table[name]
+            byts = byts_per_call * per_tok
+            gbps = byts / (tot_ms / 1e3) / 1e9
+            pct = gbps / ACHIEVABLE_GBPS * 100
+        rows.append((name + flag, n, per_tok, sum(ds) / n / 1e3, tot_ms, gbps, pct))
 
     rows.sort(key=lambda r: -r[4])
 
@@ -206,23 +248,28 @@ def main() -> None:
 
     # ---- roll-ups ---------------------------------------------------------
     def group(pred) -> float:
-        return sum(r[4] for r in rows if pred(r[0]))
+        return sum(r[4] for r in rows if pred(r[0].rstrip("! ")))
 
     print()
     state = group(lambda n: n.startswith("rnn_state_"))
-    tiny = group(lambda n: n in (
-        "fused_dequantize3_NT_matmul2_kernel",
-        "fused_dequantize3_fused_NT_matmul2_tir_sigmoid_cast2_kernel"))
-    print(f"rnn_state get/set (all 4)      {state:7.3f} ms/tok "
+    # Everything the conv-state fusion would absorb: the two copies plus the separate
+    # shift kernel that materializes the new state before `set` writes it back.
+    conv = group(lambda n: n in (
+        "rnn_state_get_1_kernel", "rnn_state_set_1_kernel", "update_conv_state1_kernel"))
+    gemvs = group(lambda n: n in gemv_table)
+    print(f"rnn_state copies still in decode  {state:7.3f} ms/tok "
           f"({state / wall_ms * 100:.1f}%)")
-    print(f"GDN in_proj_a + in_proj_b      {tiny:7.3f} ms/tok "
-          f"({tiny / wall_ms * 100:.1f}%)  <- 142 KB of weights")
+    print(f"conv-state fusion candidate       {conv:7.3f} ms/tok "
+          f"({conv / wall_ms * 100:.1f}%)  <- get_1 + set_1 + update_conv_state1")
+    print(f"identified weight GEMVs           {gemvs:7.3f} ms/tok "
+          f"({gemvs / wall_ms * 100:.1f}%)")
 
-    known = [r for r in rows if r[5] is not None and not r[0].startswith("rnn_state")]
-    if known:
-        w_ms = sum(r[4] for r in known)
-        print(f"identified weight GEMVs        {w_ms:7.3f} ms/tok "
-              f"({w_ms / wall_ms * 100:.1f}%)")
+    if warnings:
+        print("\n!! kernel table is stale — bandwidth numbers below the flagged rows "
+              "would have been wrong:")
+        for w in warnings:
+            print(f"   {w}")
+
 
 
 if __name__ == "__main__":
