@@ -1,7 +1,7 @@
 """RNN State modeling."""
 
 from collections.abc import Sequence
-from typing import Union
+from typing import Tuple, Union
 
 import tvm
 from tvm import relax as rx
@@ -161,6 +161,79 @@ class RNNState(Object):
                 )
             )
         )
+
+    def storage(
+        self,
+        layer_id: int,
+        state_id: int,
+        shape: Sequence[tirx.PrimExpr],
+        dtype: str,
+    ) -> Tensor:
+        """Raw handle on the whole state storage, for kernels that update the slot in place.
+
+        Returns the `(max_batch_size, max_history, *state_size)` buffer itself — no copy, and
+        no slot indexing. Pair it with `slot_ids()` and index inside the consumer kernel.
+
+        `max_batch_size` and `max_history` are runtime arguments to `create_rnn_state`, so no
+        Relax symbolic var naming them is in scope at the use site. The caller therefore
+        passes fresh vars for those two leading dims and this method binds them with a
+        `match_cast` — the standard Relax way to introduce shape vars from an otherwise
+        opaque value. Reusing one pair of vars across every layer is intended: the second
+        and later `match_cast`s degrade to cheap host-side assertions that all layers really
+        do share a storage geometry.
+
+        This exists so a fused recurrence kernel can replace the `get` -> compute -> `set`
+        pair, which costs two full state copies per layer per token (245 MiB/token on the
+        35B). Note the docstring on `get` has long claimed the single-sequence case "can
+        directly use the storage memory, without copying" — it never did, because `get` is
+        emitted as `call_dps_packed`, which by construction allocates a destination for the
+        builtin to fill.
+
+        Why not hand back a view of just the active slot instead: the slot offset is
+        `(seq_slot_id * max_history + history_slot_id) * state_size`, and `history_slot_id`
+        advances every step whenever `max_history > 1` (Phase 8 prefix caching sets it to 64).
+        A pointer baked into a captured CUDA graph would then address the wrong slot. Keeping
+        the addressing dynamic — whole buffer plus device-side index arrays — is cudagraph-safe
+        under any `max_history`.
+        """
+        bb = rx.BlockBuilder.current()
+        raw = bb.emit(
+            rx.call_pure_packed(
+                "vm.builtin.rnn_state_storage",
+                self._expr,
+                rx.PrimValue(layer_id),
+                rx.PrimValue(state_id),
+                sinfo_args=[rx.TensorStructInfo(ndim=len(shape), dtype=dtype)],
+            )
+        )
+        return Tensor(_expr=bb.match_cast(raw, rx.TensorStructInfo(shape, dtype)))
+
+    def slot_ids(self, batch_size: tirx.PrimExpr, dtype: str = "int32") -> Tuple[Tensor, Tensor]:
+        """The device-side `(seq_slot_ids, history_slot_ids)` arrays, shape `(batch_size,)`.
+
+        Only valid between `BeginForward` and `EndForward` — the runtime enforces this with
+        the same synchronization check `get`/`set` make. Use with `storage()`.
+        """
+        bb = rx.BlockBuilder.current()
+        seq = Tensor(
+            _expr=bb.emit(
+                rx.call_pure_packed(
+                    "vm.builtin.rnn_state_seq_slot_ids",
+                    self._expr,
+                    sinfo_args=[rx.TensorStructInfo((batch_size,), dtype)],
+                )
+            )
+        )
+        hist = Tensor(
+            _expr=bb.emit(
+                rx.call_pure_packed(
+                    "vm.builtin.rnn_state_history_slot_ids",
+                    self._expr,
+                    sinfo_args=[rx.TensorStructInfo((batch_size,), dtype)],
+                )
+            )
+        )
+        return seq, hist
 
     def set(self, layer_id: int, state_id: int, value: Tensor) -> "RNNState":
         """Set the state of the RNN layer.

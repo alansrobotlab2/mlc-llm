@@ -6,10 +6,10 @@ Our MLC model uses `model.` prefix. The mapping must translate between them.
 
 HF weight layout (under model.language_model.):
   Linear attention layers:
-    model.language_model.layers.{i}.linear_attn.in_proj_qkv.weight
-    model.language_model.layers.{i}.linear_attn.in_proj_z.weight
-    model.language_model.layers.{i}.linear_attn.in_proj_a.weight
-    model.language_model.layers.{i}.linear_attn.in_proj_b.weight
+    model.language_model.layers.{i}.linear_attn.in_proj_qkv.weight   ─┐ concatenated
+    model.language_model.layers.{i}.linear_attn.in_proj_z.weight      │ along axis 0
+    model.language_model.layers.{i}.linear_attn.in_proj_a.weight      │ into MLC's
+    model.language_model.layers.{i}.linear_attn.in_proj_b.weight     ─┘ in_proj_qkvzab
     model.language_model.layers.{i}.linear_attn.out_proj.weight
     model.language_model.layers.{i}.linear_attn.conv1d.weight
     model.language_model.layers.{i}.linear_attn.norm.weight
@@ -76,14 +76,27 @@ def huggingface(model_config: Qwen35Config, quantization: Quantization) -> Exter
             mlc_lin = f"model.layers.{i}.linear_attn"
             hf_lin = f"{hf}.layers.{i}.linear_attn"
 
-            # in_proj_qkv — maps directly (already fused in HF)
-            mlc_name = f"{mlc_lin}.in_proj_qkv.weight"
+            # Input projections: HF ships four separate tensors; the MLC layer fuses
+            # them into one GEMV (see Qwen35GatedDeltaNet.__init__). Concatenate along
+            # the output axis in exactly this order — the model splits at
+            # [qkv_dim, qkv_dim+z_dim, qkv_dim+z_dim+num_value_heads].
+            mlc_name = f"{mlc_lin}.in_proj_qkvzab.weight"
             if mlc_name in named_parameters:
                 mlc_param = named_parameters[mlc_name]
                 mapping.add_mapping(
                     mlc_name,
-                    [f"{hf_lin}.in_proj_qkv.weight"],
-                    functools.partial(lambda x, dtype: x.astype(dtype), dtype=mlc_param.dtype),
+                    [
+                        f"{hf_lin}.in_proj_qkv.weight",
+                        f"{hf_lin}.in_proj_z.weight",
+                        f"{hf_lin}.in_proj_a.weight",
+                        f"{hf_lin}.in_proj_b.weight",
+                    ],
+                    functools.partial(
+                        lambda qkv, z, a, bb, dtype: np.concatenate(
+                            [qkv, z, a, bb], axis=0
+                        ).astype(dtype),
+                        dtype=mlc_param.dtype,
+                    ),
                 )
 
             # A_log and dt_bias — no .weight suffix in HF

@@ -6,8 +6,9 @@ so the text backbone is nested under `model.language_model.*`. Vision tower
 (`model.visual.*`) and MTP head (`mtp.*`) are dropped.
 
 Notable HF layouts:
-- Linear-attention sub-projections are unfused (`in_proj_qkv` + separate
-  `in_proj_z`/`_a`/`_b`), matching the MLC layer structure 1:1.
+- Linear-attention sub-projections are unfused in HF (`in_proj_qkv` + separate
+  `in_proj_z`/`_a`/`_b`). The MLC layer fuses all four into `in_proj_qkvzab`, so
+  this loader concatenates them along the output axis — same treatment as q/k/v.
 - MoE experts are pre-stacked into single tensors:
     layers.{i}.mlp.experts.gate_up_proj  shape (num_experts, 2*moe_intermediate, hidden)
     layers.{i}.mlp.experts.down_proj     shape (num_experts, hidden, moe_intermediate)
@@ -67,13 +68,25 @@ def huggingface(model_config: Qwen35MoEConfig, quantization: Quantization) -> Ex
             mlc_lin = f"model.layers.{i}.linear_attn"
             hf_lin = f"{hf}.layers.{i}.linear_attn"
 
-            mlc_name = f"{mlc_lin}.in_proj_qkv.weight"
+            # HF ships in_proj_qkv / _z / _a / _b separately; the MLC layer fuses them
+            # into one GEMV. Order must match the split in Qwen35GatedDeltaNet._in_proj.
+            mlc_name = f"{mlc_lin}.in_proj_qkvzab.weight"
             if mlc_name in named_parameters:
                 mlc_param = named_parameters[mlc_name]
                 mapping.add_mapping(
                     mlc_name,
-                    [f"{hf_lin}.in_proj_qkv.weight"],
-                    functools.partial(lambda x, dtype: x.astype(dtype), dtype=mlc_param.dtype),
+                    [
+                        f"{hf_lin}.in_proj_qkv.weight",
+                        f"{hf_lin}.in_proj_z.weight",
+                        f"{hf_lin}.in_proj_a.weight",
+                        f"{hf_lin}.in_proj_b.weight",
+                    ],
+                    functools.partial(
+                        lambda qkv, z, a, bb, dtype: np.concatenate(
+                            [qkv, z, a, bb], axis=0
+                        ).astype(dtype),
+                        dtype=mlc_param.dtype,
+                    ),
                 )
 
             for param_name in ["A_log", "dt_bias"]:

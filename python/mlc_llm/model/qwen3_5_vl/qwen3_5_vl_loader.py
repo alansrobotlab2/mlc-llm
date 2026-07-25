@@ -61,13 +61,25 @@ def huggingface(model_config: Qwen35VLConfig, quantization: Quantization) -> Ext
             mlc_lin = f"model.layers.{i}.linear_attn"
             hf_lin = f"{HF_LM_PREFIX}.layers.{i}.linear_attn"
 
-            mlc_name = f"{mlc_lin}.in_proj_qkv.weight"
+            # HF ships in_proj_qkv / _z / _a / _b separately; the MLC layer fuses them
+            # into one GEMV. Order must match the split in Qwen35GatedDeltaNet._in_proj.
+            mlc_name = f"{mlc_lin}.in_proj_qkvzab.weight"
             if mlc_name in named_parameters:
                 mlc_param = named_parameters[mlc_name]
                 mapping.add_mapping(
                     mlc_name,
-                    [f"{hf_lin}.in_proj_qkv.weight"],
-                    functools.partial(lambda x, dtype: x.astype(dtype), dtype=mlc_param.dtype),
+                    [
+                        f"{hf_lin}.in_proj_qkv.weight",
+                        f"{hf_lin}.in_proj_z.weight",
+                        f"{hf_lin}.in_proj_a.weight",
+                        f"{hf_lin}.in_proj_b.weight",
+                    ],
+                    functools.partial(
+                        lambda qkv, z, a, bb, dtype: np.concatenate(
+                            [qkv, z, a, bb], axis=0
+                        ).astype(dtype),
+                        dtype=mlc_param.dtype,
+                    ),
                 )
 
             for param_name in ["A_log", "dt_bias"]:

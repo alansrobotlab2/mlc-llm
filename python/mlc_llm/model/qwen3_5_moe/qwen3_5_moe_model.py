@@ -10,6 +10,7 @@ Qwen35MoESparseMoeBlock and extends the config with MoE + mRoPE fields.
 """
 
 import dataclasses
+import os
 from typing import Any, Dict, List, Optional  # noqa: UP035
 
 import numpy as np
@@ -25,6 +26,8 @@ from mlc_llm.model.qwen35.qwen35_model import (
     Qwen35Config,
     Qwen35Embedding,
     Qwen35GatedDeltaNet,
+    _GDNStateIO,
+    _hoist_gdn_state_io,
 )
 from mlc_llm.nn import PagedKVCache, RopeMode
 from mlc_llm.nn.expert import MixtralExperts
@@ -199,12 +202,13 @@ class Qwen35MoEDecoderLayer(nn.Module):
         hidden_states: Tensor,
         paged_kv_cache: PagedKVCache,
         state: RNNState,
+        state_io: Optional["_GDNStateIO"] = None,
     ):
         out = self.input_layernorm(hidden_states)
         if self.layer_type == "full_attention":
             out = self.self_attn(out, paged_kv_cache, self.category_id)
         else:
-            out, state = self.linear_attn.forward(out, state)
+            out, state = self.linear_attn.forward(out, state, state_io)
         hidden_states = self._apply_residual(out, residual=hidden_states)
         out = self.post_attention_layernorm(hidden_states)
         out = self.mlp(out)
@@ -264,8 +268,19 @@ class Qwen35MoEModel(nn.Module):
         state: RNNState,
     ):
         hidden_states = inputs
+        # Hoisted above the loop on purpose — see `_GDNStateIO` in qwen35_model.py.
+        gdn_layers = [l for l in self.layers if l.layer_type != "full_attention"]
+        state_io = None
+        if gdn_layers and os.environ.get("MLC_QWEN35_INPLACE_STATE", "1") != "0":
+            gdn = gdn_layers[0].linear_attn
+            state_io = _hoist_gdn_state_io(
+                state,
+                [l.linear_attn.linear_layer_idx for l in gdn_layers],
+                hidden_states.shape[0],
+                (gdn.num_value_heads, gdn.key_head_dim, gdn.value_head_dim),
+            )
         for layer in self.layers:
-            hidden_states, state = layer.forward(hidden_states, paged_kv_cache, state)
+            hidden_states, state = layer.forward(hidden_states, paged_kv_cache, state, state_io)
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
 

@@ -191,6 +191,10 @@ QUANTIZATION: Dict[str, Quantization] = {  # noqa: UP006
     # Fallback for tiny / non-/64-aligned Linears uses GroupQuantize at g=32 (hardcoded
     # in FTQuantize.fallback_group_quantize). For Qwen3.5/Next those tiny Linears
     # (in_proj_a/b, out=16) hit the fallback but the bisect showed they're not load-bearing.
+    # Since the in_proj_qkvzab fusion those two no longer exist as standalone Linears. The
+    # fused width is /64-aligned on the 35B-A3B (12352 = 193*64) so nothing there takes the
+    # fallback; on the 0.8B it is not (8224 = 128.5*64), so that one still does — just once
+    # per layer for a wide tensor instead of twice for two 16-row ones.
     "q4f16_ft_g64": FTQuantize(
         name="q4f16_ft_g64",
         kind="ft-quant",

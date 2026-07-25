@@ -422,6 +422,168 @@ def create_gated_delta_net_func(
     return gdn_func
 
 
+def create_gated_delta_net_func_inplace(
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    dtype: str,
+):
+    """GatedDeltaNet recurrence that reads and writes the RNNState slot directly.
+
+    Same math as `create_gated_delta_net_func`, but instead of taking a pre-copied
+    `state_in` tensor and emitting a `state_out` tensor for the runtime to copy back,
+    this variant takes the whole state storage buffer plus the device-side slot-index
+    arrays and does the slot addressing itself:
+
+        load  from storage[seq_slot,       hist_slot,           head, row, col]
+        flush into storage[seq_slot, (hist_slot + 1) % max_hist, head, row, col]
+
+    That saves two full state copies per layer per token. On the 35B the `get`/`set`
+    pair moves 4 MiB per call, 60 calls/token = 245 MiB/token, which traced at
+    1.195 ms/token (6.3% of the decode budget) even though both copy kernels already
+    run at 205-216 GB/s.
+
+    **The `+ 1` in the write index is load-bearing.** It mirrors `RNNState.create_set_func`,
+    which writes the *next* history slot while `create_get_func` reads the current one:
+    the pair is a ring-buffer advance, not a redundant copy. The previous state has to
+    survive at `hist_slot` for Phase 8's `PopN` prefix-cache rollback to read it back.
+
+    Writing into `hist_slot` instead is the obvious implementation and it is wrong. This
+    was built and measured as a negative control (2026-07-25): under
+    `prefix_cache_mode="disable"` — `max_history == 1`, the two slots coincide, and what
+    every bench harness sets — it passes everything, including
+    `scripts/prefix_cache_roundtrip.py` 4/4. Under the *default* `"radix"` mode
+    (`max_history == 64`) `EndForward` advances into a slot the kernel never wrote, so it
+    fails greedy parity on all 5 prompts (3-16/50 tokens) and the round-trip gate 13
+    ways. So the failure is loud **if** you gate under radix, and invisible if you only
+    ever gate under the mode the benchmarks use.
+
+    Aliasing is safe by construction, including when the two slots do coincide. Thread
+    `(b_idx, h_idx, col)` owns exactly one column of the state matrix: it reads
+    `storage[..., row, col]` once per `row` on entry, holds that column in registers
+    across every pass and every `t`, and writes `storage[..., row, col]` once per `row`
+    on exit. The read set and the write set are identical per element and disjoint
+    across threads, so no thread can ever observe another thread's write. This is a
+    stronger guarantee than "the recurrence is elementwise in S", and it is what
+    distinguishes this from the aliasing bug in SGLang #20791, where a scheduler
+    introduced aliasing into a kernel that did have cross-thread state reads.
+
+    `max_batch_size` and `max_history` are bound from the storage tensor's own shape at
+    runtime rather than baked in, so one kernel is correct for every RNNState
+    configuration. Keeping the addressing dynamic — whole buffer plus *device-side*
+    index arrays — is also what makes this cudagraph-safe: `EndForward` advances
+    `history_slot_id` every step once `max_history > 1`, so a slot pointer baked into a
+    captured graph would silently address the wrong slot.
+    """
+    heads_per_group = num_value_heads // num_key_heads
+    K = key_head_dim
+    V = value_head_dim
+
+    @T.prim_func
+    def gdn_func_inplace(
+        q_handle: T.handle,
+        k_handle: T.handle,
+        v_handle: T.handle,
+        gate_handle: T.handle,  # exp(g), already exponentiated
+        beta_handle: T.handle,  # sigmoid(beta_raw)
+        storage_handle: T.handle,  # the whole (max_batch, max_hist, H, K, V) state buffer
+        seq_slot_handle: T.handle,  # device-side per-batch seq slot ids
+        hist_slot_handle: T.handle,  # device-side per-batch history slot ids
+        out_handle: T.handle,
+    ):
+        T.func_attr({"op_pattern": 8, "tirx.noalias": True, "tirx.is_scheduled": 1})
+        batch_size, seq_len = T.int64(), T.int64()
+        max_batch_size, max_history = T.int64(), T.int64()
+        # q, k: (batch, seq_len, key_heads, K)
+        q_buf = T.match_buffer(q_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        k_buf = T.match_buffer(k_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        # v: (batch, seq_len, value_heads, V)
+        v_buf = T.match_buffer(v_handle, (batch_size, seq_len, num_value_heads, V), dtype=dtype)
+        # gate and beta: (batch, seq_len, value_heads)
+        gate_buf = T.match_buffer(
+            gate_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        beta_buf = T.match_buffer(
+            beta_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        # The whole state storage, not a slot view. max_batch_size / max_history are
+        # bound from the tensor's own shape here.
+        storage_buf = T.match_buffer(
+            storage_handle,
+            (max_batch_size, max_history, num_value_heads, K, V),
+            dtype="float32",
+        )
+        seq_slot_buf = T.match_buffer(seq_slot_handle, (batch_size,), dtype="int32")
+        hist_slot_buf = T.match_buffer(hist_slot_handle, (batch_size,), dtype="int32")
+        # Output in fp32 for numerical stability (cast to model dtype by caller)
+        out_buf = T.match_buffer(
+            out_handle, (batch_size, seq_len, num_value_heads, V), dtype="float32"
+        )
+
+        scale = T.float32(1.0 / math.sqrt(K))
+
+        for b_idx in T.thread_binding(batch_size, thread="blockIdx.y"):
+            for h_idx in T.thread_binding(num_value_heads, thread="blockIdx.x"):
+                for col in T.thread_binding(V, thread="threadIdx.x"):
+                    with T.sblock("gdn_thread"):
+                        # Per-thread register-resident state column: 128 fp32.
+                        # Persists across all (t, pass) iterations; flushed once at end.
+                        state_local = T.sblock_alloc_buffer((K,), "float32", scope="local")
+                        dot_sk = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                        dot_sq = T.sblock_alloc_buffer((1,), "float32", scope="local")
+
+                        kh = h_idx // heads_per_group
+
+                        # Resolve this batch element's slot pair once.
+                        seq_id: T.int64 = T.cast(seq_slot_buf[b_idx], "int64")
+                        hist_in: T.int64 = T.cast(hist_slot_buf[b_idx], "int64")
+                        # Ring advance — see the docstring; must match create_set_func.
+                        hist_out: T.int64 = (hist_in + T.int64(1)) % max_history
+
+                        # Load the state column straight out of its slot (one GMEM read
+                        # per element — the copy this replaces did two).
+                        for row in range(K):
+                            state_local[row] = storage_buf[seq_id, hist_in, h_idx, row, col]
+
+                        # Sequential loop over tokens (like RWKV6)
+                        for t in range(seq_len):
+                            gate_val = gate_buf[b_idx, t, h_idx]
+                            beta_val = beta_buf[b_idx, t, h_idx]
+                            v_val = T.cast(v_buf[b_idx, t, h_idx, col], "float32")
+
+                            # Pass 1: decay + dot(S, k) fused
+                            #   S[r] *= gate;  dot_sk += S[r] * k[r]
+                            dot_sk[0] = T.float32(0)
+                            for row in range(K):
+                                state_local[row] = state_local[row] * gate_val
+                                dot_sk[0] = dot_sk[0] + state_local[row] * T.cast(
+                                    k_buf[b_idx, t, kh, row], "float32"
+                                )
+
+                            # Pass 2: delta + dot(S', q) fused
+                            #   S[r] += k[r] * beta * (v - dot_sk)
+                            #   dot_sq += S[r] * q[r]
+                            coef = beta_val * (v_val - dot_sk[0])
+                            dot_sq[0] = T.float32(0)
+                            for row in range(K):
+                                state_local[row] = state_local[row] + T.cast(
+                                    k_buf[b_idx, t, kh, row], "float32"
+                                ) * coef
+                                dot_sq[0] = dot_sq[0] + state_local[row] * T.cast(
+                                    q_buf[b_idx, t, kh, row], "float32"
+                                )
+
+                            # Output with scale
+                            out_buf[b_idx, t, h_idx, col] = dot_sq[0] * scale
+
+                        # Flush registers straight into the next history slot.
+                        for row in range(K):
+                            storage_buf[seq_id, hist_out, h_idx, row, col] = state_local[row]
+
+    return gdn_func_inplace
+
+
 def create_gated_delta_net_func_with_history(
     num_key_heads: int,
     num_value_heads: int,
@@ -556,24 +718,49 @@ class Qwen35GatedDeltaNet(nn.Module):
             + (self.num_value_heads * self.value_head_dim)
         )
 
-        # Projections — matching HF weight names
-        self.in_proj_qkv = nn.Linear(config.hidden_size, qkv_dim, bias=False)
-        self.in_proj_z = nn.Linear(
-            config.hidden_size, self.num_value_heads * self.value_head_dim, bias=False
+        # Input projections, fused into ONE GEMV.
+        #
+        # HF ships four separate tensors (in_proj_qkv / _z / _a / _b) and this layer
+        # used to mirror that 1:1. All four read the same `hidden_size` activation, so
+        # they are one matmul with the outputs concatenated — exactly the fusion
+        # `Qwen35Attention.c_attn` already does for q/k/v, and the loader concatenates
+        # them the same way.
+        #
+        # Why: at batch 1 the split cost 130.6 us per GDN layer on Orin (66.1 + 48.6 +
+        # 8.1 + 7.7) against 99.7 us fused — the two `->num_value_heads` projections are
+        # so narrow that the 64-outputs-per-CTA GEMV schedule emits grid=(1,1,1), i.e.
+        # one CTA on a 16-SM GPU, and they burned 2.5% of the token budget to move
+        # 142 KB. Fused: 4.5% of the decode budget and 90 fewer launches per token.
+        # See workplan-cuda-13.md §4.6/§5.
+        #
+        # This is bit-exact, not an approximation: group quantization groups along the
+        # reduction axis (`linear_quant_axis = 1` for the NK layout, see
+        # quantization/group_quantization.py), so concatenating along output rows leaves
+        # every group boundary and every scale untouched.
+        self.qkv_dim = qkv_dim
+        self.z_dim = self.num_value_heads * self.value_head_dim
+        self.in_proj_qkvzab = nn.Linear(
+            config.hidden_size,
+            qkv_dim + self.z_dim + self.num_value_heads + self.num_value_heads,
+            bias=False,
         )
-        self.in_proj_a = nn.Linear(config.hidden_size, self.num_value_heads, bias=False)
-        self.in_proj_b = nn.Linear(config.hidden_size, self.num_value_heads, bias=False)
         self.out_proj = nn.Linear(
             self.num_value_heads * self.value_head_dim, config.hidden_size, bias=False
         )
 
         # Bisect hook: env var QWEN35_NO_QUANT=<comma-separated module names> marks
         # the listed Linear submodules with no_quantization=True so the GroupQuantize/
-        # FTQuantize Mutator skips them. Used for narrowing down q4 correctness bug.
-        # Names: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj.
+        # FTQuantize Mutator skips them. Used for narrowing down q4 correctness bugs.
+        # Names: in_proj_qkvzab, out_proj. The legacy per-sub-projection names
+        # (in_proj_qkv / _z / _a / _b) are accepted and all mark the fused Linear —
+        # sub-projection granularity is no longer separable, so a bisect that needs it
+        # has to un-fuse first.
         skip = os.environ.get("QWEN35_NO_QUANT", "")
         if skip:
+            legacy = {"in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"}
             for n in (s.strip() for s in skip.split(",")):
+                if n in legacy:
+                    n = "in_proj_qkvzab"
                 if n and hasattr(self, n):
                     getattr(self, n).no_quantization = True
 
@@ -589,8 +776,41 @@ class Qwen35GatedDeltaNet(nn.Module):
         # Output gating norm — per-head RMSNorm (shared weight across heads)
         self.norm = nn.RMSNorm(self.value_head_dim, -1, config.rms_norm_eps, bias=False)
 
-    def forward(self, hidden_states: Tensor, state: RNNState) -> Tuple[Tensor, RNNState]:  # noqa: UP006
-        """Forward using RNNState (for MLCEngine batch methods)."""
+    def _in_proj(self, hidden_states: Tensor, per_token_seq: int = 0):
+        """Fused input projection, split back into (qkv, z, alpha, beta_raw).
+
+        `per_token_seq` > 0 runs the projection one token at a time and concatenates —
+        the small-static-seq GEMV dispatch the verify path needs (see the comment at the
+        `forward_with_history` call site). 0 means project the whole `hidden_states` in
+        one call.
+        """
+        if per_token_seq:
+            h_parts = op.split(hidden_states, indices_or_sections=per_token_seq, axis=1)
+            fused = op.concat(
+                [self.in_proj_qkvzab(h_parts[t]) for t in range(per_token_seq)], dim=1
+            )
+        else:
+            fused = self.in_proj_qkvzab(hidden_states)
+        n_vh = self.num_value_heads
+        parts = op.split(
+            fused,
+            [self.qkv_dim, self.qkv_dim + self.z_dim, self.qkv_dim + self.z_dim + n_vh],
+            axis=-1,
+        )
+        return parts[0], parts[1], parts[2], parts[3]
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        state: RNNState,
+        state_io: Optional["_GDNStateIO"] = None,
+    ) -> Tuple[Tensor, RNNState]:  # noqa: UP006
+        """Forward using RNNState (for MLCEngine batch methods).
+
+        When `state_io` is supplied the recurrent state is updated in place by the fused
+        kernel and the `get`/`set` copy pair is skipped entirely; otherwise the original
+        copy path runs unchanged.
+        """
         b, s, _ = hidden_states.shape
         K = self.key_head_dim
         V = self.value_head_dim
@@ -598,11 +818,8 @@ class Qwen35GatedDeltaNet(nn.Module):
         n_vh = self.num_value_heads
         layer_idx = self.linear_layer_idx
 
-        # Input projections
-        qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states)
-        alpha = self.in_proj_a(hidden_states)
-        beta_raw = self.in_proj_b(hidden_states)
+        # Input projections — one GEMV, then split
+        qkv, z, alpha, beta_raw = self._in_proj(hidden_states)
 
         # Get conv state from RNNState (state_id=1)
         qkv_dim = qkv.shape[-1]
@@ -636,31 +853,60 @@ class Qwen35GatedDeltaNet(nn.Module):
         gate, beta = self._compute_gate_beta(alpha, beta_raw)
         # beta is already (b, s, n_vh) — no GVA expansion needed.
 
-        # Get recurrent state from RNNState (state_id=0)
-        state_in_layer = state.get(layer_idx, 0, (b, n_vh, K, V), "float32")
+        if state_io is not None:
+            # Fused path: the kernel loads from and flushes to the state slot itself, so
+            # neither the `get` copy nor the `set` copy is emitted.
+            storage = state_io.storages[layer_idx]
+            args = [q, k, v, gate, beta, storage, state_io.seq_slot_ids, state_io.history_slot_ids]
+            # Identity, not `.index()` — `==` on a Tensor is an elementwise op, not a
+            # predicate, so equality-based search is the wrong tool here.
+            storage_idx = next(i for i, a in enumerate(args) if a is storage)
+            out_recurrent, _ = op.tensor_ir_inplace_op(
+                create_gated_delta_net_func_inplace(
+                    num_key_heads=n_kh,
+                    num_value_heads=n_vh,
+                    key_head_dim=K,
+                    value_head_dim=V,
+                    dtype=self.dtype,
+                ),
+                "gated_delta_net_inplace",
+                args,
+                # Output 0 is the freshly allocated recurrent output and is the only one
+                # read; output 1 aliases the storage argument, and declaring that alias is
+                # what makes the in-place write visible to the rest of the graph.
+                inplace_indices=[-1, storage_idx],
+                out=[
+                    Tensor.placeholder([b, s, n_vh, V], "float32"),
+                    Tensor(_expr=storage._expr),
+                ],
+            )
+            out_recurrent = op.astype(out_recurrent, self.dtype)
+        else:
+            # Copy path (unchanged): get -> compute -> set.
+            state_in_layer = state.get(layer_idx, 0, (b, n_vh, K, V), "float32")
 
-        # Recurrent computation via TIR kernel
-        out_recurrent, state_out_layer = op.tensor_ir_op(
-            create_gated_delta_net_func(
-                num_key_heads=n_kh,
-                num_value_heads=n_vh,
-                key_head_dim=K,
-                value_head_dim=V,
-                dtype=self.dtype,
-            ),
-            "gated_delta_net",
-            [q, k, v, gate, beta, state_in_layer],
-            [
-                Tensor.placeholder([b, s, n_vh, V], "float32"),
-                Tensor.placeholder([b, n_vh, K, V], "float32"),
-            ],
-        )
+            # Recurrent computation via TIR kernel
+            out_recurrent, state_out_layer = op.tensor_ir_op(
+                create_gated_delta_net_func(
+                    num_key_heads=n_kh,
+                    num_value_heads=n_vh,
+                    key_head_dim=K,
+                    value_head_dim=V,
+                    dtype=self.dtype,
+                ),
+                "gated_delta_net",
+                [q, k, v, gate, beta, state_in_layer],
+                [
+                    Tensor.placeholder([b, s, n_vh, V], "float32"),
+                    Tensor.placeholder([b, n_vh, K, V], "float32"),
+                ],
+            )
 
-        # Cast recurrent output back to model dtype
-        out_recurrent = op.astype(out_recurrent, self.dtype)
+            # Cast recurrent output back to model dtype
+            out_recurrent = op.astype(out_recurrent, self.dtype)
 
-        # Write updated state back to RNNState (state_id=0)
-        state = state.set(layer_idx, 0, state_out_layer)
+            # Write updated state back to RNNState (state_id=0)
+            state = state.set(layer_idx, 0, state_out_layer)
 
         # Output gating
         out_normed = self.norm(out_recurrent)
@@ -691,17 +937,9 @@ class Qwen35GatedDeltaNet(nn.Module):
         # the dl.gpu.GEMV() path saves substantial verify cost. Triggered by the
         # seq_len-pinned `batch_verify_g{1..4}` spec entries on the 35B target;
         # 0.8B target's dynamic-seq verify falls through unchanged.
-        if isinstance(s, int) and 1 < s <= 5:
-            h_parts = op.split(hidden_states, indices_or_sections=s, axis=1)
-            qkv = op.concat([self.in_proj_qkv(h_parts[t]) for t in range(s)], dim=1)
-            z = op.concat([self.in_proj_z(h_parts[t]) for t in range(s)], dim=1)
-            alpha = op.concat([self.in_proj_a(h_parts[t]) for t in range(s)], dim=1)
-            beta_raw = op.concat([self.in_proj_b(h_parts[t]) for t in range(s)], dim=1)
-        else:
-            qkv = self.in_proj_qkv(hidden_states)
-            z = self.in_proj_z(hidden_states)
-            alpha = self.in_proj_a(hidden_states)
-            beta_raw = self.in_proj_b(hidden_states)
+        qkv, z, alpha, beta_raw = self._in_proj(
+            hidden_states, per_token_seq=s if isinstance(s, int) and 1 < s <= 5 else 0
+        )
 
         qkv_dim = qkv.shape[-1]
         conv_state = state.get(
@@ -930,6 +1168,57 @@ class Qwen35GatedDeltaNet(nn.Module):
 
 
 # ============================================================================
+# In-place GDN recurrent-state access
+# ============================================================================
+
+
+@dataclasses.dataclass
+class _GDNStateIO:
+    """Hoisted handles that let the GDN kernel update its state slot in place.
+
+    Holds the device-side slot-index arrays (shared by every layer) and one raw storage
+    handle per GDN layer, so `Qwen35GatedDeltaNet.forward` can call the fused kernel
+    instead of the `rnn_state_get` -> `gdn_func` -> `rnn_state_set` triple.
+
+    These are emitted **once, above the layer loop** rather than inside each layer, and
+    that placement is deliberate. TVM's cudagraph pass treats every `vm.builtin.*` call
+    as non-static and calls `EndRegion()` on it
+    ([rewrite_cuda_graph.cc:383](../../../3rdparty/tvm/src/relax/transform/rewrite_cuda_graph.cc#L383)),
+    so emitting the handles per-layer would cut the capture region once more per layer on
+    top of the cut the fused kernel itself causes. Hoisting keeps them in a single eager
+    prologue; they are host-side handle fetches and launch no kernels.
+    """
+
+    seq_slot_ids: Tensor
+    history_slot_ids: Tensor
+    storages: Dict[int, Tensor]  # linear_layer_idx -> whole-storage handle for state 0
+
+
+def _hoist_gdn_state_io(
+    state: RNNState,
+    linear_layer_ids: List[int],
+    batch_size: tirx.PrimExpr,
+    state_shape: Tuple[int, int, int],  # noqa: UP006
+) -> _GDNStateIO:
+    """Emit the slot-id views and per-layer storage handles up front. See `_GDNStateIO`."""
+    seq_slot_ids, history_slot_ids = state.slot_ids(batch_size)
+    # The two leading storage dims are runtime `create_rnn_state` arguments, so nothing in
+    # scope names them; fresh vars bound by `RNNState.storage`'s match_cast stand in. One
+    # pair is shared by every layer — they all index the same geometry.
+    max_batch_size = tirx.Var("rnn_max_batch_size", "int64")
+    max_history = tirx.Var("rnn_max_history", "int64")
+    return _GDNStateIO(
+        seq_slot_ids=seq_slot_ids,
+        history_slot_ids=history_slot_ids,
+        # state_id 0 is the recurrent state: (max_batch, max_hist, n_vh, K, V).
+        storages={
+            idx: state.storage(idx, 0, (max_batch_size, max_history, *state_shape), "float32")
+            for idx in linear_layer_ids
+        },
+    )
+
+
+# ============================================================================
 # Decoder Layer (dispatches between GDN and standard attention)
 # ============================================================================
 
@@ -960,13 +1249,14 @@ class Qwen35DecoderLayer(nn.Module):
         paged_kv_cache: PagedKVCache,
         state: RNNState,
         position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,  # noqa: UP006
+        state_io: Optional["_GDNStateIO"] = None,
     ):
         out = self.input_layernorm(hidden_states)
         if self.layer_type == "full_attention":
             out = self.self_attn(out, paged_kv_cache, self.category_id, position_embeddings)
         else:
             # GDN ignores positions; mRoPE only routes to softmax-attn layers.
-            out, state = self.linear_attn.forward(out, state)
+            out, state = self.linear_attn.forward(out, state, state_io)
         hidden_states = self._apply_residual(out, residual=hidden_states)
         out = self.post_attention_layernorm(hidden_states)
         out = self.mlp(out)
@@ -1119,9 +1409,22 @@ class Qwen35Model(nn.Module):
             )
             cos, sin = self.rotary_emb(hidden_states, position_ids)
             position_embeddings = (cos, sin)
+        # Hoisted above the loop on purpose — see `_GDNStateIO`.
+        # MLC_QWEN35_INPLACE_STATE=0 compiles the old get/set copy path instead, so an A/B
+        # can be source- and flag-identical rather than a rebuild against an older tree.
+        gdn_layers = [l for l in self.layers if l.layer_type != "full_attention"]
+        state_io = None
+        if gdn_layers and os.environ.get("MLC_QWEN35_INPLACE_STATE", "1") != "0":
+            gdn = gdn_layers[0].linear_attn
+            state_io = _hoist_gdn_state_io(
+                state,
+                [l.linear_attn.linear_layer_idx for l in gdn_layers],
+                hidden_states.shape[0],
+                (gdn.num_value_heads, gdn.key_head_dim, gdn.value_head_dim),
+            )
         for layer_id, layer in enumerate(self.layers):
             hidden_states, state = layer.forward(
-                hidden_states, paged_kv_cache, state, position_embeddings
+                hidden_states, paged_kv_cache, state, position_embeddings, state_io
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
