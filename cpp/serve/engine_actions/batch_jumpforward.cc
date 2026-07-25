@@ -74,6 +74,20 @@ class BatchJumpForwardActionObj : public EngineActionObj {
       auto [rollback_cnt, new_tokens, new_string] =
           RetokenizeWithNewString(mstate, jump_forward_str, MAX_ROLLBACK_TOKENS_);
 
+      // `HandleRollback` pops from the KV cache, which on a hybrid model also rewinds the
+      // GDN recurrent state -- and that reaches only as far back as the RNNState history
+      // ring, which holds no rollback slots at all when prefix caching is disabled. Only
+      // the part of the rollback beyond `num_tokens_for_next_decode` touches the state;
+      // the rest is tokens that have not been through the model yet. When the state cannot
+      // be rewound that far, skip the jump forward for this entry instead of aborting the
+      // engine loop inside `PopN`. The grammar still constrains the following ordinary
+      // decode step, so the output stays valid -- only the jump-forward speedup is lost.
+      int state_rollback_cnt = rollback_cnt - mstate->num_tokens_for_next_decode;
+      if (state_rollback_cnt > 0 &&
+          models_[0]->GetRNNStateAvailableHistory(mstate->internal_id) < state_rollback_cnt) {
+        continue;
+      }
+
       HandleRollback(rsentry, mstate, rollback_cnt, new_tokens, new_string);
 
       // Commit new tokens (kv cache is handled in the next decode)

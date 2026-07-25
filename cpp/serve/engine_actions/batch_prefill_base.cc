@@ -227,10 +227,30 @@ BatchPrefillBaseActionObj::GetRequestStateEntriesToPrefill(EngineState estate) {
     return {};
   }
 
-  // Add the decode requests to the prefill inputs if prefill mode is hybrid.
   std::vector<PrefillInput> prefill_inputs(prefill_inputs_for_all_models[0].begin(),
                                            prefill_inputs_for_all_models[0].end());
-  if (engine_config_->prefill_mode == PrefillMode::kHybrid) {
+
+  // Models carrying an RNN state cannot run a prefill forward over more than one sequence.
+  // `batch_prefill` takes the batch concatenated into a single `(1, total_len, h)` row —
+  // per-sequence boundaries live only in the PagedKVCache — while `RNNState::BeginForward`
+  // is told about all N sequences. `RNNState::Get` then fills `cur_batch_size_` rows into a
+  // destination the model sized from `hidden_states.shape[0]` (== 1) and raises
+  // "Mismatched output.shape[0] ... expected to match seq_slot_ids.shape[0]". Even with the
+  // shapes reconciled the recurrence and the causal conv would run straight across the
+  // sequence boundary, so one sequence per prefill step is the semantics, not a workaround.
+  // Decode is unaffected: `BatchDecode` passes `(num_seq, 1, h)`, which does agree with
+  // `cur_batch_size_`, so batching there still works and is where the throughput is.
+  bool rnn_state_present =
+      kv_state_kind_ == KVStateKind::kRNNState || kv_state_kind_ == KVStateKind::kHybrid;
+  if (rnn_state_present && num_prefill_inputs > 1) {
+    prefill_inputs.resize(1);
+    num_prefill_inputs = 1;
+  }
+
+  // Add the decode requests to the prefill inputs if prefill mode is hybrid.
+  // Skipped when an RNN state is present, for the same reason: folding the running
+  // sequences in would put several sequences into one prefill forward.
+  if (engine_config_->prefill_mode == PrefillMode::kHybrid && !rnn_state_present) {
     prefill_inputs.reserve(num_decode_inputs + num_prefill_inputs);
     for (const RequestStateEntry& rsentry : *running_rsentries) {
       prefill_inputs.push_back(

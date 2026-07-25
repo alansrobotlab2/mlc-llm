@@ -5,6 +5,7 @@
 
 #include <tvm/runtime/nvtx.h>
 
+#include <algorithm>
 #include <numeric>
 
 #include "../../support/random.h"
@@ -37,7 +38,11 @@ class BatchDecodeActionObj : public EngineActionObj {
         logit_processor_(std::move(logit_processor)),
         sampler_(std::move(sampler)),
         engine_config_(std::move(engine_config)),
-        trace_recorder_(std::move(trace_recorder)) {}
+        trace_recorder_(std::move(trace_recorder)) {
+    KVStateKind kv_state_kind = models_[0]->GetMetadata().kv_state_kind;
+    rnn_state_present_ =
+        kv_state_kind == KVStateKind::kRNNState || kv_state_kind == KVStateKind::kHybrid;
+  }
 
   Array<Request> Step(EngineState estate) final {
     // - Do not run decode when there is no running request.
@@ -62,6 +67,24 @@ class BatchDecodeActionObj : public EngineActionObj {
              std::min(static_cast<int64_t>(engine_config_->max_num_sequence),
                       engine_config_->prefill_chunk_size)) {
         running_rsentries.pop_back();
+      }
+      // A decode step whose entries do not all want exactly one token falls through to
+      // `BatchPrefill` below, and models carrying an RNN state cannot run a prefill forward
+      // over more than one sequence — see the long note in batch_prefill_base.cc. So when a
+      // multi-token entry shows up (jump-forward decoding under a grammar is what produces
+      // one), advance exactly that entry this step and let the rest decode together on the
+      // next. Picking the multi-token entry rather than the first entry is what keeps it
+      // from starving: it is the only one whose count this step can bring back down to 1.
+      // The single-token case — everything else — keeps the full batch and goes through
+      // `BatchDecode`, which passes `(num_seq, 1, h)` and is per-sequence correct.
+      if (rnn_state_present_ && running_rsentries.size() > 1) {
+        auto it = std::find_if(running_rsentries.begin(), running_rsentries.end(),
+                               [](const RequestStateEntry& rsentry) {
+                                 return rsentry->mstates[0]->num_tokens_for_next_decode > 1;
+                               });
+        if (it != running_rsentries.end()) {
+          running_rsentries = {*it};
+        }
       }
     }
 
@@ -268,6 +291,21 @@ class BatchDecodeActionObj : public EngineActionObj {
     auto [rollback_cnt, new_tokens] =
         RetokenizeWithNewToken(mstate, sample_result.GetTokenId(), MAX_ROLLBACK_TOKENS_);
 
+    // 2a. A rollback on a hybrid model also rewinds the GDN recurrent state, and that can
+    // only reach as far back as the RNNState history ring. The ring is one slot deep --
+    // i.e. no rollback is possible at all -- whenever prefix caching is disabled, so
+    // `PopN` would abort the engine loop with "only has 0 available history". Retokenization
+    // only refines token boundaries so that the committed ids match a fresh tokenization of
+    // the same text; it is not required for correctness. When the state cannot be rewound,
+    // commit the sampled token as-is, exactly as the `rollback_cnt == 0` case below does.
+    // Checked before step 3 because that step mutates the callback bookkeeping.
+    if (rollback_cnt > 0 &&
+        models_[0]->GetRNNStateAvailableHistory(mstate->internal_id) < rollback_cnt) {
+      mstate->CommitToken(sample_result);
+      rsentry->rstate->metrics.completion_tokens += 1;
+      return;
+    }
+
     // 3. Handle output when retokenization happens
     if (rollback_cnt >
         static_cast<int>(committed_tokens.size()) - rsentry->next_callback_token_pos) {
@@ -309,6 +347,8 @@ class BatchDecodeActionObj : public EngineActionObj {
   EngineConfig engine_config_;
   /*! \brief Event trace recorder. */
   Optional<EventTraceRecorder> trace_recorder_;
+  /*! \brief Whether the model carries an RNN state, and so cannot batch a prefill forward. */
+  bool rnn_state_present_ = false;
   /*! \brief The maximum number of tokens to retokenize and may be rolled back. */
   const int MAX_ROLLBACK_TOKENS_ = 10;
 };

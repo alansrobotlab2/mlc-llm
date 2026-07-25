@@ -477,6 +477,19 @@ class EngineImpl : public Engine {
           engine_config->speculative_mode != SpeculativeMode::kDisable) {
         int min_required = engine_config->spec_draft_length + 2;
         model_max_history_size = std::max(model_max_history_size, min_required);
+        if (engine_config->max_num_sequence > 1) {
+          // The verify and draft forwards pack the batch into a single `(1, total_len, h)`
+          // row, which an RNN state cannot service for more than one sequence — the same
+          // constraint documented in batch_prefill_base.cc. Prefill and ordinary decode are
+          // handled there and in batch_decode.cc; the speculative actions are not, so this
+          // combination still aborts once two sequences are drafted at once.
+          LOG(WARNING) << "Speculative decoding on a hybrid (attention + recurrent) model is "
+                          "only supported with max_num_sequence = 1; "
+                       << engine_config->max_num_sequence
+                       << " was requested. Verify/draft steps with more than one sequence in "
+                          "flight will fail in rnn_state_get. Set max_num_sequence = 1, or "
+                          "disable speculative decoding to serve concurrently.";
+        }
       }
       model->CreateKVCache(engine_config->kv_cache_page_size, engine_config->max_num_sequence,
                            engine_config->max_total_sequence_length,
