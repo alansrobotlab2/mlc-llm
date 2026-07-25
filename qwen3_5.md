@@ -16,40 +16,188 @@ Strict ordering — nothing on 35B until 0.8B passes the parity bar in §11.
 
 ## 2. Quick Start: Compile & Run Qwen3.6-35B-A3B on Orin
 
-End-to-end recipe for the shipped lib at [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/). Tested on Orin AGX (sm_87, MAXN). ~25 min cold from a fresh clone, dominated by the 72 GB HF download.
+End-to-end recipe for the shipped lib at [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/). Tested on Orin AGX (sm_87, MAXN). ~25 min from a **working tree that already has the toolchain built** — dominated by the 72 GB HF download. From a *bare* clone add the toolchain bootstrap in §2.1.1 (submodules + TVM + mlc-llm C++), which is the dominant cost on a fresh machine.
 
 ### 2.1 Prereqs
 
 - Orin AGX (or any sm ≥ 87 CUDA device with ≥ 24 GB VRAM for q4f16_1).
 - `MAXN` power profile (`sudo nvpmodel -m 0 && sudo jetson_clocks`) for benchmark stability.
-- This repo's editable mlc-llm wheel installed in `.venv` (the repo `pyproject.toml` + vendored TVM).
-- HF auth (`hf auth login`) for the gated `Qwen/Qwen3.6-35B-A3B` repo.
+- ~110 GB free disk: 72 GB HF snapshot + 19 GB converted params + ~10 GB of build trees.
+- The locally-built TVM + mlc-llm C++ runtime, sourced via `.envrc.local` (§2.1.1). Note this is the **`PYTHONPATH` + `TVM_LIBRARY_PATH` + `MLC_LIBRARY_PATH`** layout, *not* an installed editable wheel — the repo `python/` tree is imported directly.
+- **No HF auth needed.** `Qwen/Qwen3.6-35B-A3B` is public (apache-2.0) and downloads unauthenticated; earlier drafts of this doc called it gated, which was wrong. Setting `HF_TOKEN` only buys higher rate limits.
+
+Platform this recipe is validated on, re-bootstrapped 2026-07-24 after the JetPack upgrade:
+
+| | was (2026-04 phases) | now |
+|---|---|---|
+| OS | Ubuntu 22.04 | **Ubuntu 24.04.4 LTS** |
+| JetPack | 6.2.2 | **7.2-b187** (L4T R39.2.0) |
+| CUDA | 12.6 | **13.2** (nvcc V13.2.78) |
+| LLVM | `llvm-15-dev` | **llvm-18** (18.1.3, the apt default on 24.04) |
+| GCC | — | 13.3.0 |
+| Python | — | 3.12.3 |
+| GPU arch | sm_87 | sm_87 (unchanged) |
+
+Deltas the upgrade forced on the build config — all three are in §2.1.1:
+1. `USE_LLVM` now points at `llvm-config-18`. Still `--link-shared`: Ubuntu ships LLVM without `libPolly.a`, so static linking fails on 24.04 exactly as it did on 22.04.
+2. `USE_GTEST OFF` is now **required**. 24.04's GTest 1.14 exports `GTest::GTest` without `IMPORTED_LOCATION`, and TVM's `CMakeLists.txt:402` hard-errors on it (`Neither GTest::GTest nor GTest::gtest targets defined IMPORTED_LOCATION`).
+3. CUDA 13 emits a wall of `__VECTOR_TYPE_DEPRECATED__` warnings on `double4`/`float4` (`use double4_16a or double4_32a`). Noise, not errors — TVM does not build with `-Werror`.
+
+#### 2.1.1 Bootstrap from a bare clone
+
+Only needed once per machine (or after a JetPack bump). Everything below is run from the repo root.
+
+```bash
+# 0. apt deps (24.04). llvm-18-dev supplies llvm-config-18 + headers.
+sudo apt install -y llvm-18-dev cmake build-essential
+
+# 1. Submodules — tvm is our fork (github.com/alansrobotlab2/relax), pinned by
+#    the gitlink. --depth 1 is safe: git still checks out the recorded commit.
+git submodule update --init --recursive --depth 1
+git submodule status --recursive | grep -E "^[-+]" || echo "all at recorded commits"
+
+# 2. Rust — tokenizers-cpp is a Rust crate and mlc-llm's cmake hard-errors
+#    ("Cargo is not found!") without it. rustup is user-local, no sudo.
+#    24.04's apt rustc is 1.75; rustup stable (1.97 here) is the safe choice.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# 3. venv + python deps.
+python3 -m venv .venv
+.venv/bin/pip install -U pip
+.venv/bin/pip install "huggingface_hub[cli]" ninja \
+    "apache-tvm-ffi==0.1.10" ml_dtypes safetensors tqdm requests shortuuid \
+    prompt_toolkit fastapi uvicorn openai pandas tiktoken sentencepiece \
+    "transformers>=5.6" accelerate numpy cloudpickle psutil typing_extensions pytest
+
+# torch is REQUIRED, but only as a tensor reader: loader/utils.py
+# `load_safetensor_shard` does safetensors.safe_open(framework="pt",
+# device="cpu"). The CPU wheel is enough and avoids multi-GB CUDA wheels.
+.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+Four dependency traps, all of which abort the pipeline in non-obvious ways:
+
+- **`apache-tvm-ffi` must be pinned to the vendored version — `0.1.10`.** Unpinned, pip takes the newest on PyPI (0.1.12 today), but `3rdparty/tvm/3rdparty/tvm-ffi` is pinned at tag **v0.1.10** (`1fed0ae`). Both the wheel and our build emit `libtvm_ffi.so` with the *same SONAME*, so ld.so loads only the first — the wheel's — while `libtvm.so` was compiled against v0.1.10 headers. The result is not a clean import error but a `std::terminate` during `import tvm`:
+  ```
+  terminate called after throwing an instance of 'tvm::ffi::Error'
+    what():  TypeAttr `__ffi_repr__` is already registered for type index 131.
+  ```
+  Re-derive the right pin after any TVM bump with
+  `git -C 3rdparty/tvm/3rdparty/tvm-ffi describe --tags` (needs `git fetch --tags`; `--depth 1` clones carry none).
+- **`pytest` is a runtime dep, not a test dep.** `USE_RPC` is ON in TVM's default config, and `tvm.rpc.testing` → `tvm.testing` → `import pytest` at module import.
+- **`torch` is required** even for a pure-safetensors checkpoint — the earlier claim in this doc that it was optional was wrong. CPU-only is sufficient for convert/compile; `validate.py`'s HF reference leg needs the CUDA build from §2.3.1.
+- **`accelerate` is required by the parity harness.** transformers 5.x needs it for `device_map`, so `validate.py --reference-only` hard-fails without it. Easy to miss because nothing in the convert/compile/serve path touches it.
+
+TVM build config — write to `3rdparty/tvm/build/config.cmake`:
+
+```cmake
+set(CMAKE_BUILD_TYPE RelWithDebInfo)
+set(USE_CUDA ON)
+set(USE_CUBLAS ON)
+set(USE_THRUST ON)
+set(USE_CUTLASS ON)
+set(USE_CUDNN OFF)
+set(USE_CURAND OFF)
+set(USE_NCCL OFF)
+set(USE_NVTX OFF)
+set(USE_LLVM "/usr/bin/llvm-config-18 --link-shared")
+set(USE_FLASHINFER OFF)   # FlashInfer is JIT'd at mlc_llm-compile time, not linked into TVM
+set(USE_GTEST OFF)        # 24.04 GTest 1.14 has no IMPORTED_LOCATION -> configure error
+set(CMAKE_CUDA_ARCHITECTURES 87)
+```
+
+```bash
+# 3. Build TVM (630 ninja edits; the long pole on a fresh machine).
+cd 3rdparty/tvm/build
+PATH=/usr/local/cuda/bin:$PWD/../../../.venv/bin:$PATH \
+  cmake .. -G Ninja -DCMAKE_MAKE_PROGRAM=$PWD/../../../.venv/bin/ninja
+PATH=/usr/local/cuda/bin:$PATH ../../../.venv/bin/ninja -j 10
+cd -
+
+# 4. Build the mlc-llm C++ runtime against that TVM.
+cmake -B build -G Ninja \
+    -DTVM_SOURCE_DIR=3rdparty/tvm \
+    -DCMAKE_CUDA_ARCHITECTURES=87 \
+    -DUSE_CUDA=ON -DUSE_CUTLASS=ON -DUSE_THRUST=ON
+ninja -C build
+```
+
+Then `source .envrc.local`, which wires the whole thing together:
+
+```bash
+export MLC_LLM_HOME=/home/alfie/mlc-llm
+export PYTHONPATH="$MLC_LLM_HOME/python:$MLC_LLM_HOME/3rdparty/tvm/python:$PYTHONPATH"
+export TVM_LIBRARY_PATH="$MLC_LLM_HOME/3rdparty/tvm/build"   # libtvm.so + libtvm_runtime.so
+export MLC_LIBRARY_PATH="$MLC_LLM_HOME/build"                # libmlc_llm.so + libmlc_llm_module.so
+export PATH="$MLC_LLM_HOME/.venv/bin:/usr/local/cuda/bin:$PATH"
+export CUDA_HOME=/usr/local/cuda
+```
+
+`nvcc` must be on `PATH` at *compile* time, not just at build time — the `flashinfer=1` opt JIT-compiles FlashInfer's paged decode/prefill kernels through `tvm.relax.backend.cuda.flashinfer`, which shells out to nvcc.
+
+Carried over from the 22.04 build and still true on 24.04:
+- `libtvm.so` in `3rdparty/tvm/build/` is **not** rebuilt by `ninja -C build` — the mlc-llm build has its own copy under `build/tvm/`, while the Python `tvm` package loads from `3rdparty/tvm/build/`. After patching TVM C++, rerun `ninja` in `3rdparty/tvm/build/` separately or the new symbols stay invisible from Python.
+
+**Verification status (2026-07-24): green end-to-end.** The whole chain was rebuilt from a bare clone on 24.04 / JetPack 7.2 / CUDA 13.2 / LLVM 18 and runs: TVM (629 ninja edits, 0 errors) → mlc-llm C++ (213 edits, 0 errors) → convert_weight → gen_config → compile → generation. **No source changes were needed for CUDA 13 or LLVM 18** — the feared Thrust/CUB and CUTLASS API drift did not materialize; the only CUDA-13 output is a wall of `double4`/`float4` deprecation warnings. Every fix was environmental (the config.cmake edits above plus the three dependency traps).
+
+Reference timings on this box (12-core Orin AGX, `-j 10`): TVM ~50 min, mlc-llm C++ ~13 min, plus a 71.9 GB download and ~40 min of model steps.
 
 ### 2.2 Download weights
 
 ```bash
-hf download Qwen/Qwen3.6-35B-A3B   # 72 GB bf16, ~7-10 min on a fast link
-SNAP=$(hf download Qwen/Qwen3.6-35B-A3B --local-dir-use-symlinks True | tail -1)
-# Or grab the snapshot path directly from the cache:
+# 71.9 GB bf16 across 26 shards (1045 tensors). ~35 min unauthenticated on a
+# fast link; hf_transfer is not available for aarch64 so this is plain HTTP.
+SNAP=$(.venv/bin/hf download Qwen/Qwen3.6-35B-A3B --max-workers 8 | tail -1)
+
+# The command prints the snapshot dir as its last line. To recover it later:
 # SNAP=~/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/<rev>/
+# (rev 995ad96eacd98c81ed38be0c5b274b04031597b0 as of 2026-07-24)
 ```
+
+Verify before spending 5 min on conversion — a truncated shard set fails deep inside `convert_weight`:
+
+```bash
+.venv/bin/python -c "
+import json; i=json.load(open('$SNAP/model.safetensors.index.json'))
+print(i['metadata']['total_size']/1e9, 'GB /', len(i['weight_map']), 'tensors')"
+# -> 71.903645408 GB / 1045 tensors
+```
+
+`hf download` on hub 1.x drops `--local-dir-use-symlinks` (it is cache-only by default), so the older form of this command in prior revisions of this doc no longer parses.
 
 ### 2.3 Convert + gen-config + compile
 
 ```bash
+source .envrc.local   # required — see §2.1.1
+
 .venv/bin/python -m mlc_llm convert_weight "$SNAP" \
     --quantization q4f16_1 \
-    -o dist/qwen3_6-35B-A3B-q4f16_1                                # ~5 min, no GPU; 19 GB output
+    -o dist/qwen3_6-35B-A3B-q4f16_1                                # ~11 min, no GPU; 19 GB output
 
 .venv/bin/python -m mlc_llm gen_config "$SNAP" \
     --quantization q4f16_1 --conv-template qwen3_5 \
-    -o dist/qwen3_6-35B-A3B-q4f16_1                                # 3 sec; auto-picks model_type=qwen3_5_moe
+    -o dist/qwen3_6-35B-A3B-q4f16_1                                # 8 sec; auto-picks model_type=qwen3_5_moe
 
 MLC_MOE_GEMM_V2=1 .venv/bin/python -m mlc_llm compile dist/qwen3_6-35B-A3B-q4f16_1 \
     --device cuda \
     --opt "flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1" \
-    -o dist/qwen3_6-35B-A3B-q4f16_1/lib.so                         # ~25 min, 202 MB sm_87 lib
+    -o dist/qwen3_6-35B-A3B-q4f16_1/lib.so                         # ~14 min, 200 MB sm_87 lib
 ```
+
+Measured on the 24.04 / JetPack 7.2 re-bootstrap (2026-07-24):
+
+| step | time | output |
+|---|---|---|
+| `convert_weight` | 11 min | 18.187 GB, 186 shards, **4.345 bits/param**, 35,951,822,704 params (peak RAM 3.7 GB, 66.97 GB streamed from disk) |
+| `gen_config` | 8 sec | `model_type=qwen3_5_moe`, `conv_template=qwen3_5`, ctx 262144, `active_vocab_size` 248320 → 248077 |
+| `compile` (FI on) | 14 min | `lib.so`, 199,630,112 B |
+| `compile` (FI off) | 13 min | `lib_nofi.so`, 197,474,024 B |
+
+`convert_weight` is quiet for its first ~10 min — it is CPU-bound building the
+quantization plan over 1045 source tensors before any progress bar appears. Same
+for `compile`'s "Exporting the model to TVM compiler". Neither is hung.
 
 Two flags matter here:
 - **`MLC_MOE_GEMM_V2=1`** (env var, Phase 9b) — opts the int4 MoE GEMM into the
@@ -63,14 +211,89 @@ Two flags matter here:
   fixed in vendored TVM). `--model-lib` is still recommended at runtime to
   bypass the JIT cache lookup.
 
+  **`flashinfer=1` needs a CUDA-enabled torch** — see §2.3.1. It is not a
+  pure compile-time flag.
+
+- **`cublas_gemm=1` is a no-op at `q4f16_1`** and is silently dropped. The
+  effective opt string echoed back by the compiler is
+  `flashinfer=1;cublas_gemm=0;faster_transformer=0;cudagraph=1;cutlass=1`.
+  `OptimizationFlags._cublas_gemm` only honors the flag for
+  `q0f16 / q0bf16 / q0f32` or an `e4m3`/`e5m2` quantization, so every
+  4-bit build ignores it. Harmless to keep for copy-paste symmetry with the
+  q0f16 recipes, but do not credit it for any of the throughput.
+
+- **`cutlass=1` is inert on sm_87** and can be dropped. Earlier revisions of this
+  doc called it a "long-standing Orin-tuned flag"; it does nothing here.
+  [op/extern.py:43-47](python/mlc_llm/op/extern.py#L43-L47) gates CUTLASS to
+  `sm_90a`/`sm_100a`, and `CUTLASS.cmake:59,65` gates the CUDA sources the same
+  way, so `tvm_cutlass_objs` comes out empty. Like `cublas_gemm=1` it is harmless
+  to keep, but do not credit it for throughput. (`faster_transformer` is
+  hard-disabled outright at `extern.py:48`.) **`cudagraph=1` is the real one** —
+  §4.7 of [workplan-cuda-13.md](workplan-cuda-13.md) measures only 131 of ~460
+  decode launches escaping the graph.
+
 Combined, this lib hits **pp512 = 561.16 / tg512 = 54.35** on the Orin AGX
 MAXN bench — past every Phase 9 gate including the 450-tps "parity to
-llama.cpp" stretch. `cudagraph=1;cutlass=1` are the long-standing
-Orin-tuned flags from prior phases.
+llama.cpp" stretch. (Those figures are the 2026-04 JetPack 6.2.2 numbers. The
+JetPack 7.2 / CUDA 13.2 rebuild **has** now been re-benched and is a wash —
+see §14.5.)
 
-A FlashInfer-off / v1-only build of the same dir is preserved at
-[lib_phase9_cta1024_pre_v2.so](dist/qwen3_6-35B-A3B-q4f16_1/lib_phase9_cta1024_pre_v2.so)
-for apples-to-apples regression checks.
+#### 2.3.1 FlashInfer needs CUDA torch (JetPack 7.2 gap)
+
+`--opt flashinfer=1` does not link a prebuilt kernel library. TVM JITs the
+paged decode/prefill kernels through
+[tvm/relax/backend/cuda/flashinfer.py](3rdparty/tvm/python/tvm/relax/backend/cuda/flashinfer.py),
+which does `from flashinfer.jit import gen_customize_batch_{prefill,decode}_module`.
+The `flashinfer-python` package calls `torch.cuda.get_device_properties()` at
+**import** time, so a CPU-only torch fails the compile with
+`AssertionError: Torch not compiled with CUDA enabled`.
+
+This never came up on 22.04 because JetPack 6's system torch was CUDA-enabled and
+visible through the venv's `--system-site-packages`. On JetPack 7.2 there is no
+Jetson torch wheel yet — jetson-ai-lab has no `jp7` index (`jp7/cu130` 404s). The
+`sbsa/cu130` index works:
+
+```bash
+.venv/bin/pip install \
+    --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130/+simple \
+    --extra-index-url https://pypi.org/simple \
+    "torch==2.11.0"
+.venv/bin/pip install flashinfer-python     # 0.6.15.post1 as of 2026-07-24
+```
+
+That torch reports `arch_list = [sm_80, sm_90, sm_100, sm_110, sm_120]` and warns
+that sm_87 has no matching SASS — **which does not matter here**. Torch is used
+only to import flashinfer and query device properties; the kernels themselves are
+emitted as CUDA source and compiled for sm_87 by nvcc. `torch.cuda.is_available()`
+is True and `get_device_properties(0)` correctly returns `Orin sm_87`.
+
+Note this torch cannot *run* GPU ops on an Orin. Nothing in the
+convert/compile/serve path needs it to — MLC never calls torch at runtime, and
+`convert_weight` uses it only as a CPU tensor reader. But `validate.py`'s
+HuggingFace-reference parity harness **does** need working GPU torch, so
+re-running §11 parity on JetPack 7.2 is blocked until a real sm_87 wheel exists.
+
+Verify FlashInfer actually linked rather than silently falling back —
+`create_flashinfer_paged_kv_cache` swallows `NotImplementedError` and returns `[]`:
+
+```bash
+nm -D --defined-only dist/qwen3_6-35B-A3B-q4f16_1/lib.so \
+    | grep -ciE "flashinfer|batch_prefill|batch_decode"    # 58  (FI-off lib: 5)
+du -sh ~/.cache/flashinfer                                 # 6.2M of JIT'd kernels
+```
+The size delta alone is not proof: the FI lib is only 2.1 MB larger than the FI-off
+lib here (199,630,112 vs 197,474,024 B), not the ~5 MB the 2026-04 build showed.
+
+A FlashInfer-off build of the same dir is kept alongside `lib.so` for
+apples-to-apples regression checks. On the 2026-07-24 rebuild that is
+`lib_nofi.so` (197,474,024 B), produced by re-running the §2.3 compile with
+`flashinfer=0` and a different `-o`. The 2026-04 equivalents
+(`lib_phase9b_v2.so`, `lib_phase9_cta1024_pre_v2.so`) were build artifacts and
+did not survive the machine rebuild — `dist/` is gitignored.
+
+**Always pass `--model-lib`** when more than one `.so` sits in the model dir. A
+harness that globs `*.so` and takes `[0]` can silently pick the FlashInfer-off
+lib and deliver ~82 % of headline tg (this exact bug is documented in §14.1).
 
 ### 2.4 Run
 
@@ -103,15 +326,21 @@ source .envrc.local && .venv/bin/python bench_mlc.py \
 
 ### 2.6 Known CLI quirks
 
-- The wheel does **not** install a `mlc_llm` shell script — always invoke as `.venv/bin/python -m mlc_llm <cmd>`.
+- There is no `mlc_llm` shell script — nothing is pip-installed, `mlc_llm` is imported off `PYTHONPATH`. Always invoke as `.venv/bin/python -m mlc_llm <cmd>`, and always after `source .envrc.local`.
 - `convert_weight` and `gen_config` reject HF repo IDs; pass the local snapshot path (`$SNAP` above).
 - `gen_config` prints argparse errors to stdout but the actual error to stderr — when redirecting, keep them separate (`> out 2> err`) or you'll see an empty `Error` block.
+- The `qwen3_5` conv template has **thinking enabled** — the assistant prefix opens a `<think>` block, so short `max_tokens` returns reasoning rather than an answer. Use `qwen3_5_nothink` for terse replies, or budget enough tokens to close the block.
 
 ### 2.7 Optional variants in dist/
 
+`dist/` is gitignored, so this table describes what the recipes *produce*, not
+what is necessarily on disk. After the 2026-07-24 rebuild only the default dir
+exists; the kvint8 / kvfp8 / mtp-draft variants need their own convert+compile
+passes to be recreated.
+
 | Build | Use case | Notes |
 |---|---|---|
-| [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/) | **default**, max throughput | Phase 9b v2 (MoE dispatch + wmma m16n8k16) + FlashInfer (paged-decode/prefill linked). pp512 = 561.16 / tg512 = 54.35 on Orin AGX |
+| [dist/qwen3_6-35B-A3B-q4f16_1/](dist/qwen3_6-35B-A3B-q4f16_1/) | **default**, max throughput | Phase 9b v2 (MoE dispatch + wmma m16n8k16) + FlashInfer (paged-decode/prefill linked). pp512 = 561.16 / tg512 = 54.35 on Orin AGX (JetPack 6.2.2 numbers; not re-benched after the 7.2 rebuild) |
 | [dist/qwen3_6-35B-A3B-q4f16_1_tir/](dist/qwen3_6-35B-A3B-q4f16_1_tir/) | apples-to-apples vs int8 | fp16 KV, FlashInfer hard-disabled in compile flags |
 | [dist/qwen3_6-35B-A3B-q4f16_1_kvint8/](dist/qwen3_6-35B-A3B-q4f16_1_kvint8/) | capacity-bound (~2× context) | int8 KV; throughput-neutral but byte-divergent from fp16 (parity 2/5 EXACT, semantic drift only) |
 | [dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/](dist/qwen3_6-35B-A3B-q4f16_1_kvfp8/) | reference for sm ≥ 89 port | fp8 KV; -25% on Orin (software fp8 dequant), preserved for Blackwell port |
@@ -659,7 +888,18 @@ What was originally listed as out-of-scope and shipped anyway: kernel perf (Phas
 
 ## 14. Benchmarks: Unsloth Q4_K_S (llama.cpp) vs MLC compiled
 
-All numbers Orin AGX (sm_87, 204 GB/s peak BW), MAXN power profile, batch=1, no concurrency. Same precision class on both sides: 4-bit weights + fp16 activations (Unsloth `Qwen3.6-35B-A3B-UD-Q4_K_S.gguf` ≈ 19.45 GB, MLC `q4f16_1` ≈ 19 GB at 4.345 bits/param). Bench harness: [bench_compare.py](bench_compare.py) drives `llama-bench` (`-p N` for prefill, `-d N -n tg` for decode-at-depth) and `bench_mlc.py` at the same context lengths.
+All numbers Orin AGX (sm_87), MAXN power profile, batch=1, no concurrency. Same precision class on both sides: 4-bit weights + fp16 activations (Unsloth `Qwen3.6-35B-A3B-UD-Q4_K_S.gguf` ≈ 19.45 GB, MLC `q4f16_1` ≈ 19 GB at 4.345 bits/param). Bench harness: [bench_compare.py](bench_compare.py) drives `llama-bench` (`-p N` for prefill, `-d N -n tg` for decode-at-depth) and `bench_mlc.py` at the same context lengths.
+
+> **Bandwidth: use 156.2 GB/s, not 204.8.** The 204.8 GB/s figure quoted throughout this section is
+> the spec sheet (256-bit LPDDR5 @ 3200 MT/s). A native sm_87 read-dominated kernel (128-bit
+> vectorized, 2 GiB buffer, far past the 4 MB L2) reaches **156.2 GB/s = 76.3% of spec** —
+> [scripts/bw_probe.cu](scripts/bw_probe.cu). Every roofline computed against 204.8 overstates
+> available headroom by ~31%. Corrected 35B roofline: 2,946,429,568 active params/token at 4.345
+> bits = **1.600 GB/token** → **97.5 tps** achievable-BW roofline (128.0 against spec). Measured
+> 54.13 tps = 86.6 GB/s = **55.5% of the achievable wall**, not the 42% a spec-peak comparison
+> implies. Reproduce with [scripts/active_params.py](scripts/active_params.py). Note this is a
+> *weight* roofline only — §4.6 of [workplan-cuda-13.md](workplan-cuda-13.md) shows another
+> 245 MiB/token of recurrent-state copy traffic on top.
 
 ### 14.1 Qwen3.6-35B-A3B — bench chart
 
@@ -767,16 +1007,71 @@ Parity (5 prompts × 50 tokens, temp=0.0): int8 = 2/5 EXACT, semantic drift only
 ### 14.4 Perf protocol (pin this when re-benching)
 
 - TG = 512 steady-state, MAXN locked (`sudo nvpmodel -m 0 && sudo jetson_clocks`), no concurrent processes.
+- **`jetson_clocks` is worth ~1.4% and is not optional.** `nvpmodel -m 0` alone leaves the
+  `nvhost_podgov` governor in charge; it does reach the 1300.5 MHz ceiling under load, so a
+  frequency readout looks identical, but throughput is not: 35B tg512 measured **53.13 unpinned vs
+  54.13 pinned**. Coarse frequency sampling hides the loss — do not skip the second command because
+  the clocks "look right".
 - Run 3 reps + 1 warmup, report median.
 - llama.cpp side: `llama-bench -m <gguf> -p <ctx> -n <tg> -r 3 -ngl 99` (or `-d <ctx> -n <tg>` for decode-at-depth).
 - MLC side: `bench_mlc.py --pp <ctx> --tg <tg> --runs 3 --warmup 1` with `EngineConfig(prefix_cache_mode="disable")` — see [bench_harness_gotchas.md](.claude/projects/-home-alfie-mlc-llm/memory/bench_harness_gotchas.md) for the three "no GPU activity" deadlock modes.
 - Always pass `--model-lib` to MLC's chat/engine — the JIT cache otherwise picks the FlashInfer path and segfaults on sm_87.
 - llama.cpp build: `cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87 -DCMAKE_BUILD_TYPE=Release` (substitute `120` for Blackwell).
 
+### 14.5 JetPack 7.2 / CUDA 13.2 re-bench (2026-07-24) — parity
+
+Everything above §14.5 was measured on Ubuntu 22.04 / JetPack 6.2.2 / **CUDA 12.6** / LLVM 15. The
+box was re-bootstrapped onto Ubuntu 24.04 / JetPack 7.2 / **CUDA 13.2** / LLVM 18 (§2.1.1) and the
+whole §14.4 protocol re-run. **The toolchain move is a wash — do not expect a CUDA 13 dividend.**
+
+**Qwen3.6-35B-A3B** (`lib.so`, MoE GEMM v2 + FlashInfer):
+
+| tg | 12.6 tg_tps | **13.2 tg_tps** | delta | 13.2 pp_tps |
+|---:|---:|---:|---:|---:|
+| 512 | 54.46 | **54.13** | −0.6% | 566.33 |
+| 1024 | 54.30 | **54.00** | −0.6% | 566.32 |
+| 2048 | 54.07 | **53.83** | −0.4% | 566.32 |
+| 4096 | 53.69 | **53.34** | −0.7% | 565.59 |
+| 8192 | 53.00 | **52.68** | −0.6% | 565.65 |
+
+pp512 561.5 → **566.33 (+0.9%)**. **Qwen3.5-0.8B** (`q4f16_g16e` + FlashInfer): tg512 134.82 →
+**133.47** (−1.0%), flat to **128.16** at tg8192 (was 129.59); pp512 2870 → **2889 (+0.7%)**.
+
+Run-to-run spread across engine loads is ~0.5%, so the decode delta is at the edge of noise.
+Prefill marginally up, decode marginally down, depth-flat behaviour preserved. nvcc 13.2 also
+reproduces 12.6 codegen on the MoE microbench to within 0.1% (gate_up 1.002 vs 1.0016 ms, down
+0.948 vs 0.9495 ms) — but compare only against `baseline_moe_v0_cta1024.json`; `baseline_moe.json`
+is the CTA_COUNT=64 config and looks like a 2–3.6× regression that is not one.
+
+Raw: `tuning/mlc_tg_sweep_35b_cuda13_20260724_210926.json`,
+`tuning/mlc_tg_sweep_0.8b_cuda13_20260724_213627.json`, `tuning/moe_kernel_cuda13_20260724.json`.
+
+Full per-kernel decode attribution on this stack — which kernels are at the memory wall and which
+are not — is in **[workplan-cuda-13.md](workplan-cuda-13.md) §4.6**, reproducible via
+[scripts/analyze_decode_trace.py](scripts/analyze_decode_trace.py). Headline: four kernels (37% of
+the token budget) are at 88–100% of the 156.2 GB/s wall and are finished; six more (30%) sit at
+44–76% and are where the remaining headroom is; GPU idle is only 5.3%.
+
 ---
 
 ## 15. Open Items
 
+- ~~**Re-bench on JetPack 7.2.**~~ **Done 2026-07-24 — see §14.5.** Verdict: parity, prefill +0.9%, decode −0.6%.
+- ~~**Re-run §11 parity on JetPack 7.2 — currently blocked.**~~ **Not blocked; 0.8B passed.** The
+  worry was that the `sbsa/cu130` torch has no sm_87 SASS, but **every native kernel runs correctly
+  via PTX JIT** and it is a valid correctness oracle — do not "fix" this. `q0f16` greedy parity vs
+  HF fp16 is **5/5 prompts × 50/50 tokens**, which also proves the CUDA 13.2 build is numerically
+  exact. One dependency gap: `accelerate` is missing from the §2.1.1 pip list and transformers 5.x
+  needs it for `device_map` — `validate.py --reference-only` hard-fails without it (`pip install
+  accelerate`, 1.14.0 here).
+  Do **not** gate on `q4f16_g16e` vs HF fp16 (1/5): that is a 4-bit-vs-fp16 comparison where every
+  divergence is a genuine near-tie ("Paris." vs "Paris,", `n <= 1` vs `n == 0`, both reaching 42),
+  all outputs coherent, and the high-margin Fibonacci prompt is 50/50. Use `q0f16` for correctness.
+- **The 35B-A3B has no parity gate on this hardware.** `--greedy-parity` needs the 72 GB fp16 HF
+  reference resident and this box has 61 GB; the recipe at [worklog.md:3226](worklog.md#L3226) was
+  run on a Blackwell machine, and `reference_outputs*.pt` is gitignored and was lost in the
+  re-bootstrap. Either regenerate the 3.5 kB cache off-box and commit it, or accept coherence-only
+  checks on Orin. This blocks any claim that a 35B optimization is correctness-preserving.
 - **Bring up Qwen3.5-{4B, 9B, 27B} and Qwen3.6-27B.** 4B/9B reuse the dense `qwen3_5` module unchanged. 27B and 3.6-27B are the first dense models with asymmetric linear heads (16/32) — exercises the kernel path the 35B-A3B already validates.
 - **Fresh apples-to-apples bench numbers post-Phase-6 for the 0.8B** — the §14.2 table is the 2026-04-27 baseline. Re-bench with the shipped lib to capture the +21 % from the dlight TX patch (worklog 2026-04-28 cont. 12: 99.5 → 120.5 tps γ=4).
 - **Long-context (≥4K) crossover vs llama.cpp.** MLC's TIR PagedKVCache reads at lower effective BW than llama.cpp's `q8_0` KV at long sequence (§14.1). FlashInfer JIT path on sm_87 is the most likely fix lane — bounded probe described in the convo recap.

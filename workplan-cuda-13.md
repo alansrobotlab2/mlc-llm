@@ -1,0 +1,1201 @@
+# Workplan: Qwen3.6-35B-A3B on JetPack 7.2 / CUDA 13.2
+
+**Sessions:** 2026-07-24 (Stage 0/1), 2026-07-25 (kernel attribution, re-scope, options 1 and 2
+landed, concurrent serving fixed)
+**Status:** §5 option 1 **landed and kept** (§10). §5 option 2 **landed** (§11) — **35B 55.61 → 58.97
+tg512 (+6.0%), prefill neutral**, the largest single win in this workplan. **Concurrent serving on
+hybrid models fixed and gated (§12)** — 0.8B only; the 35B is pinned to batch 1 by a deliberate MoE
+specialization. **Next session: start at §9.**
+**Primary target:** Qwen3.6-35B-A3B · **Fast-iteration vehicle:** Qwen3.5-0.8B
+
+> **Read §4.6 before §4.5.** The 2026-07-25 session re-derived the decode breakdown and three of the
+> first pass's conclusions did not survive: GPU idle is **5.3%, not 13.3%**; `rnn_state_get/set`
+> move **245 MiB/token**, not "~nothing"; and the two unidentified mid-size kernels turned out to be
+> the 4096→2048 down-projection (75% of the wall) and `in_proj_z` (60%) — i.e. there *is* kernel
+> headroom left. §5 is rewritten accordingly.
+
+---
+
+## 1. Why this exists
+
+Everything in [qwen3_5.md](qwen3_5.md) §14 was measured on Ubuntu 22.04 / JetPack 6.2.2 /
+**CUDA 12.6** / LLVM 15 between 2026-04-27 and 2026-04-30. The box was re-bootstrapped onto
+JetPack 7.2 / CUDA 13.2 / LLVM 18. The question was: *what performance are we leaving on the
+table in the new environment?*
+
+**Answer: none in CUDA 13 itself.** The toolchain move is a wash. But re-measuring surfaced
+where the real headroom is, and it is not where §14 says.
+
+---
+
+## 2. Environment (verified this session)
+
+Hardware unchanged — AGX Orin Developer Kit, tegra234, module **p3701-0005 (64 GB)**, **sm_87**,
+16 SMs, 12× Cortex-A78.
+
+| | was | now |
+|---|---|---|
+| OS | Ubuntu 22.04 | Ubuntu 24.04.4 |
+| JetPack | 6.2.2 | **7.2-b187** (L4T R39.2.0) |
+| CUDA | 12.6 | **13.2** (nvcc V13.2.78) |
+| Driver | — | 595.78 |
+| LLVM | 15 | 18.1.3 |
+| cuDNN / TRT | — | 9.20 / 10.16 |
+
+**Power/clocks are already maxed — no headroom there.** `nvpmodel` is MAXN
+(`/etc/nvpmodel/nvpmodel_p3701_0000.conf`, all 12 cores online, `TPC_PG_MASK 0`, every
+`MAX_FREQ -1`). GPU ceiling 1300.5 MHz; EMC pinned at 3199 MHz = the full 204.8 GB/s.
+
+**`jetson_clocks` DOES matter — worth ~1.4%.** The `nvhost_podgov` governor reaches 1300.5 MHz
+under load, but coarse frequency sampling hides real throughput loss. Always run
+`sudo nvpmodel -m 0 && sudo jetson_clocks` before benching. Unpinned tg512 measured 53.13 vs
+54.13 pinned.
+
+**`ncu` is blocked**: `/proc/driver/nvidia/params` has `RmProfilingAdminOnly: 1`, so hardware
+counters need root. Not resolved this session. `nsys` tracing works unprivileged and was
+sufficient. To unblock:
+```bash
+echo 'alfie ALL=(root) NOPASSWD: /usr/local/cuda/bin/ncu' | sudo tee /etc/sudoers.d/ncu-profiling
+sudo chmod 440 /etc/sudoers.d/ncu-profiling
+```
+
+---
+
+## 3. Stage 0 — the chain is green
+
+The Thrust/CUB/CUTLASS drift risk flagged at [qwen3_5.md:121](qwen3_5.md#L121) **did not
+materialize**. TVM built clean (646 ninja edits), bundled CUTLASS is 4.1.0 (CUDA-13-era).
+
+Verified working: TVM → mlc-llm runtime (`compute_87` in `build.ninja`, links `libcudart.so.13`,
+all deps resolved) → convert_weight → gen_config → compile with **FlashInfer live on sm_87**
+(`create_flashinfer_paged_kv_cache` is emitted) → coherent generation.
+
+TVM device detect is correct: `sm_87`, 16 SMs, 48 KB shared/block, 1024 max threads — the attrs
+the dlight passes key on.
+
+### Corrections to the documented recipe
+
+- **`accelerate` is missing from the §2.1.1 pip list.** transformers 5.x needs it for
+  `device_map`; `validate.py --reference-only` hard-fails without it. Installed 1.14.0.
+- **`cutlass=1` is inert on sm_87.** [op/extern.py:43-47](python/mlc_llm/op/extern.py#L43-L47)
+  gates it to `sm_90a`/`sm_100a`, and `CUTLASS.cmake:59,65` gates the CUDA sources to `90a`/`100a`,
+  leaving `tvm_cutlass_objs` empty. [qwen3_5.md:226](qwen3_5.md#L226) still calls it a
+  "long-standing Orin-tuned flag" — it does nothing. (`cublas_gemm=1` being a no-op is already
+  documented at §2.3; `faster_transformer` is hard-disabled at `extern.py:48`.)
+- **torch 2.11.0+cu130 lacks sm_87 in `get_arch_list()`** (`sm_80,90,100,110,120`) but every
+  native kernel runs correctly via PTX JIT. It is a valid correctness oracle. Do not "fix" this.
+- **`profile_decode.py` is hardcoded to the 0.8B** and uses `next(model_dir.glob("*.so"))` — the
+  exact footgun §14.1 warns about. The 35B dir holds both `lib.so` and `lib_nofi.so`.
+- **CUDA 13 landmine:** configuring mlc-llm without an explicit arch falls through
+  `3rdparty/tvm/cmake/modules/CUDA.cmake:153-156` → `75;80;86;89;90`, and **sm_75 was removed in
+  CUDA 13**. Always pass `-DCMAKE_CUDA_ARCHITECTURES=87`. Also `USE_NVTX OFF` is load-bearing
+  (CUDA 13 dropped `libnvToolsExt`).
+
+---
+
+## 4. Stage 1 — measurements
+
+### 4.1 CUDA 13.2 vs CUDA 12.6 (clocks pinned, §14.4 protocol, 3 runs + warmup)
+
+**Qwen3.6-35B-A3B** (`dist/qwen3_6-35B-A3B-q4f16_1/lib.so`, MoE GEMM v2 + FlashInfer):
+
+| tg | 12.6 tg_tps | **13.2 tg_tps** | delta | 13.2 pp_tps |
+|---:|---:|---:|---:|---:|
+| 512 | 54.46 | **54.13** | −0.6% | 566.33 |
+| 1024 | 54.30 | **54.00** | −0.6% | 566.32 |
+| 2048 | 54.07 | **53.83** | −0.4% | 566.32 |
+| 4096 | 53.69 | **53.34** | −0.7% | 565.59 |
+| 8192 | 53.00 | **52.68** | −0.6% | 565.65 |
+
+pp512: 561.5 → **566.33 (+0.9%)**.
+
+**Qwen3.5-0.8B** (`q4f16_g16e` + FlashInfer): tg512 134.82 → **133.47** (−1.0%), flat to
+**128.16** at tg8192 (was 129.59). pp512 2870 → **2889 (+0.7%)**.
+
+Run-to-run spread across engine loads is ~0.5%, so the decode delta is at the edge of noise.
+**Verdict: parity.** Prefill marginally up, decode marginally down, depth-flat behaviour preserved.
+
+Raw: `tuning/mlc_tg_sweep_35b_cuda13_20260724_210926.json`,
+`tuning/mlc_tg_sweep_0.8b_cuda13_20260724_213627.json`.
+
+### 4.2 nvcc 13.2 reproduces 12.6 codegen
+
+`bench_moe_kernel.py` under CUDA 13.2: gate_up **1.002 ms**, down **0.948 ms**.
+`baseline_moe_v0_cta1024.json` (CUDA 12.6, CTA_COUNT=1024): **1.0016 / 0.9495 ms**. Match within
+0.1%.
+
+⚠️ **Do not compare against `baseline_moe.json`** — that is the **CTA_COUNT=64** config
+(0.4915 / 0.2613 ms). Current source has CTA_COUNT=1024, restored in Phase 9 Stage 9.2. Comparing
+against the wrong baseline looks like a 2–3.6× regression and is not one.
+
+Side observation worth a look someday: CTA=64 is 2–3.6× faster at B=8 while the two are close at
+B=1024 (14.26 vs 14.68 ms). The Phase 9 restoration optimized prefill at a large small-batch cost.
+Only reachable via the v1 `dequantize_group_gemm`, which the shipped 35B path does not use
+(prefill goes v2, decode goes gemv) — so this only matters if spec-decode verify ever routes there
+(see §9.9 pitfall).
+
+### 4.3 Achievable bandwidth — the number the docs never had
+
+A native sm_87 read-dominated kernel (128-bit vectorized, 2 GiB buffer, far beyond the 4 MB L2):
+
+**156.0 GB/s achievable = 76.2% of the 204.8 GB/s spec peak.** Re-measured 2026-07-25 after
+promoting the probe to [scripts/bw_probe.cu](scripts/bw_probe.cu): **156.2 GB/s (76.3%)** — the
+figure is stable to ~0.1%.
+
+Every roofline in [qwen3_5.md](qwen3_5.md) used the marketing 204.8 figure, which overstates
+headroom by ~31%. Corrected there 2026-07-25 (§14 preamble).
+
+### 4.4 The 35B roofline (§14.1 asserts "weight-BW bound" but computes none)
+
+Exact active set per decode token, from safetensors headers — excludes the vision tower (446.6 M),
+the MTP draft head (844.6 M) and the embed table; routed experts counted at top-8/256:
+
+| bucket | full params | active/token |
+|---|---:|---:|
+| moe routed | 32,212,254,720 | 1,006,632,960 |
+| gdn linear-attn (30 layers) | 1,011,553,920 | 1,011,553,920 |
+| lm_head | 508,559,360 | 508,559,360 |
+| full-attention (10 layers) | 272,634,880 | 272,634,880 |
+| moe shared expert | 125,911,040 | 125,911,040 |
+| moe router | 20,971,520 | 20,971,520 |
+| **total / active** | **35,951,822,704** | **2,946,429,568** |
+
+Total matches the converter's reported param count exactly. At 4.345 bits/param:
+
+- **1.600 GB/token**
+- Roofline @ 204.8 spec peak: **128.0 tps**
+- Roofline @ **156.0 GB/s achievable: 97.5 tps**
+- Measured 54.13 tps = 86.6 GB/s = **55.5% of the achievable wall**
+
+### 4.5 Where the token budget actually goes
+
+**Superseded by §4.6.** The first pass at this table (a) guessed the byte counts for two of the
+six biggest kernels, (b) called `rnn_state_get/set` "moves ~nothing", and (c) derived GPU idle by
+subtracting a *traced* kernel sum from an *untraced* bench wall-clock. All three were wrong. The
+numbers below are kept only so the corrections in §4.6 are legible.
+
+| kernel | inst | avg µs | ms/tok | achieved BW | % of 156 GB/s |
+|---|---:|---:|---:|---:|---:|
+| `moe_dequantize_gemv_kernel` | 5040 | 66.3 | 2.609 | 137.5 GB/s | **88%** |
+| `fused_dequantize1_NT_matmul_kernel` (GDN qkv) | 3780 | 66.1 | 1.953 | 137.8 GB/s | **88%** |
+| `fused_dequantize4_NT_matmul3_kernel` | 5040 | 38.8 | 1.529 | ~~unknown~~ | — |
+| `moe_dequantize_gemv1_kernel` | 5040 | 38.5 | 1.516 | 118.3 GB/s | 76% |
+| `fused_dequantize2_…_silu1_multiply1` | 3780 | 48.6 | 1.436 | ~~unknown~~ | — |
+| `fused_dequantize7_NT_matmul8_kernel` | 1260 | 72.6 | 0.714 | — | — |
+| **`rnn_state_get_0` + `rnn_state_set_0`** | 3840×2 | ~20 | **1.198** | ~~moves ~nothing~~ | — |
+| `gdn_func_kernel` | 3840 | 61.2 | 0.505 | — | — |
+| 39 smaller kernels | — | — | 3.644 | — | — |
+| **sum of kernel time** | | | ~~16.016~~ | | |
+| **GPU idle / launch gap** | | | ~~2.458~~ | | ~~13.3%~~ |
+
+### 4.6 Corrected breakdown — every kernel mapped, idle measured in-trace
+
+Same `q35_decode.nsys-rep`, re-analyzed by [scripts/analyze_decode_trace.py](scripts/analyze_decode_trace.py).
+Three methodology fixes:
+
+1. **Steps are cut on `parallel_sampling_from_prob_kernel`** (fires exactly once per engine step),
+   and steps longer than 60 ms are classified as prefill. The trace holds 2 prefill + 125 decode
+   steps. Without this split, prefill instances of a shared kernel name blend into the decode
+   average — `depthwise_conv1d` is 4016 µs in prefill and 11 µs in decode under one name.
+2. **Wall-clock and kernel time come from the same trace.** Traced decode wall is **19.122
+   ms/token (52.29 tps)** — nsys `--cuda-graph-trace=node` costs ~3.5% vs the 18.474 ms / 54.13 tps
+   bench. Percentages below are of the traced budget, which is internally consistent; the old
+   13.3% idle figure was an artifact of mixing the two runs.
+3. **Every kernel ≥0.09 ms/token is identified from launch geometry**, not guessed. The dlight GEMV
+   schedule emits `block=(16,32,1)` with one CTA per 64 output elements, so `gridX × 64` is the
+   output width; instances-per-token gives the layer multiplicity (40 = all layers, 30 = GDN, 10 =
+   full-attention, 1 = once per token). Together those pin each kernel to exactly one projection.
+
+| kernel | what it is | /tok | ms/tok | %budget | GB/s | % of 156 |
+|---|---|---:|---:|---:|---:|---:|
+| `moe_dequantize_gemv` | routed experts gate_up, top-8 (2048→2×512) | 40 | 2.650 | 13.9% | 137.5 | **88%** |
+| `fused_dequantize1_NT_matmul` | GDN `in_proj_qkv` (2048→8192) | 30 | 1.984 | 10.4% | 137.8 | **88%** |
+| `fused_dequantize_fused_NT_matmul9_cast4` | `lm_head` (2048→248320) | 1 | 1.769 | 9.3% | 156.1 | **100%** |
+| `fused_dequantize4_NT_matmul3` | **GDN `out_proj` AND attn `o_proj`** (4096→2048, one shared kernel) | 40 | 1.553 | 8.1% | 117.4 | 75% |
+| `moe_dequantize_gemv1` | routed experts down, top-8 (512→2048) | 40 | 1.540 | 8.1% | 118.4 | 76% |
+| `fused_dequantize2_…_silu1_multiply1` | **GDN `in_proj_z` + `silu(z)*core_out`** (2048→4096) | 30 | 1.459 | 7.6% | 93.7 | 60% |
+| `fused_dequantize7_NT_matmul8` | attn `c_attn` (2048→9216) | 10 | 0.726 | 3.8% | 141.3 | **91%** |
+| `rnn_state_get_0` | GDN recurrent state get (2 MiB fp32 slot) | 30 | 0.612 | 3.2% | 205.6 | **132%** |
+| `rnn_state_set_0` | GDN recurrent state set | 30 | 0.583 | 3.1% | 215.7 | **138%** |
+| `gdn_func` | the recurrence itself | 30 | 0.569 | 3.0% | — | — |
+| `fused_dequantize5_NT_matmul5` | shared expert gate_up (2048→2×512) | 40 | 0.478 | 2.5% | 95.3 | 61% |
+| `NT_matmul4` | MoE router gate (2048→256, **fp16**) | 40 | 0.447 | 2.3% | 93.9 | 60% |
+| `depthwise_conv1d1` | GDN causal conv1d | 30 | 0.332 | 1.7% | — | — |
+| `fused_dequantize6_…_multiply5_add1` | shared expert down + gate·add (512→2048) | 40 | 0.330 | 1.7% | 69.0 | 44% |
+| `fuse_add_norm_prefill` | residual add + RMSNorm | 80 | 0.310 | 1.6% | — | — |
+| `top8_softmax` | router top-k | 40 | 0.268 | 1.4% | — | — |
+| `fused_dequantize3_NT_matmul2` | GDN `in_proj_a` (2048→**32**) | 30 | 0.242 | 1.3% | 4.4 | 3% |
+| `fused_dequantize3_…_sigmoid_cast2` | GDN `in_proj_b` + sigmoid (2048→**32**) | 30 | 0.232 | 1.2% | 4.6 | 3% |
+| `rnn_state_get_1` / `set_1` | GDN conv state get/set (3×8192) | 30+30 | 0.294 | 1.5% | 15 / 29 | 10 / 19% |
+| `BatchPrefillWithPagedKVCache` | FlashInfer full-attn decode | 10 | 0.189 | 1.0% | — | — |
+| 32 smaller kernels | — | — | 1.351 | 7.1% | — | — |
+| **sum of kernel time** | | | **18.106** | **94.7%** | | |
+| **GPU idle / launch gap** | | | **1.016** | **5.3%** | | |
+
+Roll-ups: identified weight GEMVs **13.409 ms (70.1%)**; `rnn_state` get/set (all four)
+**1.489 ms (7.8%)**; `in_proj_a` + `in_proj_b` **0.474 ms (2.5%)**.
+
+Three corrections that matter:
+
+- **`rnn_state_get/set` are memory-bound, not launch-bound.** A `get` reads one 2 MiB state slot
+  (`32 v-heads × 128 × 128` fp32) and writes a 2 MiB destination — 4 MiB per call, ×60 calls/token
+  = **245 MiB/token**, 15% on top of the 1.600 GB of weights. At 205–216 GB/s they run *above* the
+  156 GB/s DRAM wall, which is only possible because the 4 MiB working set fits the 4 MB L2 and the
+  consumer reads it right back. This matches [worklog.md:2312](worklog.md#L2312) ("at peak DRAM BW …
+  truly at ceiling") and contradicts §4.5. **Cudagraph capture cannot recover this 1.489 ms** — it
+  is real traffic. Only eliminating the copies can.
+- **GPU idle is 5.3%, not 13.3%.** Measured wall minus measured kernel time, same trace. This
+  roughly halves the ceiling on any launch-overhead work.
+- **The two unknown kernels are now known, and both are below the wall.** `fused_dequantize4_NT_matmul3`
+  is the 4096→2048 down-projection *shared* between GDN `out_proj` and attention `o_proj` (identical
+  shapes → dlight emits one kernel, hence 40 calls/token) at **75%**;
+  `fused_dequantize2_…_silu1_multiply1` is `in_proj_z` fused with the GDN output gate at **60%**.
+  The old guess had both at shared-expert size — off by 4× and 2×. Confirmed against
+  [qwen35_model.py:560-566](python/mlc_llm/model/qwen35/qwen35_model.py#L560-L566), which declares
+  `in_proj_qkv` / `in_proj_z` / `in_proj_a` / `in_proj_b` / `out_proj` as five separate `nn.Linear`s.
+
+### 4.7 Cudagraph coverage (`--cuda-graph-trace=node`)
+
+In steady-state decode, **131 launches/token stay eager**:
+
+| eager in decode | launches/tok | ms/tok | why it matters |
+|---|---:|---:|---|
+| `rnn_state_get_0/1` + `set_0/1` | 120 | 1.489 | the whole eager population, effectively |
+| `lm_head` | 1 | 1.769 | one 1.77 ms kernel — launch cost is noise |
+| `BatchPrefillWithPagedKVCache` (FlashInfer) | 10 | 0.189 | external kernel, outside the captured region |
+
+Everything else — `gdn_func`, the conv1d, all MoE and projection GEMVs — is inside a graph.
+`op.topk`/thrust (the `cudaErrorStreamCaptureImplicit` breaker at [worklog.md:2529](worklog.md#L2529))
+did **not** regress: `top8_softmax` is captured. So the 5.3% idle is ~131 launches, of which 120 are
+the `rnn_state` wrappers. Capturing those is worth at most ~4% and realistically less.
+
+---
+
+## 5. The conclusion that changes the plan
+
+The first version of this section said: the big kernels are done, the budget is overhead, go chase
+launch gaps. **With every kernel now identified (§4.6), that is backwards.** Overhead is 5.3%, not
+20%. The headroom is still in kernels — just not the ones that were already measured.
+
+**Tier 1 — genuinely finished.** Four kernels sit at 88–100% of the 156 GB/s wall: routed-expert
+gate_up (88%), GDN `in_proj_qkv` (88%), attention `c_attn` (91%), and `lm_head` (100.1% — exactly
+at the wall). That is **7.13 ms/token, 37% of the budget**, with nothing left in it. Phase 2C's
+"Pareto-optimal, no further tile gains" verdict holds for this tier under nvcc 13.2.
+
+**Tier 2 — six kernels between 44% and 76%, and this is the real headroom.**
+
+| kernel | ms/tok | now | at 88% | saving |
+|---|---:|---:|---:|---:|
+| GDN `out_proj` + attn `o_proj` (shared) | 1.553 | 75% | 1.328 | 0.225 |
+| routed-expert down | 1.540 | 76% | 1.328 | 0.212 |
+| GDN `in_proj_z` + output gate | 1.459 | 60% | 0.996 | 0.463 |
+| shared-expert gate_up | 0.478 | 61% | 0.332 | 0.146 |
+| MoE router (fp16) | 0.447 | 60% | 0.305 | 0.142 |
+| shared-expert down | 0.330 | 44% | 0.165 | 0.165 |
+| **total** | **5.807** | | **4.454** | **1.353** |
+
+**Tier 3 — two structural inefficiencies that are not bandwidth at all.**
+
+- **`in_proj_a` + `in_proj_b`: 0.474 ms/token (2.5%) to move 142 KB.** Both are `2048→32`, so the
+  64-outputs-per-CTA GEMV schedule emits `grid=(1,1,1)` — **one CTA, 1/16 of the GPU**, twice per
+  GDN layer. This is parallelism starvation, not bandwidth; at 4.4 GB/s they are not even close to
+  what a single SM could pull.
+- **`rnn_state_get/set`: 1.489 ms/token (7.8%) of real, unnecessary traffic.** 245 MiB/token copied
+  slot→temp→slot around a recurrence that could read and write the slot directly. Running at
+  205–216 GB/s (L2-assisted), so there is no tiling win here — the fix is to not do the copy.
+
+### Recommended re-scope (revised)
+
+Drop the knob re-sweep and the ptxas dials, as before — §4.2 shows the constants transferred to
+nvcc 13.2 cleanly, and tier 1 has no room. But **do not redirect to launch-overhead work**: at 5.3%
+total idle across 131 eager launches, that whole lane is worth ≤4% and option B below makes most of
+it moot.
+
+In expected-value order:
+
+1. **Merge the four GDN input projections into one GEMV** — `in_proj_qkv` ∥ `in_proj_z` ∥
+   `in_proj_a` ∥ `in_proj_b` → a single `2048→12352`. **IMPLEMENTED AND MEASURED — see §10.**
+   Predicted ~0.87 ms/token (4.5% decode); **measured +2.8% decode and −1.1% prefill.** The
+   prediction assumed the fused 12352-wide GEMV would reach the 137.8 GB/s its 8192-wide
+   predecessor does, and it did not; it also ignored the prefill cost of losing the
+   `silu(z)·core_out` fusion. Subsumes tier-3's `in_proj_a/b` problem and tier-2's `in_proj_z` row.
+2. **Eliminate the recurrent-state copies** — up to **1.489 ms/token (7.8%)**, the single largest
+   line item. **IMPLEMENTED AND MEASURED — see §11.** Landed the recurrent half (state 0,
+   1.195 ms/token of the 1.489); **measured +6.0% decode on the 35B with prefill neutral**, i.e.
+   93% of its estimate and no offsetting cost — the best-behaved prediction in this document.
+   The conv half (state 1, 0.294 ms) is left for a follow-on.
+   ⚠️ **The rest of this item is superseded twice — read the two bold correction blocks
+   below before acting on any of it.** The mechanism it proposes is cudagraph-unsafe, and the
+   obvious implementation corrupts the *default* configuration. The corrected design is at
+   the end, and is what §11 built. Upstream TVM already flags exactly this:
+   `// TODO(siyuan): support zero-copy when seq_len is one` at
+   [rnn_state.cc:304](3rdparty/tvm/src/runtime/vm/rnn_state.cc#L304), and
+   `GetStatePtrBySeqHistory` ([rnn_state.cc:482](3rdparty/tvm/src/runtime/vm/rnn_state.cc#L482))
+   already constructs the exact zero-copy `DLTensor` view — the slice
+   `(seq_slot, history_slot, …)` is contiguous. **Gated on pitfall §9.2**: aliasing the read and
+   write of recurrent state is what broke SGLang #20791, so `gdn_func` must first be shown to touch
+   each state element exactly once per step. For a single decode token the recurrence is
+   elementwise in `S`, so this looks safe — but prove it before writing code, and keep the
+   copy path for the multi-token / history-mode forwards.
+
+   **Feasibility analysed 2026-07-25 — aliasing is SAFE, but the recommended mechanism is WRONG.**
+
+   *The aliasing question is settled, favourably.* In `gdn_func`
+   ([qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py)) thread `(b_idx, h_idx, col)` owns
+   exactly one column of the state matrix: it reads `state_in_buf[b,h,row,col]` once per `row` on
+   entry, holds the column in registers across every pass and every `t`, and writes
+   `state_out_buf[b,h,row,col]` once per `row` on exit. Read set and write set are identical,
+   per-element, and disjoint across threads — no thread ever reads state another thread wrote. That is
+   a stronger guarantee than "elementwise". §9.2/SGLang #20791 was a *scheduler* introducing aliasing
+   into a kernel with cross-thread state reads; this kernel structurally has none. (Caveat: the
+   kernel declares `tirx.noalias: True`, so that attribute has to change with any aliasing.)
+
+   *But "just return `GetStatePtrBySeqHistory`'s view" does not work.* The slot byte offset is
+   `(seq_slot_id * max_history_ + history_slot_id) * state_size`, and `EndForward` advances
+   `history_slot_id = (history_slot_id + 1) % max_history_` every step. With prefix caching off
+   `max_history_` clamps to 1 and the address is stable — but Phase 8 sets `max_history_ = 64`
+   ([config.cc](cpp/serve/config.cc)), and then the address **rotates every step**. Baking that
+   pointer into a captured cudagraph reads the wrong slot silently. Since the point of this work is
+   partly to get these 120 launches *into* the graph (§4.7), a raw-pointer view is the wrong mechanism.
+   Two further obstacles: `get()` uses `call_dps_packed`, which by construction allocates a
+   destination the builtin must fill, so zero-copy needs a different Relax op; and
+   `tirx.noalias: True` on `gdn_func` would be violated.
+
+   **Revised design — fuse the state access into `gdn_func` instead of aliasing buffers.** Pass the
+   *whole* storage buffer plus the `seq_slot_ids` / `history_slot_ids` device tensors into the kernel
+   and index inside it, exactly as the existing `rnn_state_get_0` kernel already does
+   (`f_gets_[state_id](state, seq_slot_ids_view_, history_slot_ids_view_, o_data)`). Then:
+   addresses are computed from device tensor data at runtime, so it is cudagraph-safe under any
+   `max_history_`; both copy kernels disappear rather than being merely captured; and the per-element
+   ownership proof above still applies unchanged. Cost: a new builtin to expose the storage tensor and
+   the id views to the model, a TIR signature change, and the copy path retained for prefill and
+   history mode. Requires rebuilding `libtvm.so` in `3rdparty/tvm/build` separately (§2.1.1).
+
+   **CRITICAL correction — `get`/`set` are a ring-buffer advance, not a redundant copy.**
+   [rnn_state.py](python/mlc_llm/nn/rnn_state.py) `create_get_func` reads
+   `storage[seq_id, history_id, ...]` but `create_set_func` writes
+   `storage[seq_id, (history_id + 1) % max_history, ...]` — **different slots**. `EndForward` then
+   advances `history_slot_id`, so the previous state survives at slot `h`, which is exactly what
+   Phase 8's `PopN` prefix-cache rollback reads.
+
+   This matters because `prefix_cache_mode` defaults to **`"radix"`**
+   ([config.py:157](python/mlc_llm/serve/config.py#L157)) and
+   [config.cc:931](cpp/serve/config.cc#L931) then sets `max_history = 64` for hybrid models. The
+   1.489 ms/token in §4.6 was traced under `prefix_cache_mode="disable"` (which every bench harness
+   sets), i.e. `max_history = 1`, where `(h+1) % 1 == h` and the pair degenerates to a pure copy.
+   **A naive in-place fusion would have sped up the benchmark configuration while destroying the
+   history the default configuration depends on.**
+
+   *The fix is not to abandon the fusion — it is to use the right write index.* The fused kernel
+   loads from `storage[seq, hist, h, row, col]` and flushes to
+   `storage[seq, (hist + 1) % max_history, h, row, col]`, mirroring `create_set_func`. Then both
+   copy kernels vanish in **both** configurations, ring semantics are preserved exactly, and the
+   aliasing question disappears — the slots are distinct whenever `max_history > 1`, and identical
+   only when `max_history == 1`, where the per-element ownership proof above already guarantees
+   safety. The full 1.489 ms/token is recoverable without trading away prefix caching.
+
+   **Progress 2026-07-25:** `vm.builtin.rnn_state_storage` / `_seq_slot_ids` / `_history_slot_ids`
+   added to [rnn_state.cc](3rdparty/tvm/src/runtime/vm/rnn_state.cc), `libtvm.so` rebuilt, all three
+   verified resolvable via `get_global_func`. `RNNState.storage()` / `.slot_ids()` added to
+   [rnn_state.py](python/mlc_llm/nn/rnn_state.py). Remaining: the fused TIR kernel, model wiring
+   (fused for decode, copy path retained for prefill and history mode), and validation.
+3. **Retune the two big tier-2 shared kernels** — `out_proj`/`o_proj` (75%, 40 calls/token) and
+   routed-expert down (76%, 40 calls/token), 3.09 ms/token combined. Worth ~0.44 ms (2.3%) at 88%.
+   Treat 88% as optimistic: both have K = 512 or 4096 rather than the 2048 the tier-1 kernels use,
+   so some of the gap is shape, not schedule.
+4. **Capture the 120 `rnn_state` launches into the cudagraph** — ≤4%, and only if option 2 is
+   ruled out. Superseded by 2, not additive with it.
+
+1 + 2 + 3 ≈ 2.8 ms/token = **14.6%** → roughly **54.13 → 62 tps** *if every option lands at its
+estimate*. Option 1 has since landed at **62% of its estimate** (§10), so treat the other two as
+optimistic by a similar factor until measured. The 97.5 tps weight roofline stays out of reach
+regardless, because §4.6 shows 30% of the budget is kernels that do not stream weights at all.
+
+> **Estimation lesson, worth carrying into options 2 and 3.** The option-1 model was
+> "bytes ÷ the best GB/s any kernel of similar shape achieves". It missed on both sides: the wider
+> fused GEMV did not inherit the narrower one's efficiency, and the estimate covered only decode
+> while the change also cost prefill. For options 2 and 3, predict from a *measured* kernel at the
+> target shape, and always state the prefill effect.
+
+---
+
+## 6. Correctness status
+
+| gate | result |
+|---|---|
+| 0.8B `q0f16` greedy parity vs HF fp16 | ✅ **5/5 prompts, 50/50 tokens each** |
+| 0.8B `q0f16` greedy parity **after the `in_proj_qkvzab` merge** | ✅ **5/5 prompts, 50/50 tokens each** (§10) |
+| 0.8B `q0f16` greedy parity **after the in-place state update**, radix **and** disable | ✅ **5/5 prompts, 50/50 tokens each, both modes** (§11) |
+| 0.8B `q0f16` prefix-cache round-trip (PopN rollback), radix | ✅ **4/4 checks**, identical to the copy path (§11) |
+| 0.8B `q0f16` serial vs **6-way concurrent** decode, `disable` **and** radix | ✅ **6/6 identical**, on the in-place **and** copy-path libs (§12) |
+| 0.8B `q0f16` 4-way concurrent **JSON-schema** generation (jump-forward) | ✅ no abort, schema-valid output (§12) |
+| 0.8B `q4f16_g16e` vs HF fp16 | 1/5 — **quantization divergence, not a bug** |
+| 35B-A3B greedy parity | ❌ **not reproducible on this box — see §6.1, neither leg fits** |
+| 35B-A3B concurrent decode | ⛔ **blocked by design, not by a bug** — `batch_decode` is compiled with batch pinned to 1 (§12) |
+
+⚠️ **Gate hybrid recurrent-state changes under `--prefix-cache-mode radix` as well as `disable`.**
+The two configurations give `max_history` 64 and 1, and a whole class of state-indexing bug is
+green under `disable` and broken under radix — which is the *default*. §11 demonstrates this with a
+built negative control. Every bench harness sets `disable`.
+
+The `q0f16` pass proves the CUDA 13.2 build is numerically exact. The `q4f16_g16e` result is a
+4-bit-vs-fp16 comparison: every divergence is at a genuine near-tie ("Paris." vs "Paris,",
+`n <= 1` vs `n == 0`, both reaching **42**), all outputs coherent and correct, and the high-margin
+Fibonacci prompt is 50/50. Not a valid gate — use `q0f16` for correctness.
+
+### 6.1 Why a bf16 35B gate cannot run on Orin — and the fp8 route that can
+
+Two independent size walls, not one.
+
+**Wall 1 — the HF reference leg**: bf16 `Qwen/Qwen3.6-35B-A3B` needs ~72 GB and this box
+has 61 GB. The worklog recipe ([worklog.md:3226](worklog.md#L3226)) was run on a Blackwell machine
+and `reference_outputs*.pt` is gitignored, so the cache was lost in the re-bootstrap.
+
+**Wall 2 — the MLC leg, missed the first time round.** `--greedy-parity` is only a *bit-exact* gate
+when MLC also runs fp16, and a `q0f16` 35B is 34.66 B text-only params at 2 B = **~69 GB**. Also does
+not fit. So regenerating the 3.5 kB reference cache off-box is necessary but **not sufficient** —
+there is no configuration in which a bit-exact 35B-vs-bf16 comparison runs on a 64 GB Orin.
+
+#### The fp8 release fits, and a software path exists
+
+`Qwen/Qwen3.6-35B-A3B-FP8` is **37.5 GB** (block-wise e4m3, `weight_block_size [128, 128]`, with
+`modules_to_not_convert` keeping the routers, norms and every `linear_attn.in_proj_a` in bf16).
+Getting transformers to actually execute it on sm_87 took three findings:
+
+1. `FineGrainedFP8HfQuantizer.validate_environment` warns below compute capability 8.9 and sets
+   `quantization_config.dequantize = True` — which materializes the model in bf16 and puts us back at
+   72 GB. It has to be overridden, not worked around.
+2. With the quantized path forced, dispatch lands on the Triton kernel (DeepGEMM is SM90+), and
+   Triton **cannot compile it on Ampere**: `ValueError("type fp8e4nv not supported in this
+   architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')")`. There is no fp8 *arithmetic*
+   on sm_87 — this is a hardware limit, not a missing package. (`kernels==0.15.2` installs cleanly
+   and changes nothing.)
+3. The fp8 to bf16/fp16 **cast** does work on sm_87. So a weight-only dequant is viable.
+
+[fp8_software_dequant.py](fp8_software_dequant.py) replaces `fp8_linear` — the single dispatcher both
+`FP8Linear.forward` and `FP8Experts.linear` route through — with a pure-PyTorch dequant: weights stay
+fp8 in memory, the per-128x128-block scale is expanded, and the matmul runs in the activation dtype.
+`FP8Experts.forward` loops only over *hit* experts, so a decode step dequantizes top-8, not all 256.
+`validate.py::load_hf` installs it automatically when the checkpoint declares fp8, and skips the
+`.half()`/`.float()` forcing that would otherwise cast the fp8 weights straight back up.
+
+**Read the result correctly: this is W8A16, not the W8A8 a real fp8 deployment runs.** Activations are
+never quantized, which makes it a *more* accurate oracle than genuine fp8 inference and closer to the
+bf16 master — but weights still carry e4m3 rounding (3 mantissa bits per block). Against a 4-bit MLC
+build, expect near-tie flips exactly like the 0.8B `q4f16_g16e` row above.
+
+So the 35B now has three tiers of check, and it matters which one a claim rests on:
+
+| check | where | strength |
+|---|---|---|
+| `--greedy-parity`, MLC `q0f16` vs HF bf16 | **off-box only** (>=72 GB) | bit-exact; the only thing that proves the port itself |
+| `--greedy-parity`, MLC `q4f16_1` vs **HF fp8 W8A16** | **Orin, works** | weaker than first claimed — see §6.2. Coherence + *comparative* signal only; the match count is not a pass/fail bar |
+| [scripts/greedy_snapshot.py](scripts/greedy_snapshot.py) before/after | **Orin, works** | **bit-exact for refactors** — no reference model needed at all |
+
+Tier 3 is what a layout merge or kernel fusion actually needs: "same lib, same prompts, identical
+tokens" is a stronger statement than any tolerance comparison, and it runs in ~2 min. It cannot tell
+you the port was right to begin with — only that a change did not alter it. Tier 2 covers that gap
+and, unlike tier 1, runs on this hardware.
+
+```bash
+# tier 2 — fp8 reference cache, on Orin. The shim installs itself; ~37.5 GB resident.
+python validate.py --reference-only --model Qwen/Qwen3.6-35B-A3B-FP8 --device cuda:0 \
+    --cache reference_outputs_35b_fp8.pt --no-layer-hooks
+python validate.py --greedy-parity  --model Qwen/Qwen3.6-35B-A3B-FP8 --device cuda:0 \
+    --mlc-model-dir dist/qwen3_6-35B-A3B-q4f16_1 \
+    --mlc-lib dist/qwen3_6-35B-A3B-q4f16_1/lib.so --cache reference_outputs_35b_fp8.pt
+
+# tier 3 — bit-exactness across a refactor, no reference model
+python scripts/greedy_snapshot.py --model-dir <dir> --model-lib <dir>/lib.so \
+    --out tuning/greedy_35b_before.json          # before the change
+python scripts/greedy_snapshot.py --model-dir <dir> --model-lib <dir>/lib.so \
+    --compare tuning/greedy_35b_before.json      # after; nonzero exit on divergence
+
+# tier 1 — still needs another machine, if a bit-exact port gate is ever wanted
+python validate.py --reference-only --model Qwen/Qwen3.6-35B-A3B --device cuda:0 \
+    --cache reference_outputs_35b.pt --no-layer-hooks
+git add -f reference_outputs_35b.pt   # 3.5 kB; .gitignore has an exception for it
+```
+
+### 6.2 What the fp8 tier-2 gate actually measures (measured 2026-07-25)
+
+`reference_outputs_35b_fp8.pt` is built and committed-able (3.5 kB, 5 prompts x 50 tokens). Ran it
+against both 35B libs:
+
+| prompt | baseline `q4f16_1` | fused `q4f16_1` |
+|---|---:|---:|
+| 1 `The capital of France is` | 1/50 | 1/50 |
+| 2 `def fibonacci(n):` | 15/50 | 15/50 |
+| 3 `7 multiplied by 6` (chat) | 2/50 | 2/50 |
+| 4 `Once upon a time...` | 5/50 | 5/50 |
+| 5 `1, 1, 2, 3, 5, 8, 13, 21,` | **50/50** | **50/50** |
+
+**The absolute match counts are low, and §6.1's first framing of this gate was too generous.** It
+claimed the gate "catches every gross porting bug"; at 1/50 agreement on an open-ended prompt, a real
+bug and 4-bit-vs-8-bit quantization noise are not distinguishable by match count. The `>=48/50` bar in
+`validate.py` is calibrated for fp16-vs-fp16 and applying it here is a category error — the same
+mistake §6 already flags for the 0.8B `q4f16_g16e` row.
+
+What the run does establish, and it is not nothing:
+
+1. **Comparative identity.** Both libs agree with the reference *identically, prompt for prompt*,
+   despite generating different text from each other (prompt 3's trailing `<|im_start|>` run differs,
+   4 vs 5). Whatever drives the divergence is common to both, so **the `in_proj_qkvzab` merge does not
+   degrade agreement**. That is the question the gate was run to answer, and it answered it cleanly.
+2. **Coherence.** All five outputs on both libs are fluent and factually right (Paris/Seine,
+   a correct recursive fibonacci, `7 x 6 = 42`, an intact fable, exact Fibonacci continuation). A
+   wrong concat order, a broken RoPE or mis-routed experts produce garbage, not this.
+3. **Margin dependence is the tell.** Prompt 5 — the only high-logit-margin prompt in the set — is
+   **50/50 on both**. Everything else is an open-ended continuation where the next token is a
+   near-tie, so the two quantizations part ways within a token or two and cascade.
+
+**Concrete improvement for next session:** point 3 says how to turn this into a real gate. Build a
+high-margin prompt set — arithmetic, exact-continuation sequences, closed-form factual lookups, the
+kind of prompt where the top-1 logit gap is wide — and require e.g. 48/50 on those. Prompt 5 shows the
+signal is there when the margin is; the current set is simply the wrong instrument, inherited from an
+fp16-vs-fp16 era.
+
+
+---
+
+## 7. Artifacts (all uncommitted)
+
+Full uncommitted inventory — including the **TVM submodule**, which is easy to miss — is in §9.
+Data artifacts:
+```
+tuning/mlc_tg_35b_cuda13_20260724_210647.json        # 35B tg512 single point
+tuning/mlc_tg_sweep_35b_cuda13_20260724_210926.json  # 35B full depth sweep
+tuning/mlc_tg_sweep_0.8b_cuda13_20260724_213627.json # 0.8B full depth sweep
+tuning/moe_kernel_cuda13_20260724.json               # MoE microbench, CUDA 13.2
+tuning/mlc_tg_35b_fused_20260725.json                # 35B after the in_proj merge (§10)
+tuning/mlc_tg_35b_copypath_20260725.json             # 35B option-2 A/B baseline (§11)
+tuning/mlc_tg_35b_inplace_20260725.json              # 35B after the in-place state update (§11)
+tuning/greedy_35b_before.json  tuning/greedy_35b_after.json   # tier-3 snapshots (§6.1)
+reference_outputs.pt              # 0.8B HF fp16 reference (gitignored)
+reference_outputs_35b_fp8.pt      # 35B fp8 W8A16 reference — COMMIT THIS (3.5 kB, §6.1/§6.2);
+                                  # .gitignore already has the exception for the 35B name
+dist/qwen3_5-0.8B-q4f16_g16e/  dist/qwen3_5-0.8B-q0f16/  dist/qwen3_5-0.8B-q0f16_fused/
+dist/qwen3_6-35B-A3B-q4f16_1/  dist/qwen3_6-35B-A3B-q4f16_1_fused/     # dist/ is gitignored
+```
+
+**Both `_fused` dirs now hold three libs, so `glob("*.so")` is more dangerous than ever** (§14.1's
+footgun, and §3's note that `profile_decode.py` still trips it). Always pass `--model-lib`:
+
+| lib | what it is |
+|---|---|
+| `lib_inplace.so` | **the current build** — §10 in_proj merge + §11 in-place state. Bench and gate against this |
+| `lib_copypath.so` | same tree, same flags, `MLC_QWEN35_INPLACE_STATE=0` — the §11 A/B baseline |
+| `lib.so` | the older §10 build (35B: byte-size-identical to `lib_copypath.so` at 166 MB) |
+
+The `_fused` dirs are the §10 builds and are the ones to bench against; the non-fused 35B dir is the
+pre-merge baseline, worth keeping until the merge is committed.
+
+`qwen3_5.md` had uncommitted edits from a parallel session; §9.1 folds the CUDA-13 findings in on
+top of them.
+
+**Session scripts — promoted into `scripts/` (2026-07-25), all re-verified after the move:**
+
+| file | purpose |
+|---|---|
+| [scripts/bw_probe.cu](scripts/bw_probe.cu) | achievable read-BW probe, native sm_87. Reproduces **156.2 GB/s** |
+| [scripts/active_params.py](scripts/active_params.py) | exact active-param/roofline calc from safetensors headers. Now takes `--snapshot/--bits/--tps` |
+| [scripts/profile_decode_35b.py](scripts/profile_decode_35b.py) | parameterized nsys/ncu decode harness (explicit `--model-lib`) |
+| [scripts/analyze_decode_trace.py](scripts/analyze_decode_trace.py) | **new** — the §4.6 breakdown: step-segmented per-token ms, in-trace idle, kernel→weight map |
+| [scripts/greedy_snapshot.py](scripts/greedy_snapshot.py) | **new** — tier-3 bit-exactness gate (§6.1): capture greedy tokens, diff after a refactor |
+| [scripts/prefix_cache_roundtrip.py](scripts/prefix_cache_roundtrip.py) | **new (§11)** — PopN rollback gate under radix. Needs no reference model, so it runs on the 35B |
+| [scripts/batch_decode_parity.py](scripts/batch_decode_parity.py) | **new (§11)** — serial vs concurrent decode; covers per-batch state-slot indexing. **Runs and passes as of §12**, and now also reports the concurrency speedup |
+| [fp8_software_dequant.py](fp8_software_dequant.py) | **new** — software W8A16 fp8 path so the 37.5 GB fp8 checkpoint can be an HF reference on sm_87 (§6.1) |
+
+Build/run:
+```bash
+nvcc -O3 -arch=sm_87 -o /tmp/bw scripts/bw_probe.cu && /tmp/bw
+python scripts/active_params.py
+nsys export --type sqlite -o dec.sqlite q35_decode.nsys-rep
+python scripts/analyze_decode_trace.py dec.sqlite --top 26
+```
+
+`prof_decode35.py`'s `decode-steady` NVTX range **never made it into the trace** — the only NVTX
+rows are CCCL/thrust. torch's `nvtx.range_push` is a no-op here (TVM is built `USE_NVTX OFF` and the
+sbsa torch cannot initialize CUDA on sm_87). `analyze_decode_trace.py` segments on the sampling
+kernel instead and does not need NVTX; leave the range in place but do not rely on it.
+
+---
+
+## 8. Reproduction
+
+```bash
+sudo nvpmodel -m 0 && sudo jetson_clocks     # REQUIRED — worth ~1.4%
+source .envrc.local
+
+# bench (always pass --model-lib; glob picks lib_nofi.so otherwise → ~82% of headline)
+python scratch_mlc_tg_sweep.py \
+  --model-dir dist/qwen3_6-35B-A3B-q4f16_1 \
+  --model-lib dist/qwen3_6-35B-A3B-q4f16_1/lib.so \
+  --pp 512 --tg 512,1024,2048,4096,8192 --runs 3 --warmup 1 --json-out tuning/<name>.json
+
+# correctness (q0f16 only — q4 vs fp16 is not a valid gate)
+python validate.py --reference-only --model Qwen/Qwen3.5-0.8B --device cuda:0 \
+    --cache reference_outputs.pt
+python validate.py --greedy-parity --model Qwen/Qwen3.5-0.8B --device cuda:0 \
+    --mlc-model-dir dist/qwen3_5-0.8B-q0f16 \
+    --mlc-lib dist/qwen3_5-0.8B-q0f16/lib.so --cache reference_outputs.pt
+
+# recurrent-state gates — run BOTH modes; `disable` alone is blind to a whole bug class (§6)
+python scripts/prefix_cache_roundtrip.py \
+    --model-dir dist/qwen3_5-0.8B-q0f16_fused \
+    --model-lib dist/qwen3_5-0.8B-q0f16_fused/lib_inplace.so
+for m in disable radix; do
+  python scripts/batch_decode_parity.py --prefix-cache-mode $m \
+      --model-dir dist/qwen3_5-0.8B-q0f16_fused \
+      --model-lib dist/qwen3_5-0.8B-q0f16_fused/lib_inplace.so
+done   # also prints the concurrency speedup (§12); 0.8B only — the 35B is pinned to batch 1
+
+# decode trace + the §4.6 breakdown
+nsys profile -t cuda,nvtx --cuda-graph-trace=node -o q35_decode -f true \
+  python scripts/profile_decode_35b.py \
+  --model-dir dist/qwen3_6-35B-A3B-q4f16_1 --model-lib dist/qwen3_6-35B-A3B-q4f16_1/lib.so
+nsys export --type sqlite -o q35_decode.sqlite q35_decode.nsys-rep
+python scripts/analyze_decode_trace.py q35_decode.sqlite --top 26
+```
+
+**Engine-side C++ changes need `ninja -C build`, not just `source .envrc.local`.** Everything in §12
+lives in `libmlc_llm.so`; a Python-only workflow will silently keep running the old engine. The TVM
+half (`3rdparty/tvm/build`) is a separate build again — see §2.1.1.
+
+Do not read `nsys stats --report cuda_gpu_kern_sum` directly for per-token cost: it averages prefill
+and decode instances of the same kernel name together (`depthwise_conv1d` is 4016 µs in prefill,
+11 µs in decode) and gives no idle figure. Use `analyze_decode_trace.py`.
+
+**`ncu` is still blocked** — `sudo` on this box requires a password, so the §2 sudoers entry could
+not be added non-interactively. Everything in §4.6/§4.7 came from `nsys`, which needs no privileges.
+Add the entry by hand if per-kernel hardware counters are wanted:
+```bash
+echo 'alfie ALL=(root) NOPASSWD: /usr/local/cuda/bin/ncu' | sudo tee /etc/sudoers.d/ncu-profiling
+sudo chmod 440 /etc/sudoers.d/ncu-profiling
+```
+
+Monitoring: **`nvidia-smi` does not report iGPU utilization or processes on Tegra** — it shows
+`Not Supported` / `N/A` / "No running processes found" even under full load. Use `tegrastats`, or
+`cat /sys/devices/platform/bus@0/17000000.gpu/load` (per-mille).
+
+---
+
+## 9. Status and next steps
+
+### Done 2026-07-25
+
+- **Every decode kernel identified; the budget re-derived from one trace (§4.6).** Closed both
+  "which weights are those two kernels" questions; refuted the "moves ~nothing" claim about
+  `rnn_state_get/set` and the 13.3% idle figure.
+- **Cudagraph coverage audited (§4.7).** 131 eager launches/token, 120 of them `rnn_state`.
+  `op.topk` has not regressed.
+- **§5 re-scoped** off launch-overhead onto tier-2/tier-3 kernels.
+- **§5 option 1 landed and measured (§10)** — `in_proj_qkvzab`. +2.8% tg / -1.1% pp. **Kept**, by
+  decision, after the fp8 gate showed it correctness-neutral.
+- **The 35B got its first on-box reference (§6.1, §6.2)** via the fp8 checkpoint plus a software
+  W8A16 shim, and the gate was then honestly de-rated in §6.2.
+- **§5 option 2 LANDED and measured (§11)** — in-place GDN recurrent-state update. **35B +6.04%
+  decode, prefill neutral**; 0.8B +2.25%. Validated under both `prefix_cache_mode` settings, and
+  the §5 trap was confirmed by building the wrong version on purpose.
+- **Eight scripts promoted/added under `scripts/` (§7).**
+- **Concurrent serving fixed and gated (§12)** — the break was multi-sequence *prefill*, not decode.
+  0.8B now serves 6 requests concurrently at **2.67×** serial wall clock, 6/6 identical output under
+  both prefix-cache modes and on both libs. Two pre-existing grammar-path aborts fixed on the way.
+  Closes §11's coverage gap on the fused kernel's per-batch slot indexing.
+
+### Start here next session
+
+1. **Decide whether the 35B should be able to decode more than one sequence (§12).**
+   `batch_decode` is pinned to a literal batch of 1 at
+   [qwen3_5_moe_model.py:637](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L637) so the
+   MoE block's `if num_tokens == 1:` folds at compile time — worth ~6× and load-bearing for the
+   58.97 tps in §11. Restoring the dynamic-batch spec would give that back. The options worth
+   costing are (a) a Relax `If` in the MoE block for runtime dispatch, (b) a second decode entry
+   point with a dynamic batch that the engine selects when `max_num_sequence > 1`, (c) leave it
+   interactive-only and say so in the docs. Until this is settled the 35B is single-sequence and
+   the engine fix in §12 does nothing for it.
+2. **Consider fusing the *conv* state too (state 1).** §11 took the recurrent half; the conv half is
+   the remaining **0.294 ms/token (1.5%)** of §4.6's `rnn_state` line. Bigger prize than the raw
+   1.5%: it would remove the last 60 `vm.builtin` calls per token from the layer loop, and each one
+   currently forces `EndRegion()` in the cudagraph pass, so the whole decode body could become one
+   captured region. Harder than option 2 — the conv1d is a TE op, not a hand-written TIR kernel.
+3. **Optional: get the fused kernel back into a cudagraph.** ⚠️ **This item is reasoned from the
+   pass source, not from a trace — re-run §4.7's `--cuda-graph-trace=node` profile against
+   `lib_inplace.so` before acting on it.** Reading
+   [rewrite_cuda_graph.cc:377-387](3rdparty/tvm/src/relax/transform/rewrite_cuda_graph.cc#L377),
+   the fused call should *not* be captured: its storage argument is produced by a `vm.builtin`
+   call, which the pass never marks static, so every consumer is non-static too. The predicted net
+   effect is still favourable — per GDN layer, 2 eager builtin launches plus 1 captured kernel
+   becomes 1 eager kernel, so both traffic and region count fall — which would explain why +6.04%
+   landed regardless. Making it capturable means allowlisting the three `rnn_state_*` handle
+   builtins as static in that pass; that is **sound**, since the runtime audit for §11 confirmed
+   `storages_` and both slot-id views are allocated once in the constructor and `CreateView` uses
+   byte offset 0, so the pointers are stable across steps. Do 2 and 3 together or not at all.
+4. **Consider a high-margin prompt set (§6.2).** The cheapest way to turn the fp8 tier-2 gate from a
+   comparative signal into a real pass/fail bar. Prompt 5 is 50/50 on both libs; the rest are
+   open-ended near-ties. This unblocks trusting any future 35B change.
+5. **Then §5 option 3** (tier-2 GEMV retune), discounted per the estimation lesson in §5.
+
+**Not re-gated: the VL path.** `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward`, so it inherits
+the in-place update, but there is **no compiled VL model on this box**, so the 176/180 multimodal
+gate from f667b07e was not re-run. Rebuild and re-gate it before trusting the VL build.
+
+### Uncommitted state (nothing has been committed)
+
+**The TVM submodule has its own uncommitted change** — easy to lose, and the mlc-llm build will not
+rebuild it (§2.1.1):
+
+```
+3rdparty/tvm (fork alansrobotlab2/relax, detached at bf273f5)
+  M src/runtime/vm/rnn_state.cc      # the three new builtins
+```
+
+Main repo:
+
+| file | what |
+|---|---|
+| `python/mlc_llm/model/qwen35/qwen35_model.py` | `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle |
+| `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§11** same state_io wiring (the 35B's model file; VL reuses `Qwen35Model` and needed none) |
+| `scripts/{prefix_cache_roundtrip,batch_decode_parity}.py` | **§11 new** — rollback and batch-slot gates; `batch_decode_parity` gained phase timing in **§12** |
+| `cpp/serve/engine_actions/batch_prefill_base.cc` | **§12** one-sequence prefill cap for RNN-state models; no decode-folding |
+| `cpp/serve/engine_actions/batch_decode.cc` | **§12** multi-token decode cap + retokenization history guard |
+| `cpp/serve/engine_actions/batch_jumpforward.cc` | **§12** skip jump-forward when its rollback exceeds the RNNState ring |
+| `cpp/serve/engine.cc` | **§12** startup warning: speculative decoding on hybrid is single-sequence only |
+| `python/mlc_llm/model/{qwen35,qwen3_5_moe,qwen3_5_vl}/*_loader.py` | 4-way concat |
+| `python/mlc_llm/nn/rnn_state.py` | `storage()` / `slot_ids()` accessors (`storage()` now `match_cast`s the shape; both had a `Tensor(_name=...)` kwarg that does not exist and would have failed on first use) |
+| `python/mlc_llm/quantization/quantization.py` | comment: ft-quant fallback no longer hit on the 35B |
+| `validate.py` | fp8 detection, shim install, bf16 forcing; **§11** `--prefix-cache-mode` |
+| `fp8_software_dequant.py` | **new** — software W8A16 fp8 path |
+| `scripts/{analyze_decode_trace,greedy_snapshot,active_params,profile_decode_35b}.py`, `scripts/bw_probe.cu` | **new/promoted** |
+| `qwen3_5.md` | §14.5 + 5 stale-item corrections |
+| `workplan-cuda-13.md` | **new** — this file |
+| `.gitignore` | exception for `reference_outputs_35b.pt` |
+
+Artifacts: `reference_outputs_35b_fp8.pt` (3.5 kB, **worth committing** — it is the only 35B
+reference that runs on this box), `tuning/greedy_35b_{before,after}.json`,
+`tuning/mlc_tg_35b_fused_20260725.json`, plus the four 2026-07-24 tuning files.
+`dist/qwen3_6-35B-A3B-q4f16_1_fused/` and `dist/qwen3_5-0.8B-q0f16_fused/` are the merged builds
+(`dist/` is gitignored).
+
+### Open questions
+
+- Why are `out_proj`/`o_proj` (75%) and routed-expert down (76%) short of the 88% the same schedule
+  reaches at K=2048? Both differ in K (4096 and 512). Shape-driven or schedule-driven decides
+  whether §5 option 3 is worth doing.
+- Can the -1.1% prefill regression from §10 be recovered? The lost `silu(z)*core_out` fusion and the
+  wider v2 group-GEMM output are the two candidates; neither has been profiled.
+- Does the CTA_COUNT=64-vs-1024 small-batch gap (§4.2) reach any shipped path?
+- The baseline/fused A/B was not compile-flag-identical (§10 caveat). A rebuild with matching flags
+  would close it.
+- **Is the 35B's batch-1 MoE specialization still worth ~6%?** The "~6× faster than
+  `dequantize_group_gemm` at b=1 top-8" claim at
+  [qwen3_5_moe_model.py:632](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L632) is a source
+  comment, not a measurement in this document, and it predates both the Phase 9 CTA_COUNT=1024
+  restoration (§4.2) and nvcc 13.2. Measuring it is what decides §9 item 1 — and `moe_dequantize_gemv`
+  already sits at 88% of the 156 GB/s wall (§4.6), so the honest question is how far the
+  dynamic-batch path falls short of *that*, at b=1, today. `bench_moe_kernel.py` is the instrument.
+
+---
+
+## 10. Landed: the GDN input-projection merge (2026-07-25)
+
+§5 option 1, implemented. `in_proj_qkv` / `in_proj_z` / `in_proj_a` / `in_proj_b` are now one
+`in_proj_qkvzab` Linear (`2048 -> 12352` on the 35B, `1024 -> 8224` on the 0.8B), split back into
+four tensors right after the projection.
+
+**Code**: [qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py) — one `nn.Linear` plus a
+`_in_proj()` helper that both `forward` and `forward_with_history` call (the helper carries the
+small-static-seq per-token GEMV dispatch the spec-verify path needs). The `QWEN35_NO_QUANT` bisect
+hook still accepts the four legacy names, but they now all mark the fused Linear — per-sub-projection
+granularity is gone, so a bisect needing it has to un-fuse first. Loader concat added to all three
+loaders that map this layer ([qwen35](python/mlc_llm/model/qwen35/qwen35_loader.py),
+[qwen3_5_moe](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_loader.py),
+[qwen3_5_vl](python/mlc_llm/model/qwen3_5_vl/qwen3_5_vl_loader.py)) — same treatment `c_attn`
+already gives q/k/v. The MTP drafts do not instantiate a GDN layer and needed no change.
+
+### What the weights do — exactly as predicted
+
+Group quantization runs along the reduction axis, so row-concatenation changes nothing:
+
+| check | result |
+|---|---|
+| 0.8B `q0f16`: fused fp16 tensor vs `concatenate([qkv, z, a, b])` | **bit-identical** |
+| 35B `q4f16_1`: fused `q_weight` (int4) vs concat | **bit-identical** |
+| 35B `q4f16_1`: fused `q_scale` vs concat | **bit-identical** |
+| 35B convert totals | **18.187 GB / 35,951,822,704 params / 4.345 bits** — unchanged |
+| 0.8B tensor count | 296 -> 242 (18 GDN layers x 3 fewer tensors) |
+
+### What the arithmetic does — NOT as predicted
+
+§5 called this "bit-exact, not an approximation". **That claim was too strong and is corrected
+here.** The *weights* are bit-exact. The *arithmetic* is not: a 12352-wide GEMV gets a different
+dlight reduction split than the 8192/4096/32/32 kernels it replaces, so fp16 accumulation order
+changes, and at 4 bits that flips near-ties.
+
+- 0.8B `q0f16` greedy parity vs HF: **5/5 prompts, 50/50 tokens** — the gate holds. fp16 has enough
+  margin that the reordering changes nothing observable.
+- 35B `q4f16_1` [greedy_snapshot](scripts/greedy_snapshot.py) vs pre-merge: **3/5 diverged**. Every
+  divergence is a single early token flip that then cascades (prompt 4 splits at char 10 on
+  `<think>\n` -> `\n` vs `Here`), and all five outputs stay coherent and correct.
+
+**Method lesson: `greedy_snapshot.py` is the wrong gate for a change that alters kernel shape.** It
+is the right gate for changes that preserve arithmetic — launch reordering, cudagraph capture,
+memory-layout moves that keep the same reduction. Anything that makes dlight schedule differently
+needs the tier-2 semantic gate (§6.1) instead.
+
+### Measured throughput
+
+Baseline `dist/qwen3_6-35B-A3B-q4f16_1/lib.so` vs fused, MAXN + `jetson_clocks`, `--pp 512
+--runs 3 --warmup 1`, both libs carrying 58 FlashInfer symbols:
+
+| | baseline | fused | delta |
+|---|---:|---:|---:|
+| tg 512 | 54.13 | **55.66** | **+2.8%** |
+| tg 1024 | 54.00 | **55.47** | +2.7% |
+| tg 4096 | 53.34 | **54.74** | +2.6% |
+| pp 512 | 566.33 | **559.83** | **-1.1%** |
+| `lib.so` | 200 MB | 166 MB | -34 MB |
+
+Raw: `tuning/mlc_tg_35b_fused_20260725.json`.
+
+Predicted +4.5% decode, got +2.8% — the estimate assumed the fused 12352-wide GEMV would inherit the
+137.8 GB/s its 8192-wide predecessor reaches, and it did not. The prefill cost was not predicted at
+all; the `silu(z)*core_out` fusion is gone (z now comes from a split, so Relax cannot fold the
+multiply into the matmul) and the v2 group-GEMM sees a different output width.
+
+**The trade is workload-dependent.** End-to-end at pp512/tg512 the fused lib is ~2.5% faster; at
+pp8192/tg64 it is ~0.9% *slower*. Decode-bound interactive use wins, prefill-heavy short-generation
+use loses slightly.
+
+### Correctness verdict
+
+With bit-exactness unavailable (arithmetic changed) the deciding evidence is the §6.2 tier-2 run:
+**both libs agree with the fp8 reference identically, 1/15/2/5/50 prompt for prompt**, while
+generating slightly different text from each other. The divergence is common to both, so it is not
+caused by the merge. Combined with the 0.8B `q0f16` 5/5 gate and bit-identical quantized weights,
+the merge is **correctness-neutral**. Note this is weaker than a bit-exact proof, and §6.2 explains
+why the match counts themselves are not a pass/fail bar.
+
+> **Compile-flag caveat.** The baseline was built with
+> `flashinfer=1;cublas_gemm=1;cudagraph=1;cutlass=1`; the fused lib with `flashinfer=1;cudagraph=1`.
+> Per §3 both dropped flags are inert here (`cublas_gemm` is silently disabled at `q4f16_1`,
+> `cutlass` is gated to sm_90a/sm_100a), and both libs export 58 FlashInfer symbols — but the A/B
+> is not flag-identical, and a rebuild with matching flags would remove the last doubt.
+
+---
+
+## 11. Landed: in-place GDN recurrent-state update (2026-07-25)
+
+§5 option 2, implemented as the corrected design in that section prescribes — fuse the state
+*access* into `gdn_func` rather than aliasing buffers or handing out a slot pointer.
+
+**Result: the largest single win in this workplan, and the only one that cost nothing elsewhere.**
+
+| | 35B `q4f16_1` | 0.8B `q0f16` |
+|---|---:|---:|
+| tg512 before | 55.61 | 87.64 |
+| tg512 after | **58.97** | **89.61** |
+| delta | **+6.04%** | **+2.25%** |
+| pp512 before → after | 560.18 → 560.59 (+0.07%) | 2838.45 → 2846.25 (+0.27%) |
+| `lib.so` | 166 → 153 MB | — |
+
+Five runs each, spread ≤0.1% on both libs (35B: 55.54–55.64 vs 58.93–58.99). **Clocks were not
+pinned** — `sudo` needs a password on this box (§8) — so absolute numbers sit ~1.4% below the
+pinned figures in §4.1; the A/B ran back-to-back under identical conditions.
+
+Predicted 1.195 ms/token of an 18.474 ms budget = 6.5%; measured 6.04%, i.e. **93% of estimate**.
+That is the estimation lesson in §5 being applied rather than re-learned: the prediction came from
+a *measured* pair of kernels at the real shape (`rnn_state_get_0` + `set_0` in §4.6), not from a
+bytes-÷-best-observed-bandwidth model, and it also predicted the prefill effect (none — the copies
+are per-call, not per-token, so prefill amortizes them away already).
+
+### The A/B is source- and flag-identical
+
+§10 shipped with a caveat that its baseline and fused libs were built with different `--opt`
+strings. That is closed here: both libs are built from **the same tree** with the **same flags**
+(`flashinfer=1;cudagraph=1`), differing only by `MLC_QWEN35_INPLACE_STATE=0`, a new env toggle that
+compiles the old copy path. The 35B `lib_copypath.so` and the pre-existing §10 `lib.so` are both
+166 MB, which is the consistency check on that claim.
+
+### What the kernel does
+
+[`create_gated_delta_net_func_inplace`](python/mlc_llm/model/qwen35/qwen35_model.py) takes the whole
+`(max_batch, max_hist, H, K, V)` storage buffer plus the device-side `seq_slot_ids` /
+`history_slot_ids` arrays, and does the slot addressing itself:
+
+```
+load  from storage[seq_slot,       hist_slot,            head, row, col]
+flush into storage[seq_slot, (hist_slot + 1) % max_hist, head, row, col]
+```
+
+Both copy kernels disappear from the decode path. `max_batch_size` and `max_history` are bound from
+the storage tensor's own shape by `T.match_buffer` — they are *runtime* arguments to
+`create_rnn_state`, so nothing in Relax scope names them, and `RNNState.storage()` introduces them
+with a `match_cast`. One kernel is therefore correct at any `max_history`.
+
+Wiring: handles are hoisted **above** the layer loop (`_GDNStateIO` / `_hoist_gdn_state_io`). That
+placement is load-bearing — TVM's cudagraph pass calls `EndRegion()` on every `vm.builtin.*` call
+([rewrite_cuda_graph.cc:383](3rdparty/tvm/src/relax/transform/rewrite_cuda_graph.cc#L383)), so
+emitting 30 storage handles inside the loop would cut the capture region 30 extra times. The
+`forward_with_history` (spec-verify) path keeps the copy path unchanged.
+
+### Correctness
+
+All gates on the 0.8B `q0f16`, which is the only configuration where a bit-exact comparison exists
+(§6):
+
+| gate | radix (`max_history=64`, **default**) | disable (`max_history=1`, what benches use) |
+|---|---|---|
+| `--greedy-parity` vs HF fp16 | ✅ 5/5 prompts, 50/50 tokens | ✅ 5/5 prompts, 50/50 tokens |
+| `scripts/prefix_cache_roundtrip.py` | ✅ 4/4 checks | ✅ 4/4 checks (control) |
+
+The copy-path lib produces identical text on the round-trip gate, so this is behavioural identity
+on the rollback path, not merely self-consistency.
+
+**On the 35B `q4f16_1` the round-trip gate is comparative, not pass/fail** — the same category
+error §6.2 flags for the fp8 gate, now confirmed for this one. Both libs score 19/20:
+
+| check | in-place | copy path (pre-existing) |
+|---|---|---|
+| pass1 vs cold | **4/5** | 5/5 |
+| pass2 vs pass1 (exact-match reuse) | 5/5 | **4/5** |
+| pass3 ext vs cold (fork) | 5/5 | 5/5 |
+| pass3 base vs cold (**fork + PopN rollback**) | **5/5** | **5/5** |
+
+The single divergence is the *same prompt* on both libs ("The three primary colors are") between
+the *same two orderings* ("red, yellow, and blue" ↔ "red, blue, and yellow") — a genuine near-tie
+that flips run to run — and it lands on a **different check each time**. That is the signature of
+nondeterminism, not of a mechanism bug: a real state bug takes a whole check from 5/5 to 0/5, as
+the negative control below does. **The rollback check itself is 5/5 on both libs**, which is the
+question the gate was run to answer.
+
+### The trap in §5 is real — built and measured
+
+§5 warned that writing back into the *current* slot "would have sped up the benchmark configuration
+while destroying the history the default configuration depends on". That was an analytical claim;
+it is now a measurement. A deliberate negative-control lib with `hist_out = hist_in`:
+
+| | radix (default) | disable (benches) |
+|---|---|---|
+| `--greedy-parity` | ❌ all 5 prompts, **3–16/50 tokens** | — |
+| `prefix_cache_roundtrip.py` | ❌ 13 divergences (0/5, 2/5, 0/5) | ✅ **4/4 — fully green** |
+
+**One correction to §5's framing.** It says a naive fusion corrupts the default *silently*. It does
+not: under radix, `EndForward` advances into a slot the kernel never wrote, so ordinary generation
+breaks immediately and loudly. The real hazard is narrower and more specific — the failure is
+invisible **only if you gate exclusively under `disable`**, which is what every bench harness sets.
+Since `validate.py` inherits the engine default (radix), it would have caught this. The genuine
+risk was benching under `disable`, seeing a clean speedup, and shipping.
+
+### New gates
+
+`validate.py` gained `--prefix-cache-mode`, because the mode is the variable that decides whether
+this class of bug is observable at all.
+
+[scripts/prefix_cache_roundtrip.py](scripts/prefix_cache_roundtrip.py) closes the gap flagged at
+[worklog.md:946](worklog.md#L946) ("the actual PopN-round-trip parity test") and guards the risk at
+[worklog.md:1112](worklog.md#L1112) ("a fused kernel would need to preserve that PopN-able history
+path"). It needs **no reference model**, so unlike `--greedy-parity` it runs on the 35B, where §6.1
+shows no bit-exact reference fits in 64 GB. Cold-vs-warm engine, exact-match reuse, and
+fork-plus-rollback are checked separately so a failure says which mechanism broke.
+
+### Found while gating: hybrid models cannot serve more than one sequence at a time
+
+> **Fixed in §12 — and this diagnosis is wrong about where.** The failing forward is
+> multi-sequence *prefill*, not decode: `BatchDecode` already passes `(num_seq, 1, h)` and always
+> agreed with `cur_batch_size_`. Read §12 before acting on anything below. The reassuring second
+> bullet is also half-wrong: batch > 1 *was* reachable on the 0.8B and was being blocked by an
+> engine bug; on the 35B it is blocked instead by a deliberate compile-time MoE specialization.
+
+[scripts/batch_decode_parity.py](scripts/batch_decode_parity.py) was written to cover the one thing
+the other gates miss — the fused kernel indexes `storage[seq_slot_ids[b], ...]` per batch element,
+and every other gate runs at batch 1. It cannot run, because **multi-sequence decode is broken on
+hybrid models independently of this work**:
+
+```
+ValueError: Mismatched output.shape[0] on argument #3 when calling:
+  rnn_state_get_1(storage: Tensor([max_batch_size, max_history, 3, 6144], float16),
+                  seq_slot_ids: Tensor([batch_size], int32), ...,
+                  output: Tensor([batch_size, 3, 6144], float16))
+  expected to match seq_slot_ids.shape[0]
+```
+
+**Reproduced identically on `lib_copypath.so`**, and the failing kernel is `rnn_state_get_1` — the
+*conv* state, which §11 does not touch. The cause is the invariant the model has always assumed:
+`RNNState.get` sizes its destination from `hidden_states.shape[0]`, while the runtime fills
+`cur_batch_size_` rows, and those diverge as soon as more than one sequence is in flight. This is
+presumably why every harness in this repo uses `mode="interactive"` (max_batch_size 1).
+
+Two consequences, and the second is the reassuring one:
+
+- The per-batch slot indexing in the fused kernel is **still unverified**, and cannot be verified
+  until the above is fixed. Stated plainly rather than buried: it is the one gap in §11's coverage.
+- **The risk is correspondingly small** — batch > 1 is not a reachable configuration on hybrid
+  models in this tree at all, for the copy path or the fused path. Nothing regressed; a door that
+  was already shut stayed shut.
+
+### Three harness traps, all of which cost time this session
+
+Any future multi-engine gate on this box will hit these. All three are already handled in
+`prefix_cache_roundtrip.py`; copy that file's `new_engine` / `_gen` / driver shape rather than
+rediscovering them.
+
+1. **`engine._generate` hangs, GPU at 0%.** Already documented at
+   [worklog.md:815](worklog.md#L815) but easy to miss. It survived on the 0.8B and on the 35B's
+   *first* engine, then hung on the second — so it fails late and looks like a model bug rather
+   than a harness bug. Use `engine.completions.create(..., model=<model_type>, stream=False)`. It
+   also deadlocks outright when driven from several threads.
+2. **`mode="interactive"` without explicit sizes routes through the auto-config path** — the
+   `max_total=262144, prefill_chunk=2048` combination in the worklog.md:815 hang. Pass
+   `max_num_sequence` / `max_total_sequence_length` / `prefill_chunk_size` explicitly.
+3. **Two 35B engines cannot coexist, and neither `terminate()` nor `gc.collect()` frees in time.**
+   At ~41 GB each (18.6 GB params + 5.2 KV + 7.9 rnn_state at `max_history=64` + 9.2 temp), the
+   second `MLCEngine(...)` dies in `cudaMalloc`. Only **process exit** reliably releases the C++
+   engine's device memory, so the script re-invokes itself once per phase and passes results
+   through JSON.
+
+---
+
+## 12. Landed: concurrent serving on hybrid models (2026-07-25)
+
+§9 item 1. [scripts/batch_decode_parity.py](scripts/batch_decode_parity.py) now runs, and passes
+6/6 under both `prefix_cache_mode` settings and on both the in-place and copy-path libs. **This
+closes §11's one stated coverage gap**: the fused kernel's per-batch `storage[seq_slot_ids[b], …]`
+indexing has now been exercised with six sequences in distinct slots.
+
+Everything below is **engine-side C++. No model change, no recompile** — `lib_inplace.so` and
+`lib_copypath.so` were both gated exactly as they were already built.
+
+### It was prefill, not decode
+
+§11 called this "hybrid models cannot serve more than one sequence at a time" and named
+`rnn_state_get_1`, both correct. But it placed the failure in decode, and the stack places it
+somewhere else entirely:
+
+```
+NewRequestPrefillActionObj::Step   new_request_prefill.cc:148
+  ModelImpl::BatchPrefill          model.cc:355
+    RNNStateImpObj::Get            rnn_state.cc:307
+      ValueError: Mismatched output.shape[0] ... expected to match seq_slot_ids.shape[0]
+```
+
+`BatchDecode` was never broken. [model.cc:538](cpp/serve/model.cc#L538) views the embeddings as
+`(num_sequence, 1, h)`, which is exactly what `cur_batch_size_` expects, and the 0.8B's
+`batch_decode` spec is `["batch_size", 1, hidden]` to match. `BatchPrefill` at
+[model.cc:316](cpp/serve/model.cc#L316) instead views them as `(1, total_length, h)` — the batch is
+**concatenated**, and per-sequence boundaries exist only inside the PagedKVCache's own
+`BeginForward` — while [model.cc:302](cpp/serve/model.cc#L302) hands `RNNState::BeginForward` all N
+sequence ids. The model sizes the `get` destination from `hidden_states.shape[0]`, which is the
+literal `1` in the `batch_prefill` spec, and the assert fires.
+
+**The shape mismatch is the shallow half.** Reconcile the shapes and it is still wrong: `gdn_func`'s
+`for t in range(seq_len)` and the causal conv1d would both run straight across the boundary between
+two concatenated sequences, silently mixing one request's recurrent state into the next. *One
+sequence per prefill forward is what a recurrent layer means*, not a workaround for an assert.
+That is why the fix caps the batch rather than reconciling the shapes.
+
+### The changes
+
+| file | change |
+|---|---|
+| [batch_prefill_base.cc](cpp/serve/engine_actions/batch_prefill_base.cc) | cap the prefill batch to one sequence when the model carries an RNN state, and skip `PrefillMode::kHybrid`'s decode-folding, which would otherwise re-add the running sequences to the same forward |
+| [batch_decode.cc](cpp/serve/engine_actions/batch_decode.cc) | a decode step whose entries do not *all* want exactly one token falls through to `BatchPrefill`; when that happens, advance only the one multi-token entry. Picking the multi-token entry, not the first, is what avoids starving it |
+| [batch_decode.cc](cpp/serve/engine_actions/batch_decode.cc) | `CommitTokenMayRetokenize`: skip retokenization when the rollback exceeds the RNNState history ring |
+| [batch_jumpforward.cc](cpp/serve/engine_actions/batch_jumpforward.cc) | skip the jump forward when *its* rollback would exceed the ring |
+| [engine.cc](cpp/serve/engine.cc) | warn at startup that speculative decoding on a hybrid model is still single-sequence only |
+
+Nothing changes for pure-attention models: every guard is behind
+`kv_state_kind ∈ {kRNNState, kHybrid}`. Pure-RNN models (RWKV6) get the prefill cap too, and want
+it — [rwkv6_model.py:483](python/mlc_llm/model/rwkv6/rwkv6_model.py#L483) declares the same
+`[1, "seq_len", h]` prefill spec against a per-`batch` `state.get`, so the bug is upstream MLC's,
+not something this port introduced.
+
+### One more bug fell out, at two call sites — the grammar path
+
+Not reachable without structured output, and not known before this session. It surfaced because
+unblocking concurrency is what first let four grammar-constrained requests run together.
+
+**Jump-forward decoding aborts the engine loop on any hybrid model.** Jump-forward commits several
+tokens at once and then rolls back to re-tokenize; the rollback goes through `PopNFromKVCache`,
+which on a hybrid model also rewinds the GDN recurrent state — and that reaches only as far as the
+RNNState history ring:
+
+```
+tvm.error.InternalError: Check failed: n <= it->second.available_history_num (1 vs. 0)
+```
+
+With `prefix_cache_mode="disable"` the ring is **one slot deep**, so `available_history_num` is
+pinned at 0 and *no* rollback is possible at all. Retokenization only refines token boundaries so
+the committed ids match a fresh tokenization of the same text — it is not a correctness
+requirement — so both call sites now check the ring first and fall back to committing the sampled
+token as-is: `CommitTokenMayRetokenize` in `batch_decode.cc` and `HandleRollback`'s caller in
+`batch_jumpforward.cc`, one root cause reachable from two places.
+
+⚠️ **It should hit at batch 1 too, but that is reasoned, not measured.** `available_history_num` is
+per-sequence and has nothing to do with batch size, so nothing about the crash *depends* on
+concurrency. The single-request schema run done this session did not trigger it — that run simply
+never produced a jump forward long enough to need a rollback. If a batch-1 repro matters, force one
+with a longer schema before claiming it.
+
+**Measured before/after**, 4 concurrent requests against a JSON schema with long mandatory key
+names (the shape that gives xgrammar something to jump over): before, the engine thread died in
+`PopN` and every request hung. After, all four return, three of them schema-valid JSON and the
+fourth only truncated by `max_tokens` — the same output the single-request run gives.
+
+### The 35B cannot use this, and that is a design decision rather than a bug
+
+Running the gate on `dist/qwen3_6-35B-A3B-q4f16_1_fused` fails differently and much earlier:
+
+```
+RuntimeError: Check failed: input_shape[i] == reg (6 vs. 1)
+  ErrorContext(fn=batch_decode, param=input_embeds, annotation=R.Tensor((1, 1, 2048), "float16"))
+```
+
+[qwen3_5_moe_model.py:637](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L637) pins
+`batch_decode` to a **literal** batch of 1, and the comment above it says why: it makes the MoE
+block's `if num_tokens == 1:` resolve statically so decode routes through `dequantize_gemv` instead
+of `dequantize_group_gemm`, worth ~6× at top-8 on Orin. That specialization is load-bearing for the
+58.97 tps in §11. The 0.8B ([qwen35_model.py:1771](python/mlc_llm/model/qwen35/qwen35_model.py#L1771))
+keeps `["batch_size", 1, hidden]` and is therefore the model this work unblocks.
+
+So **§11's "batch > 1 is not a reachable configuration on hybrid models in this tree at all" is now
+half true.** It is reachable on the 0.8B and was blocked by the engine bug above. On the 35B it is
+blocked by a deliberate compile-time specialization, and making it reachable is a separate decision
+with a real cost — see §9.
+
+The same run is the regression evidence for the 35B: its **serial phase ran to completion** (six
+prompts, one at a time, through `lib_inplace.so`) before the concurrent phase hit the pinned spec.
+The prefill cap and the decode guard are therefore neutral for the single-sequence path that every
+benchmark in this document measures.
+
+### What is still not covered
+
+- **Speculative decoding at batch > 1 on a hybrid model still aborts.** `BatchVerify`,
+  `BatchVerifyToLastHidden` and the `batch_draft` multi-token path all pack `(1, total_len, h)`
+  across sequences the same way `BatchPrefill` does, and none of them is capped. The engine now
+  warns at startup instead of failing obscurely mid-run. Fixing it wants the same treatment prefill
+  got — one sequence per forward — but `batch_draft` and `batch_verify` have to agree on which
+  sequences are in flight, so capping one without the other strands the other's draft tokens. Not a
+  two-line change.
+- **Disaggregated serving** ([disagg_remote_send.cc:148](cpp/serve/engine_actions/disagg_remote_send.cc#L148))
+  calls `BatchPrefill` directly and is uncapped. Not a combination this box runs.
+- **The VL path.** Same as §9: `Qwen35VLLMHeadModel` reuses `Qwen35Model`, so it inherits the
+  dynamic-batch decode spec and should work, but there is no compiled VL model here to gate.
+
+### What it buys, and what it costs
+
+`batch_decode_parity.py` now times both of its phases, so the gate reports the win as well as the
+correctness answer. 0.8B `q0f16`, `lib_inplace.so`, 6 requests × 40 tokens, one warmup request
+outside each timed region (the first request pays kernel JIT and cudagraph capture, which would
+otherwise land entirely on the serial phase and flatter the concurrent one):
+
+| | wall clock |
+|---|---:|
+| serial (one at a time, `max_num_sequence=1`) | 2.72 s |
+| concurrent (all six in flight) | **1.02 s** |
+| | **2.67×** |
+
+The cost: prefill for N new requests now takes N engine steps rather than one. Single-request
+benchmarks are untouched — every `scratch_mlc_tg_sweep.py` number in this document runs one
+sequence. The loss is real only when many *short* prompts arrive together, and it is what buys the
+2.67× on the decode that follows.
