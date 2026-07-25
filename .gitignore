@@ -6,6 +6,12 @@ debug/
 
 # Qwen3-Next validation harness artifacts
 reference_outputs*.pt
+# ...except the 35B greedy caches. Each is ~3.5 kB (token ids only, --no-layer-hooks).
+# The bf16 one can only be produced on a machine with >=72 GB; the fp8 one is the only
+# 35B reference that can be produced on this 64 GB Orin at all (see workplan §6.1).
+# Committing them is the only way the 35B has a parity gate here.
+!reference_outputs_35b.pt
+!reference_outputs_35b_fp8.pt
 *.parity.log
 stage*.log
 bench_*.log

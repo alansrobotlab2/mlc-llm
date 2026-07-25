@@ -109,6 +109,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vl-image", default=str(VL_FIXTURE_IMAGE), help="Fixed image fixture for --reference-vl.")
     p.add_argument("--vl-query", default=VL_FIXED_QUERY, help="Fixed text query paired with the image fixture.")
 
+    p.add_argument("--prefix-cache-mode", default=None, choices=["disable", "radix"], help="Override the engine prefix_cache_mode. Matters for hybrid (RNNState) models: 'radix' is the default and gives max_history=64, 'disable' clamps it to 1. Gate any change to recurrent-state handling under BOTH.")
     p.add_argument("--mlc-model-dir", default=None, help="Path to compiled MLC model directory (for --greedy-parity / --layer-parity).")
     p.add_argument("--mlc-lib", default=None, help="Path to compiled MLC .so (if not auto-found in model dir).")
     p.add_argument("--debug-layer", type=int, default=None, help="Dump detailed GDN sub-step values for this layer index.")
@@ -134,6 +135,25 @@ def load_hf(model_id: str, dtype: str, device: str):
     torch_dtype = torch.float16 if dtype == "float16" else torch.float32
     print(f"[ref] Loading model {model_id!r} on {device}, dtype={dtype}")
 
+    # An fp8 checkpoint is the only way the 35B reference fits a 64 GB Orin (37.5 GB
+    # vs 72 GB bf16). sm_87 has no fp8 arithmetic, so route the fp8 linears through a
+    # software weight-only dequant and leave the stored weights fp8. See
+    # fp8_software_dequant.py for the precision caveats — the result is W8A16.
+    import fp8_software_dequant
+
+    is_fp8 = fp8_software_dequant.is_fp8_checkpoint(model_id)
+    if is_fp8:
+        fp8_software_dequant.install()
+        # Force bf16 for the whole model. The fp8 weights are never cast, but the
+        # modules in `modules_to_not_convert` (lm_head, routers, norms, in_proj_a) are —
+        # and casting only those to fp16 leaves them mismatched against the bf16
+        # activations coming out of the dequant path:
+        #   RuntimeError: expected mat1 and mat2 to have the same dtype,
+        #                 but got: c10::BFloat16 != c10::Half
+        # bf16 is also the checkpoint's native dtype, so this is the faithful choice.
+        torch_dtype = torch.bfloat16
+        print("[ref] fp8 checkpoint — forcing bfloat16 for the unquantized modules")
+
     if device.startswith("cuda"):
         free_b, total_b = torch.cuda.mem_get_info(device)
         print(f"[ref] {device} mem before load: free={free_b/1e9:.2f} GiB / total={total_b/1e9:.2f} GiB")
@@ -149,7 +169,11 @@ def load_hf(model_id: str, dtype: str, device: str):
 
     # Force the requested dtype — the `dtype` kwarg is silently ignored on some
     # transformers builds and the model lands at the checkpoint's native dtype.
-    if dtype == "float16":
+    # Skipped for fp8: .half()/.float() would cast the fp8 weights up and blow the
+    # memory budget that picking an fp8 checkpoint bought us in the first place.
+    if is_fp8:
+        print("[ref] fp8 checkpoint — skipping the .half()/.float() dtype forcing")
+    elif dtype == "float16":
         model = model.half()
     elif dtype == "float32":
         model = model.float()
@@ -446,11 +470,18 @@ def _run_mlc_greedy(args: argparse.Namespace, prompts: list[str]) -> list[list[s
 
     # mode="interactive": max_batch=1, max KV=full context window. Server mode
     # over-allocates a 6.5M-token KV cache and OOMs on a 32 GB card.
+    engine_kwargs = {}
+    if args.prefix_cache_mode is not None:
+        from mlc_llm.serve.config import EngineConfig
+
+        engine_kwargs["engine_config"] = EngineConfig(prefix_cache_mode=args.prefix_cache_mode)
+        print(f"[mlc] prefix_cache_mode={args.prefix_cache_mode}")
     engine = MLCEngine(
         model=model_dir,
         model_lib=lib_path,
         device=args.device,
         mode="interactive",
+        **engine_kwargs,
     )
     gen_cfg = GenerationConfig(temperature=0.0, top_p=1.0, max_tokens=GREEDY_N)
 
