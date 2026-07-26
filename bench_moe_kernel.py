@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -130,6 +131,37 @@ SHAPES = {
     "nsweep_k2048_n1024":  dict(Ne=0, N=1024,  K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
     "nsweep_k2048_n2048":  dict(Ne=0, N=2048,  K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
     "nsweep_k2048_n4096":  dict(Ne=0, N=4096,  K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    # ===== §9 item 0e: the prefill-scale B sweep for the MoE expert GEMM =====
+    # §16.7 put `dequantize_group_gemm_v2` + `_v21` at 52.5% of 35B pp512 prefill
+    # — 6.9 ms/call at B = 512 tokens × top_k 8 = 4096 rows. Every group_gemm entry
+    # above stops at B=64, where §16.4 found the cost flat and concluded "51× worse
+    # than gemv"; that conclusion is about decode. These extend the sweep to the
+    # shape prefill actually runs, and past it.
+    #
+    # The sweep is the discriminator. v2's grid is
+    #     UPPER = (ceildiv(B, BLK_M=16) + Ne) * (N / BLK_N=128)
+    # so the `+ Ne` padding term is a *fixed* block count whose share falls as B
+    # grows. Three hypotheses make three different curves:
+    #   block-count bound  → ms ∝ UPPER, i.e. ms/row falls steeply with B
+    #   weight-BW bound    → ms flat (the 302 MB expert set is read once regardless)
+    #   compute bound      → ms ∝ B once every expert is populated
+    # B=8192 is past prefill's shape and is here only to extend the lever arm.
+    "gate_up_b512":    dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=512,  spread=True, kind="group_gemm"),
+    "down_b512":       dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=512,  spread=True, kind="group_gemm"),
+    "gate_up_b2048":   dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=2048, spread=True, kind="group_gemm"),
+    "down_b2048":      dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=2048, spread=True, kind="group_gemm"),
+    # The production prefill shape: 512 tokens × top_k 8.
+    "gate_up_b4096":   dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=4096, spread=True, kind="group_gemm"),
+    "down_b4096":      dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=4096, spread=True, kind="group_gemm"),
+    "gate_up_b8192":   dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=8192, spread=True, kind="group_gemm"),
+    "down_b8192":      dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=8192, spread=True, kind="group_gemm"),
+    # The same production shape under uniform-random routing instead of a perfectly
+    # even division. The kernel built is byte-identical — only the indptr differs —
+    # but the real/padding CTA split does not, and that split is what any fix to
+    # the padding CTAs would be worth. Also the L2 control for the whole sweep: if
+    # `spread=True`'s numbers were an artifact of tidy addressing, these would move.
+    "gate_up_b4096_rand": dict(Ne=256, N=1024, K=2048, group_size=32, top_k=8, B=4096, spread="random", kind="group_gemm"),
+    "down_b4096_rand":    dict(Ne=256, N=2048, K=512,  group_size=32, top_k=8, B=4096, spread="random", kind="group_gemm"),
 }
 
 
@@ -207,8 +239,26 @@ class _FTDenseGemvModule(nn.Module):
         return self.linear(x)
 
 
+def _arm_cuda_source_dump(path: str) -> None:
+    """Capture the CUDA that codegen emits, so "does it use tensor cores" is answerable.
+
+    Via the codegen postproc hook rather than by walking `ex.mod.imported_modules`:
+    the built artifact is a `VMExecutable` whose `.mod` exposes neither `type_key`
+    nor `imported_modules` here, so the walk finds nothing and reports success.
+    Registration is global, so this fires for whichever build runs next.
+    """
+
+    @tvm.ffi.register_global_func("tvm_callback_cuda_postproc", override=True)
+    def _postproc(code, target):  # pylint: disable=unused-argument
+        Path(path).write_text(code)
+        print(f"[bench] device source ({len(code)} chars) -> {path}")
+        return code
+
+
 def build_vm(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
-             spread: bool, kind: str, target, dev):
+             spread, kind: str, target, dev, dump_source: str | None = None):
+    if dump_source:
+        _arm_cuda_source_dump(dump_source)
     if kind == "topk_softmax":
         # gating_softmax_topk takes (B, num_experts) "gate logits" and returns
         # (top-k weights, top-k indices). K here re-purposed as num_experts? No:
@@ -301,7 +351,7 @@ def _upload(arr_np: np.ndarray, dev):
 
 
 def make_inputs(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
-                spread: bool, kind: str, dev, rng):
+                spread, kind: str, dev, rng, indptr_np=None):
     if kind == "topk_softmax":
         # Single input: gate logits of shape (B, Ne).
         x_np = rng.standard_normal((B, Ne), dtype="float32").astype(np.float16)
@@ -326,60 +376,151 @@ def make_inputs(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
     x_np = rng.standard_normal((B, K), dtype="float32").astype(np.float16)
     w_np = rng.integers(0, 2**32, size=(Ne, N, K // 8), dtype=np.uint32)
     scale_np = (rng.standard_normal((Ne, N, K // group_size), dtype="float32") * 0.01).astype(np.float16)
+    if indptr_np is None:
+        indptr_np = make_indptr(Ne, top_k, B, spread, kind, rng)
 
+    return [_upload(a, dev) for a in (x_np, w_np, scale_np, indptr_np)]
+
+
+def make_indptr(Ne: int, top_k: int, B: int, spread: bool, kind: str, rng):
+    """The routing the timed call runs against.
+
+    Split out of `make_inputs` so the roofline accounting below can count the
+    experts and dispatch tiles this exact routing produces, instead of assuming
+    `top_k` (which is right at decode and wrong at every prefill shape).
+    """
     if kind == "gemv":
         # gemv expects (1, top_k) indptr listing the top-k chosen expert ids.
-        chosen = rng.choice(Ne, top_k, replace=False).astype(np.int32)
-        indptr_np = chosen.reshape(1, top_k)
-    elif spread:
+        return rng.choice(Ne, top_k, replace=False).astype(np.int32).reshape(1, top_k)
+    if spread == "random":
+        # Every row picks an expert uniformly at random. `spread=True` divides B
+        # exactly evenly, which at B=4096/Ne=256 lands 16 rows on every expert —
+        # exactly one BLK_M tile each, with zero rounding waste. No real router
+        # is that tidy, and the rounding waste is precisely what decides how many
+        # of v2's CTAs are padding, so this is the honest version of the shape.
+        counts = np.bincount(rng.integers(0, Ne, size=B), minlength=Ne).astype(np.int32)
+        indptr_np = np.zeros(Ne + 1, dtype=np.int32)
+        np.cumsum(counts, out=indptr_np[1:])
+        return indptr_np
+    if spread:
         indptr_np = np.zeros(Ne + 1, dtype=np.int32)
         rows_per_expert = np.full(Ne, B // Ne, dtype=np.int32)
         rows_per_expert[: B % Ne] += 1
         np.cumsum(rows_per_expert, out=indptr_np[1:])
-    else:
-        assert B == top_k, f"non-spread requires B==top_k (got B={B}, top_k={top_k})"
-        indptr_np = np.zeros(Ne + 1, dtype=np.int32)
-        active = set(rng.choice(Ne, top_k, replace=False).tolist())
-        cum = 0
-        for e in range(Ne):
-            if e in active:
-                cum += 1
-            indptr_np[e + 1] = cum
+        return indptr_np
+    assert B == top_k, f"non-spread requires B==top_k (got B={B}, top_k={top_k})"
+    indptr_np = np.zeros(Ne + 1, dtype=np.int32)
+    active = set(rng.choice(Ne, top_k, replace=False).tolist())
+    cum = 0
+    for e in range(Ne):
+        if e in active:
+            cum += 1
+        indptr_np[e + 1] = cum
+    return indptr_np
 
-    return [_upload(a, dev) for a in (x_np, w_np, scale_np, indptr_np)]
+
+# Tile geometry mirrored from `_dequantize_group_gemm_v2` in
+# python/mlc_llm/op/moe_matmul.py — keep in sync if BLK_M/BLK_N move there.
+V2_BLK_M, V2_BLK_N = 16, 128
+
+
+def v2_grid(Ne: int, N: int, B: int, indptr_np) -> dict:
+    """Replay v2's dispatch-table construction to count real vs padding CTAs.
+
+    v2 launches `UPPER = (ceildiv(B, BLK_M) + Ne) * tiles_per_n` blocks, where the
+    `+ Ne` gives every expert at least one private slack index so the per-expert
+    m-tile runs cannot collide. Slack blocks get sentinel `te = -1`, and the
+    kernel handles that by zeroing the X tile and predicating off the store — but
+    it still loads and dequantizes a full W tile and still runs the full wmma
+    matmul, so a padding CTA costs very nearly what a real one does.
+    """
+    tiles_per_n = N // V2_BLK_N
+    ceil = lambda a, b: -(-a // b)  # noqa: E731
+    real_m = pad_m = 0
+    for e in range(Ne):
+        sb = ceil(int(indptr_np[e]), V2_BLK_M) + e
+        nb = ceil(int(indptr_np[e + 1]) - int(indptr_np[e]), V2_BLK_M)
+        sb_next = ceil(int(indptr_np[e + 1]), V2_BLK_M) + e + 1
+        real_m += nb
+        pad_m += sb_next - (sb + nb)
+    upper_m = ceil(B, V2_BLK_M) + Ne
+    return {
+        "cta_total": upper_m * tiles_per_n,
+        "cta_real": real_m * tiles_per_n,
+        "cta_pad": pad_m * tiles_per_n,
+        "pad_frac": (pad_m * tiles_per_n) / max(1, upper_m * tiles_per_n),
+        "experts_active": int(np.count_nonzero(np.diff(indptr_np))),
+    }
 
 
 # Measured achievable bandwidth on this box (§4.3) — NOT the 204.8 GB/s spec number.
 # Every "% of wall" in the workplan is against this.
 BW_WALL_GBS = 156.0
 
+# Compute ceilings, DERIVED not measured — quote them as ceilings only.
+#   CUDA cores: 2048 lanes × 2 (FMA) × 1300.5 MHz  = 5.33 TFLOP/s fp32
+#   Tensor:     16 SM × 2048 FLOP/clk × 1300.5 MHz = 42.6 TFLOP/s fp16 (fp16 accum,
+#               the GA10x rate; consistent with AGX Orin's 170 INT8 TOPS sparse
+#               = 85 dense = 42.5 fp16). v2 accumulates in fp16, so this is its ceiling.
+CUDA_FP32_TFLOPS = 5.33
+TENSOR_FP16_TFLOPS = 42.6
 
-def bandwidth(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
-              kind: str, median_ms: float) -> dict:
-    """Bytes the kernel is obliged to move, and what fraction of the wall that reaches.
+
+def roofline(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
+             spread: bool, kind: str, median_ms: float, indptr_np=None) -> dict:
+    """Bytes and FLOPs the kernel is obliged to do, and what fraction of each wall it reaches.
 
     Weight traffic dominates at b=1 and is the only term that differs between the
-    shapes under test: int4 weights at K*N/2 bytes plus fp16 group scales. Activations
-    are counted too but are noise at these sizes. For the MoE kinds only the *active*
-    experts are touched, so the weight term carries top_k, not Ne.
+    b=1 shapes: int4 weights at K*N/2 bytes plus fp16 group scales. For the MoE kinds
+    the weight term carries the number of *non-empty* experts under the routing
+    actually being timed — which is `top_k` at decode but climbs to all `Ne` of them
+    at any prefill-scale B, and using `top_k` there would understate the compulsory
+    traffic by 32×. Padding-CTA re-reads are deliberately not counted: every one of
+    them reads the same expert-0 slice, so they hit in L2 and are a *compute* cost,
+    not a bandwidth one.
     """
     if kind == "topk_softmax" or median_ms <= 0:
         return {}
-    experts = top_k if kind in ("gemv", "group_gemm") else 1
+    if kind in ("gemv", "group_gemm"):
+        experts = int(np.count_nonzero(np.diff(indptr_np))) if (
+            indptr_np is not None and kind == "group_gemm") else top_k
+    else:
+        experts = 1
     w_bytes = experts * (N * K // 2)                      # int4
     if group_size:
         w_bytes += experts * (N * (K // group_size) * 2)  # fp16 scales
     act_bytes = B * K * 2 + B * N * 2
     total = w_bytes + act_bytes
     gbs = total / (median_ms * 1e-3) / 1e9
-    return {"bytes": total, "gb_s": gbs, "pct_wall": 100.0 * gbs / BW_WALL_GBS}
+    out = {
+        "bytes": total, "experts_active": experts,
+        "gb_s": gbs, "pct_wall": 100.0 * gbs / BW_WALL_GBS,
+    }
+    # Useful arithmetic: every active row against its expert's full N×K weight.
+    flop = 2.0 * B * N * K
+    tflops = flop / (median_ms * 1e-3) / 1e12
+    out.update({
+        "gflop": flop / 1e9,
+        "tflop_s": tflops,
+        "pct_cuda_peak": 100.0 * tflops / CUDA_FP32_TFLOPS,
+        "pct_tensor_peak": 100.0 * tflops / TENSOR_FP16_TFLOPS,
+    })
+    return out
 
 
 def time_kernel(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
-                spread: bool, kind: str, target, dev, repeats: int, number: int):
-    vm = build_vm(Ne, N, K, group_size, top_k, B, spread, kind, target, dev)
+                spread: bool, kind: str, target, dev, repeats: int, number: int,
+                dump_source: str | None = None):
+    vm = build_vm(Ne, N, K, group_size, top_k, B, spread, kind, target, dev,
+                  dump_source=dump_source)
     rng = np.random.default_rng(seed=42)
-    inputs = make_inputs(Ne, N, K, group_size, top_k, B, spread, kind, dev, rng)
+    # Drawn once, here, and handed to both the timed call and the accounting below —
+    # under `spread="random"` two independent draws would be two different routings,
+    # and the CTA split reported would not be the one measured.
+    indptr_np = (make_indptr(Ne, top_k, B, spread, kind, np.random.default_rng(seed=7))
+                 if kind == "group_gemm" else None)
+    inputs = make_inputs(Ne, N, K, group_size, top_k, B, spread, kind, dev, rng,
+                         indptr_np=indptr_np)
 
     for _ in range(3):
         vm["forward"](*inputs)
@@ -393,7 +534,10 @@ def time_kernel(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
         "min_ms":    r.min * 1000.0,
         "std_ms":    r.std * 1000.0,
     }
-    out.update(bandwidth(Ne, N, K, group_size, top_k, B, kind, out["median_ms"]))
+    if indptr_np is not None:
+        out.update(v2_grid(Ne, N, B, indptr_np))
+    out.update(roofline(Ne, N, K, group_size, top_k, B, spread, kind,
+                        out["median_ms"], indptr_np))
     return out
 
 
@@ -407,28 +551,44 @@ def main() -> None:
     p.add_argument("--number", type=int, default=50)
     p.add_argument("--shapes", default="gate_up,down",
                    help="Subset of " + ",".join(SHAPES.keys()))
+    p.add_argument("--dump-source", metavar="PATH",
+                   help="Write the emitted CUDA/PTX for the LAST shape to PATH.")
     args = p.parse_args()
 
     dev = tvm.cuda(0)
     target = tvm.target.Target.from_device(dev)
+    v2 = os.environ.get("MLC_MOE_GEMM_V2", "0") == "1"
     print(f"[bench] target={target.export()}")
+    # §8's trap in bench form: without the flag the group_gemm shapes silently
+    # measure the v1 persistent-loop fallback, which is a different kernel.
+    print(f"[bench] MLC_MOE_GEMM_V2={'1 (v2 wmma dispatch-table)' if v2 else '0 (v1 persistent loop)'}")
 
     names = [s.strip() for s in args.shapes.split(",") if s.strip()]
     results: dict = {}
-    for name in names:
+    for i, name in enumerate(names):
         if name not in SHAPES:
             print(f"unknown shape '{name}'", file=sys.stderr)
             sys.exit(1)
         cfg = SHAPES[name]
         print(f"[bench] {name}  kind={cfg['kind']}  Ne={cfg['Ne']} N={cfg['N']} "
               f"K={cfg['K']} g={cfg['group_size']} top_k={cfg['top_k']} B={cfg['B']}")
+        dump = args.dump_source if (args.dump_source and i == len(names) - 1) else None
         r = time_kernel(**cfg, target=target, dev=dev,
-                        repeats=args.repeats, number=args.number)
+                        repeats=args.repeats, number=args.number, dump_source=dump)
         results[name] = r
         bw = (f"  {r['gb_s']:6.1f} GB/s = {r['pct_wall']:5.1f}% of the {BW_WALL_GBS:.0f} wall"
               if "gb_s" in r else "")
         print(f"        median={r['median_ms']:.3f} ms  "
               f"min={r['min_ms']:.3f} ms  std={r['std_ms']:.3f} ms{bw}")
+        if "tflop_s" in r:
+            print(f"        {r['gflop']:8.2f} GFLOP -> {r['tflop_s']:6.3f} TFLOP/s = "
+                  f"{r['pct_tensor_peak']:5.1f}% of the {TENSOR_FP16_TFLOPS:.1f} tensor ceiling "
+                  f"({r['pct_cuda_peak']:5.1f}% of the {CUDA_FP32_TFLOPS:.2f} fp32 CUDA-core one), "
+                  f"{r['experts_active']} experts touched")
+        if v2 and "cta_total" in r:
+            print(f"        v2 grid: {r['cta_total']:6d} CTAs, {r['cta_real']:6d} real + "
+                  f"{r['cta_pad']:6d} padding ({100.0 * r['pad_frac']:.1f}% wasted), "
+                  f"{1e3 * r['median_ms'] / max(1, r['cta_total']):.3f} us/CTA")
 
     if args.baseline:
         print()

@@ -883,6 +883,8 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `3c6edc2b` | **§16.5** flush isolated with `--max-history 1`; item 0d's mechanism corrected before building it |
 | `7865c5de` | **§16.6** item 0d — `v_block` + `MLC_QWEN35_GDN_VBLOCK` + the `vb_exact` gate bar; opt-in at default `0` |
 | `6c0ef467` | **§16.7** the 35B prefill trace; item 0c.2 de-prioritised, item **0e** filed |
+| `8562fade` | **§9** handoff rewritten as a cold-start block; traps list gains the concurrency failure |
+| `7f8787fa` | **§16.8** item 0e measured — v2 is CTA-bound, 27–50% padding CTAs; item **0f** filed; `bench_moe_kernel.py` large-B mode + two instrument fixes |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
@@ -941,20 +943,24 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > 0.8B and −8% on the 35B — so the default configuration and every gate result above are unchanged
 > by it.
 >
-> ### The one thing to do next: item 0e, and it is a measurement
+> ### The one thing to do next: item 0f, and now it *is* a build
 >
-> §16.7 traced 35B prefill *after* today's changes and **§9's priority order was wrong**:
+> §16.7 traced 35B prefill *after* §16.5/§16.6 and **§9's priority order was wrong**:
 > `dequantize_group_gemm_v2`+`_v21` are **52.5% of prefill** (MoE machinery overall ~64%), while the
 > GDN recurrence that four sections called "the biggest prefill item by 5×" is **11.1% and third**.
 > That framing was measured on the 0.8B, and §16.5 cut it further. Consequently **item 0c.2, the
 > chunked reformulation, is capped at +12.5% on the 35B by Amdahl** — do not start it first.
 >
-> Item 0e's next action is **not a build**: establish whether `group_gemm_v2` is bandwidth-,
-> compute- or schedule-bound at prefill's **B = 4096** (512 tokens × top-8), and whether it uses
-> tensor cores at all. It runs **6.9 ms/call against a ~1.94 ms weight-bandwidth floor**, ~3.6× off
-> its own roofline, while the arithmetic needs ~3.2 ms even at fp32 CUDA-core peak.
-> `bench_moe_kernel.py` already sweeps this kernel and needs a large-B mode. At 52.5% of prefill a
-> mere 2× is **+36%**, three times what 0c.2 could deliver and for far less risk.
+> **§16.8 then measured the GEMM (item 0e, closed).** It uses tensor cores and is bound by neither
+> wall — 5.5% of the fp16 tensor ceiling, 28.6% of the 156 GB/s one. It is **CTA-bound**: cost is
+> `n_real·c_real + n_pad·c_pad` with `c_pad ≈ 0.93 c_real`, fitting all 12 sweep points to ≤1.6%.
+> And **27–50% of its CTAs are dispatch-table padding that runs the full dequant + wmma and discards
+> the result**, because the sentinel path guards only the `X` read and the store.
+>
+> **Item 0f is that early exit** — predicate the `W_shared` load and the compute block on
+> `e_v >= 0`. Bit-exact by construction, worth **+16% to +34% pp512** (the range is router balance;
+> a balanced router means *more* padding and a bigger win). Read 0f's two cautions before starting:
+> the guard has to survive `blockize`/`cache_read`/`tensorize`, and the +34% end is the best case.
 >
 > ### Two non-code loose ends
 >
@@ -1003,11 +1009,13 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 #### Open
 
-> As of the **end of 2026-07-26b** the open list is **two items plus one blocked precondition**, and
-> the ordering changed: **item 0e is new and now first**, because §16.7's trace found the MoE GEMM at
-> 52.5% of 35B prefill against the recurrence's 11.1%. Items 0b, 1 and 5 closed 2026-07-26a;
-> **0c.1 landed in §16.5**, **0d landed opt-in in §16.6**, and **0c.2 is de-prioritised** — read its
-> entry before starting it, the +15× kernel ceiling is capped at +12.5% end-to-end on the 35B.
+> As of the **end of 2026-07-26c** the open list is **two items plus one blocked precondition**, and
+> **item 0f is first**. §16.7's trace found the MoE GEMM at 52.5% of 35B prefill against the
+> recurrence's 11.1%; **§16.8 then measured that GEMM (item 0e, now closed) and found it CTA-bound
+> with 27–50% of its CTAs doing discarded work** — so 0f, the early exit, is a small bit-exact change
+> worth +16% to +34% pp512. Items 0b, 1 and 5 closed 2026-07-26a; **0c.1 landed in §16.5**,
+> **0d landed opt-in in §16.6**, and **0c.2 is de-prioritised** — read its entry before starting it,
+> the +15× kernel ceiling is capped at +12.5% end-to-end on the 35B.
 
 **0c. The GDN recurrence is parallelism-starved — still the biggest prefill item after §16.5.**
 §15.6 measured it on the **0.8B**: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the
@@ -1031,19 +1039,32 @@ sequence sequentially.
      at `seq_len=1` the chunked form degenerates. Still worth ~+27% on the 0.8B, which is the
      iteration vehicle rather than the target. **Do item 0e first.**
 
-**0e. The MoE expert GEMM is 52.5% of 35B prefill and appears to be ~3.6× off its own roofline.**
-§16.7's trace: `dequantize_group_gemm_v2` + `_v21` are **395.9 ms of a 754 ms pp512 prefill**, and
-MoE machinery including combine/`scatter_output`/`take` is ~64%. Per call that is **6.9 ms against a
-~1.94 ms weight-bandwidth floor** (§16.4's 302 MB expert set at 156 GB/s), while the arithmetic
-(17.2 GFLOP/call at B=4096) needs ~3.2 ms even at fp32 CUDA-core peak.
+**0e. ✅ Measured, §16.8 — the MoE expert GEMM is CTA-bound, not bandwidth- or compute-bound.**
+§16.7's trace put `dequantize_group_gemm_v2` + `_v21` at **395.9 ms of a 754 ms pp512 prefill**. The
+three questions it posed are answered: it **does** use tensor cores (`nvcuda::wmma::mma_sync`), and at
+B=4096 it sits at **5.5% of the fp16 tensor ceiling and 28.6% of the 156 GB/s wall** — so neither.
+Its time is `n_real·c_real + n_pad·c_pad` with `c_pad ≈ 0.93 c_real`, a two-parameter fit that
+predicts all 12 sweep points to ≤1.6%. §16.4's "flat in batch" was the right observation with the
+wrong mechanism: the grid is 97% padding at B=8, not reading all 256 experts. Closes into **0f**.
 
-§16.4 already characterised this kernel — dispatch-table, sized for all 256 experts, **cost flat in
-batch** — and correctly concluded that makes it 51× worse than the b=1 gemv *at decode*. What it did
-not ask is whether flat-in-batch is efficiently *implemented* at prefill's B=4096, where that
-property is exactly what you want. **Measure before building:** is it bandwidth-bound, compute-bound
-or schedule-bound at B=4096, and does it use tensor cores? `bench_moe_kernel.py` sweeps this kernel
-already and needs a large-B mode; §16.3's L2-reuse caveat matters far less at B=4096 than at B=8 but
-should still be checked before quoting absolutes.
+**0f. Early-exit v2's padding CTAs — bit-exact, small, and worth +16% to +34% pp512.**
+v2 launches `UPPER = (ceildiv(B, BLK_M) + Ne) · tiles_per_n` CTAs, where the `+ Ne` slack gives each
+expert a private index range without a prefix scan. Slack CTAs carry sentinel `te[bx] = -1`, and
+[moe_matmul.py:698-727](python/mlc_llm/op/moe_matmul.py#L698-L727) guards only the `X` read and the
+store — the `W_shared` dequant and the entire wmma reduction run unconditionally on `e_safe = 0`. So
+those CTAs cost 92–94% of a real one and produce nothing. At B=4096 they are **50% of the grid under
+a perfectly balanced router and 27% under uniform-random routing** (§16.8 measured both).
+
+The change is to predicate the `W_shared` load and the compute block on `e_v >= 0` as well. **It is
+bit-exact by construction** — those results are already discarded by the store predicate — which
+makes `high_margin_gate.py` a regression check rather than a judgement call, unlike 0c.2.
+
+Two cautions. (a) The guard sits around blocks that `_schedule_v2()` later `blockize`s, `cache_read`s
+and `tensorize`s; if the schedule primitives will not survive an enclosing `if`, the fallback is to
+compact the dispatch table with an exclusive scan over `ceildiv(count_e, BLK_M)` and shrink the grid
+— but the grid extent is a compile-time shape expression, so that route needs a dynamic launch and is
+much larger. Try the guard first. (b) The **+34% end is the balanced-router case**; quote the range,
+not the top of it, until a real prefill's indptr histogram is dumped (§16.8's second open item).
 
 **0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
 Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
@@ -1140,7 +1161,7 @@ Main repo:
 | `scripts/gdn_recurrence_probe.cu` | **§16.2 new** — standalone CUDA probe, four variants of the GDN recurrence (base / acc4 / ksplit2 / ksplit4). No model, no TVM. **§16.5** added a header warning: its `grid(n_kh, batch)` is the 0.8B's geometry, and quoting its ratios against the 35B over-predicts by 2.3× |
 | `scripts/gdn_kernel_bench.py` | **§16.5 new** — the GDN recurrence A/B on the kernels MLC actually compiles: real grid (`n_vh` blocks, so 32 on the 35B), ring flush included, `k_split` 1/2/4/8 × seq_len. `--trace-share` prints an Amdahl bound. Timing goes through `mod.mod.time_evaluator`, **not** `Executable.time_evaluator`, which does not exist. **§16.6** `--v-blocks` crosses the `v_block` axis with `--k-splits`; header warns to run only one instance at a time and to check with `pgrep -af`, not `ps -C python` |
 | `scripts/prefix_cache_roundtrip.py` | **§16.1** — prompt families replaced with the high-margin set; `--legacy-prompts` reproduces §13's numbers. **Propagate any new flag to the subprocess `common` list** — the two phases run as separate processes and mismatched sets fail everything |
-| `bench_moe_kernel.py` | **§16.3/§16.4** — K-sweep at fixed N and N-sweep at fixed K, plus achieved-bandwidth reporting against the 156 GB/s wall. ⚠️ it reuses one weight tensor, so absolute numbers are L2-inflated for small kernels (§16.3); A/Bs at a fixed shape are fine |
+| `bench_moe_kernel.py` | **§16.3/§16.4** — K-sweep at fixed N and N-sweep at fixed K, plus achieved-bandwidth reporting against the 156 GB/s wall. ⚠️ it reuses one weight tensor, so absolute numbers are L2-inflated for small kernels (§16.3); A/Bs at a fixed shape are fine. **§16.8** added the prefill-scale sweep (`{gate_up,down}_b512…b8192`), FLOP reporting against both the tensor and CUDA-core ceilings, `v2_grid()` (replays v2's dispatch table to count real vs padding CTAs), and `spread="random"` routing. Two fixes went with it: the active-expert count is now taken from the indptr instead of assumed to be `top_k`, which understated prefill traffic by 32×, and the indptr is drawn **once** and shared by the timed call and the accounting — two draws under random routing would report a different routing than the one measured |
 | `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§16.4** — the batch-1 MoE comment now carries the measurement (51×, not ~6×) and points at option (d) |
 | `python/mlc_llm/support/auto_target.py` | **§14.6 new** — `MLC_NVCC_OPTIONS` / `MLC_DUMP_CUDA` hooks + nvcc phase timing |
 | `scratch_mlc_tg_sweep.py` | **§14.1 new** — `--prefix-cache-mode` and per-run prompt salting; without both, the default config was unmeasurable |
@@ -2818,3 +2839,116 @@ much less at B=4096 than at B=8, but check it before quoting absolutes.
 > thrown away. Use `pgrep -af gdn_kernel_bench`, and treat "no output yet" as "still compiling"
 > rather than "died". The correctness results in this section are unaffected: `vb_exact` compares
 > tensor contents, which contention cannot perturb.
+
+### 16.8 Item 0e measured — v2 is CTA-bound, and half its CTAs are padding
+
+§16.7 asked three questions before any building: at prefill's `B = 4096`, is
+`dequantize_group_gemm_v2` bandwidth-, compute- or schedule-bound, and does it use tensor cores at
+all. `bench_moe_kernel.py` gained a prefill-scale B sweep (`gate_up_b512` … `gate_up_b8192`, and the
+same for `down`), roofline reporting against both walls, and a replay of v2's dispatch-table
+construction so the CTA count is known for every point. **Answers: tensor cores yes, schedule-bound,
+and the specific schedule fault is that ~half the CTAs at the production shape do a full tile of
+work and throw the result away.**
+
+#### Tensor cores: yes, and they are nowhere near the limit
+
+The emitted CUDA for `dequantize_group_gemm_v2_kernel` contains `nvcuda::wmma::mma_sync` over
+`fragment<matrix_a/matrix_b/accumulator, 16,16,16, half>`, 256 threads per CTA — the hand-tensorize
+in `_schedule_v2()` does what it says. So the question is settled, and settled in the direction that
+*removes* a hypothesis: at B=4096 the kernel reaches **2.34 TFLOP/s, 5.5% of the ~42.6 TFLOP/s fp16
+tensor ceiling**. It is not compute-bound. Nor is it bandwidth-bound: the compulsory traffic (all 256
+experts' weights and scales, plus activations) is **44.6 GB/s = 28.6% of the 156 GB/s wall**.
+
+Also worth naming: it runs at **43.9% of the 5.33 TFLOP/s *CUDA-core fp32* ceiling**. A wmma kernel
+whose throughput is a large fraction of the non-tensor-core wall is telling you the tensor cores are
+waiting on scalar work — here, the int4 dequant that feeds them.
+
+#### The B sweep, and a two-parameter model that fits all of it
+
+`MLC_MOE_GEMM_V2=1`, medians over `--repeats 3 --number 20`. `real`/`pad` are CTAs with a live
+`te[bx]` and with the sentinel `te[bx] = -1`:
+
+| shape | B | CTAs (real + pad) | median ms | µs/CTA |
+|---|---:|---|---:|---:|
+| `gate_up` N=1024 K=2048 | 8 | 2056 (64 + 1992) | 3.574 | 1.738 |
+| | 512 | 2304 (2048 + 256) | 4.270 | 1.853 |
+| | 2048 | 3072 (2048 + 1024) | 5.549 | 1.806 |
+| | **4096** | **4096 (2048 + 2048)** | **7.338** | **1.791** |
+| | 8192 | 6144 (4096 + 2048) | 11.024 | 1.794 |
+| `down` N=2048 K=512 | 8 | 4112 (128 + 3984) | 1.541 | 0.375 |
+| | 512 | 4608 (4096 + 512) | 1.861 | 0.404 |
+| | 2048 | 6144 (4096 + 2048) | 2.424 | 0.395 |
+| | **4096** | **8192 (4096 + 4096)** | **3.211** | **0.392** |
+| | 8192 | 12288 (8192 + 4096) | 4.870 | 0.396 |
+
+**µs/CTA is constant to ±3% while the useful work per call moves 512×** (0.03 → 34.4 GFLOP). Fitting
+`t = n_real·c_real + n_pad·c_pad` by least squares over all 12 points (the ten above plus the two
+random-routing points below) predicts every one of them to **≤1.6%, median 0.31%**:
+
+| | c_real | c_pad | pad / real |
+|---|---:|---:|---:|
+| `gate_up` (K=2048) | 1.837 µs | 1.732 µs | **94.3%** |
+| `down` (K=512) | 0.406 µs | 0.375 µs | **92.3%** |
+
+Two things fall out. **A padding CTA costs 92–94% of a real one** — which is what the source says it
+should: the sentinel path guards only the `X` reads (`m_offset + i < row_end`) and the final store,
+while the `W_shared` dequant loop and the whole wmma reduction run unconditionally on `e_safe = 0`.
+And **c_real scales with K, not with rows**: 4.52× for a 4× K ratio, so the per-CTA constant is the
+`BLK_N × K` weight dequant, not the matmul and not the row work.
+
+This also corrects §16.4's *reason*, while leaving its decision intact. v2's cost is flat from B=8 to
+B=64 not because "the full 302 MB expert set is read every call" — at B=8 only 8 experts are touched
+and the measured traffic is **2.7 GB/s, 1.7% of the wall** — but because the grid
+`UPPER = (ceildiv(B, BLK_M) + Ne) · tiles_per_n` is **97% padding** at that batch and barely moves.
+The b=1 conclusion (keep the gemv specialization, 51×) is unaffected; only the mechanism was wrong.
+
+#### How much padding is real routing's problem, not the bench's
+
+`spread=True` divides B exactly evenly, which at B=4096 over Ne=256 lands 16 rows on every expert —
+one `BLK_M=16` tile each, zero rounding waste, and therefore the *maximum* padding share. That is a
+flattering assumption, so the same shape was re-run under `spread="random"` (each row picks an expert
+uniformly). Identical kernel, identical launch, only the indptr differs:
+
+| routing | CTAs (real + pad) | pad share | median ms |
+|---|---|---:|---:|
+| `gate_up` even-spread | 4096 (2048 + 2048) | **50.0%** | 7.338 |
+| `gate_up` uniform-random | 4096 (2992 + 1104) | **27.0%** | 7.393 |
+| `down` even-spread | 8192 (4096 + 4096) | **50.0%** | 3.211 |
+| `down` uniform-random | 8192 (5984 + 2208) | **27.0%** | 3.250 |
+
+The total CTA count is fixed by B and Ne regardless of routing, and `c_pad ≈ c_real`, so **the
+runtime barely moves (+0.7% / +1.2%) while the padding share halves.** That is the model's sharpest
+prediction and it holds. It is also the L2 control §16.3 asked for: if the sweep's absolutes were an
+addressing artifact, this would have moved them.
+
+#### What a fix is worth — and the counterintuitive part
+
+Giving the sentinel CTAs an early exit (guard the `W_shared` load and the compute block on
+`e_v >= 0`, as the store already is) recovers `n_pad · c_pad`:
+
+| routing | pair (v2 + v21) | after | kernel | **pp512 at 52.5% of prefill** |
+|---|---:|---:|---:|---:|
+| even-spread | 10.549 ms | 5.466 ms | 1.93× | **+33.9%** |
+| uniform-random | 10.643 ms | 7.903 ms | 1.35× | **+15.6%** |
+
+**The win grows as the router gets more balanced**, because a balanced router puts every expert's row
+count near a clean multiple of `BLK_M` and pushes the padding share toward its 50% ceiling. Qwen3.5's
+router is load-balance-trained, so production sits somewhere in **[27%, 50%]** and the honest range
+is **+16% to +34% pp512**. Either end beats item 0c.2's +12.5% ceiling for a fraction of the risk,
+and unlike 0c.2 this **changes no arithmetic** — the padding CTAs' results are already discarded by
+the store predicate, so a correct early exit is bit-exact by construction.
+
+#### Two things this did not establish
+
+1. **Where the per-CTA 1.84 µs actually goes** — dequant ALU, shared-memory traffic, or global
+   load latency. `ncu` is installed but **the GPU performance counters are not accessible to this
+   user** (`ERROR: The user does not have permission to access NVIDIA GPU Performance Counters`), so
+   the within-CTA breakdown is unmeasured. It does not block the early exit, but it is what decides
+   whether the *remaining* 2.6× off the bandwidth roofline is worth chasing after it.
+2. **The production routing histogram.** The [27%, 50%] range above is bracketed, not measured; a
+   dump of a real prefill's indptr would collapse it to a number.
+
+⚠️ **Absolutes: prefer the trace.** The bench reads 7.338 ms/call at B=4096 where §16.7's nsys trace
+reads 6.9 ms — 6% apart, the usual gap between an isolated microbench and the same kernel inside a
+CUDA graph. Every conclusion above is a **ratio** measured within one harness, which is why the gap
+does not matter here; do not quote the bench's milliseconds as production numbers.
