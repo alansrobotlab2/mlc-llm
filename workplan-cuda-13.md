@@ -1,12 +1,23 @@
 # Workplan: Qwen3.6-35B-A3B on JetPack 7.2 / CUDA 13.2
 
-**Sessions:** 2026-07-24 (Stage 0/1), 2026-07-25 (kernel attribution, re-scope, options 1 and 2
-landed, concurrent serving fixed)
-**Status:** §5 option 1 **landed and kept** (§10). §5 option 2 **landed** (§11) — **35B 55.61 → 58.97
-tg512 (+6.0%), prefill neutral**, the largest single win in this workplan. **Concurrent serving on
-hybrid models fixed and gated (§12)** — 0.8B only; the 35B is pinned to batch 1 by a deliberate MoE
-specialization. **Next session: start at §9.**
+**Sessions:** 2026-07-24 (Stage 0/1), 2026-07-25a (kernel attribution, re-scope, options 1 and 2
+landed, concurrent serving fixed), 2026-07-25b (conv-state fusion, §9 item 3 refuted, everything
+committed)
+**Status:** **35B-A3B tg512 54.13 → 60.20 (+11.2%) and pp512 566 → 645 (+14%) across the two
+sessions**, from four landed changes: the GDN input-projection merge (§10), the in-place recurrent
+state (§11), concurrent serving on hybrid models (§12), and the in-place conv state (§13).
+**Everything is committed** — see §9. **Next session: start at §9.**
 **Primary target:** Qwen3.6-35B-A3B · **Fast-iteration vehicle:** Qwen3.5-0.8B
+
+> **Two traps that cost most of session 2026-07-25b. Read before benching or gating anything.**
+> 1. **Compiling the 35B requires `MLC_MOE_GEMM_V2=1`** and nothing warns you — §8. Without it,
+>    pp512 reads 225 instead of 645 and it looks like the model change did it.
+> 2. **`prefix_cache_mode` decides which forward path prefill takes.** Under the default `radix`
+>    prefill goes through `forward_with_history` (copy path); only `disable` uses the fused path.
+>    A prefill gate run at the default tests nothing — §13.
+>
+> Generalised: **an A/B is only an A/B if the two libs differ by the change under test.** Both
+> "the change broke it" moments in that session were the harness.
 
 > **Read §4.6 before §4.5.** The 2026-07-25 session re-derived the decode breakdown and three of the
 > first pass's conclusions did not survive: GPU idle is **5.3%, not 13.3%**; `rnn_state_get/set`
@@ -587,9 +598,14 @@ footgun, and §3's note that `profile_decode.py` still trips it). Always pass `-
 
 | lib | what it is |
 |---|---|
-| `lib_inplace.so` | **the current build** — §10 in_proj merge + §11 in-place state. Bench and gate against this |
-| `lib_copypath.so` | same tree, same flags, `MLC_QWEN35_INPLACE_STATE=0` — the §11 A/B baseline |
+| `lib_convfused.so` | **the current build** — §10 in_proj merge + §11 in-place recurrent state + §13 in-place conv state. Bench and gate against this |
+| `lib_inplace.so` | the §11 build — the §13 A/B baseline |
+| `lib_copypath.so` | same tree, same flags, `MLC_QWEN35_INPLACE_STATE=0` — the §11 A/B baseline. Note that toggle now disables the conv fusion too, since both hang off `state_io` |
 | `lib.so` | the older §10 build (35B: byte-size-identical to `lib_copypath.so` at 166 MB) |
+
+⚠️ **The 35B `lib_convfused.so` is the only one of these built with `MLC_MOE_GEMM_V2=1`
+deliberately verified** (`nm -D | grep -c 'group_gemm_v2\|moe_dispatch_tables'` → 4). Any 35B lib
+rebuilt without that env var is not comparable to these — see the §8 warning.
 
 The `_fused` dirs are the §10 builds and are the ones to bench against; the non-fused 35B dir is the
 pre-merge baseline, worth keeping until the merge is committed.
@@ -725,9 +741,70 @@ Monitoring: **`nvidia-smi` does not report iGPU utilization or processes on Tegr
   both prefix-cache modes and on both libs. Two pre-existing grammar-path aborts fixed on the way.
   Closes §11's coverage gap on the fused kernel's per-batch slot indexing.
 
+### Done 2026-07-25b
+
+- **§9 item 2 landed (§13)** — in-place GDN *conv* state. **35B +2.40% tg, +15.3% pp**; 0.8B
+  +1.28% / +42.7%. Decode hit 109% of a traced estimate. The prefill win was unpredicted and is
+  the larger number: the TE conv it replaces is **~42× off roofline**.
+- **§9 item 3 REFUTED (§13)** — the cudagraph allowlist should not be built. Eager launches went
+  *up* 131 → 183/token after §11, idle did not move, and an eager launch costs ~0.9 µs at the
+  margin.
+- **`analyze_decode_trace.py` was reporting wrong bandwidth** and is fixed (commit `6749a630`).
+  Kernel names are reused across fusion passes, so it now verifies output width against
+  `gridX*64` every run. It had the fused `in_proj` at 60% of wall; it is at **91%**.
+- **`scripts/conv1d_kernel_check.py` added** — numerical unit gate, no model needed (§7).
+- **Everything committed**, including the TVM submodule.
+
+### Committed state (was: nothing committed)
+
+All work from both 2026-07-25 sessions is now in git on branch `qwen3_5`:
+
+| commit | what |
+|---|---|
+| `e3b099e8` | §10 in_proj merge + §11 in-place recurrent state |
+| `838c2d1b` | §12 concurrent serving on hybrid models |
+| `fce533aa` | §6.1 fp8 software dequant + six gates/probes + fp8 reference cache |
+| `54777593` | §1–§12 workplan, qwen3_5.md corrections, tuning data |
+| `6749a630` | `analyze_decode_trace` geometry verification |
+| `3ff691f5` | §13 conv-state fusion + `conv1d_kernel_check.py` |
+| `c2fd8691` | §13 workplan, §8 build warning, §9 item 3 refutation |
+
+⚠️ **The TVM submodule commit is local-only.** `3rdparty/tvm` points at `4624d97`
+(branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork), which **has not been
+pushed**. It carries the three `vm.builtin.rnn_state_*` accessors that §11 and §13 both depend on.
+Push it before this box is rebuilt or that work does not reproduce.
+
+`.gitignore`'s reference-cache exception named only `reference_outputs_35b.pt`, so the fp8 cache
+that §7 said to commit was still ignored; the exception now covers both names and the file is in
+`fce533aa`.
+
 ### Start here next session
 
-1. **Decide whether the 35B should be able to decode more than one sequence (§12).**
+> **Recommended order, by measured expected value (2026-07-25b).** Items are renumbered relative
+> to the 2026-07-25a list; the old numbering is kept below so the reasoning trail survives. New
+> item **0** did not exist before this session's trace and is now the largest known prefill item
+> in the document.
+
+**0. Fuse the conv state on the *history* path** — the successor to §13, and the biggest
+remaining prefill item. `forward_with_history` still runs the TE conv that §13 measured at
+**3404 µs/call, ~42× off roofline**, and — this is the point — it is the path the **default**
+`prefix_cache_mode="radix"` uses for prefill. §13's +15.3% pp only exists under `disable`, which
+is a benchmark setting, so this item is worth more *to actual users* than the one just landed.
+Harder than §13: `set_with_history` writes one slot **per position** rather than a single ring
+advance, so the flush is a scatter over `(hist + 1 + t) % max_history`, and
+`create_set_with_history_func` in [rnn_state.py](python/mlc_llm/nn/rnn_state.py) is the shape to
+mirror. `gdn_func_history` and `rnn_state_set_with_history_0` are the two other big kernels on
+that path (554 ms and 530 ms in the §13 trace vs the conv's 709 ms), so scope a combined pass.
+Gate with `--prefix-cache-mode radix` — the default is the *only* mode that exercises this.
+
+**0b. A deterministic 35B state gate** — cheap, and it unblocks trusting item 0. §13 quantified
+that the existing rollback gate fails on the *unmodified baseline* in 3 of 4 runs, so it cannot
+adjudicate a state change. Same root cause as §6.2's complaint about the fp8 gate, same fix: a
+high-margin prompt set (old item 4). `scripts/conv1d_kernel_check.py` is the model for what a
+gate should look like — deterministic, no engine, and it separates "wrong" from "rounded
+differently", which no token-diff on the 35B can.
+
+**1. Decide whether the 35B should be able to decode more than one sequence (§12).**
    `batch_decode` is pinned to a literal batch of 1 at
    [qwen3_5_moe_model.py:637](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L637) so the
    MoE block's `if num_tokens == 1:` folds at compile time — worth ~6× and load-bearing for the
@@ -762,31 +839,40 @@ Monitoring: **`nvidia-smi` does not report iGPU utilization or processes on Tegr
    builtins as static in that pass; that is **sound**, since the runtime audit for §11 confirmed
    `storages_` and both slot-id views are allocated once in the constructor and `CreateView` uses
    byte offset 0, so the pointers are stable across steps. Do 2 and 3 together or not at all.
-4. **Consider a high-margin prompt set (§6.2).** The cheapest way to turn the fp8 tier-2 gate from a
-   comparative signal into a real pass/fail bar. Prompt 5 is 50/50 on both libs; the rest are
-   open-ended near-ties. This unblocks trusting any future 35B change.
+4. **Consider a high-margin prompt set (§6.2).** — **promoted to item 0b above.** The cheapest way
+   to turn the fp8 tier-2 gate from a comparative signal into a real pass/fail bar. Prompt 5 is
+   50/50 on both libs; the rest are open-ended near-ties. §13 showed the rollback gate has the
+   same problem, so this now unblocks two gates rather than one.
 5. **Then §5 option 3** (tier-2 GEMV retune), discounted per the estimation lesson in §5.
+   **Re-scoped by the corrected §4.6 numbers** — the fused `in_proj` is at **91%** of wall, not the
+   60% the stale analyzer table reported, so it is *not* a candidate. What remains, all confirmed
+   against launch geometry in the 2026-07-25b trace: shared-expert down **44%** (0.331 ms/tok),
+   shared-expert gate_up **60%** (0.486), MoE router fp16 **61%** (0.443), `out_proj`/`o_proj`
+   **74%** (1.579 — the largest), routed-expert down **76%** (1.533). `out_proj`/`o_proj` is the
+   only one big enough to be worth a session on its own.
 
 **Not re-gated: the VL path.** `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward`, so it inherits
-the in-place update, but there is **no compiled VL model on this box**, so the 176/180 multimodal
-gate from f667b07e was not re-run. Rebuild and re-gate it before trusting the VL build.
+the in-place update **and the §13 conv fusion**, but there is **no compiled VL model on this box**,
+so the 176/180 multimodal gate from f667b07e was not re-run. Rebuild and re-gate it before trusting
+the VL build. Note both loaders were already updated for the 4-way `in_proj` concat, so a VL
+rebuild should just work.
 
-### Uncommitted state (nothing has been committed)
+### What changed, by file (all committed — see "Committed state" above)
 
-**The TVM submodule has its own uncommitted change** — easy to lose, and the mlc-llm build will not
-rebuild it (§2.1.1):
+**The TVM submodule change is committed but NOT pushed** — easy to lose, and the mlc-llm build
+will not rebuild it (§2.1.1):
 
 ```
-3rdparty/tvm (fork alansrobotlab2/relax, detached at bf273f5)
-  M src/runtime/vm/rnn_state.cc      # the three new builtins
+3rdparty/tvm (fork alansrobotlab2/relax) -> 4624d97 on branch qwen35-inplace-rnn-state
+  src/runtime/vm/rnn_state.cc      # the three new builtins — LOCAL ONLY, push this
 ```
 
 Main repo:
 
 | file | what |
 |---|---|
-| `python/mlc_llm/model/qwen35/qwen35_model.py` | `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle |
-| `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§11** same state_io wiring (the 35B's model file; VL reuses `Qwen35Model` and needed none) |
+| `python/mlc_llm/model/qwen35/qwen35_model.py` | `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle; **§13** `create_causal_conv1d_func_inplace` + `conv_storages` on `_GDNStateIO` |
+| `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§11** same state_io wiring (the 35B's model file; VL reuses `Qwen35Model` and needed none). **§13**: it has its *own* `_hoist_gdn_state_io` call site — changing that helper's signature breaks the 35B compile while the 0.8B still builds |
 | `scripts/{prefix_cache_roundtrip,batch_decode_parity}.py` | **§11 new** — rollback and batch-slot gates; `batch_decode_parity` gained phase timing in **§12** |
 | `cpp/serve/engine_actions/batch_prefill_base.cc` | **§12** one-sequence prefill cap for RNN-state models; no decode-folding |
 | `cpp/serve/engine_actions/batch_decode.cc` | **§12** multi-token decode cap + retokenization history guard |
@@ -797,12 +883,13 @@ Main repo:
 | `python/mlc_llm/quantization/quantization.py` | comment: ft-quant fallback no longer hit on the 35B |
 | `validate.py` | fp8 detection, shim install, bf16 forcing; **§11** `--prefix-cache-mode` |
 | `fp8_software_dequant.py` | **new** — software W8A16 fp8 path |
-| `scripts/{analyze_decode_trace,greedy_snapshot,active_params,profile_decode_35b}.py`, `scripts/bw_probe.cu` | **new/promoted** |
+| `scripts/{analyze_decode_trace,greedy_snapshot,active_params,profile_decode_35b}.py`, `scripts/bw_probe.cu` | **new/promoted**. `analyze_decode_trace` reworked in **§13** to verify kernel identity against launch geometry |
+| `scripts/conv1d_kernel_check.py` | **§13 new** — numerical unit gate for the fused conv1d |
 | `qwen3_5.md` | §14.5 + 5 stale-item corrections |
 | `workplan-cuda-13.md` | **new** — this file |
-| `.gitignore` | exception for `reference_outputs_35b.pt` |
+| `.gitignore` | exception for `reference_outputs_35b.pt` **and `reference_outputs_35b_fp8.pt`** — the fp8 name was still ignored, so §7's "commit this" silently had not happened |
 
-Artifacts: `reference_outputs_35b_fp8.pt` (3.5 kB, **worth committing** — it is the only 35B
+Artifacts: `reference_outputs_35b_fp8.pt` (3.5 kB, **committed** in `fce533aa` — it is the only 35B
 reference that runs on this box), `tuning/greedy_35b_{before,after}.json`,
 `tuning/mlc_tg_35b_fused_20260725.json`, plus the four 2026-07-24 tuning files.
 `dist/qwen3_6-35B-A3B-q4f16_1_fused/` and `dist/qwen3_5-0.8B-q0f16_fused/` are the merged builds
