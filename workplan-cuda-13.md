@@ -2,14 +2,20 @@
 
 **Sessions:** 2026-07-24 (Stage 0/1), 2026-07-25a (kernel attribution, re-scope, options 1 and 2
 landed, concurrent serving fixed), 2026-07-25b (conv-state fusion, §9 item 3 refuted, everything
-committed), 2026-07-25c (history-path conv fusion — §14)
-**Status:** **35B-A3B tg512 54.13 → 60.20 (+11.2%) and pp512 566 → 645 (+14%) across the first two
-sessions** under `prefix_cache_mode=disable`, from four landed changes: the GDN input-projection
-merge (§10), the in-place recurrent state (§11), concurrent serving on hybrid models (§12), and the
-in-place conv state (§13). **Session 2026-07-25c then measured the *default* `radix` configuration
-for the first time and found it was getting barely half of that prefill number** — §14 closes part
-of the gap (35B pp512 355 → 394, +10.9%; 0.8B 1469 → 1798, +22.4%).
-**Everything is committed** — see §9. **Next session: start at §9.**
+committed), 2026-07-25c (history-path conv fusion — §14), 2026-07-25d (history-path *recurrent*
+fusion — §15)
+**Status:** **35B-A3B tg512 54.13 → 60.20 (+11.2%)** from four landed changes: the GDN
+input-projection merge (§10), the in-place recurrent state (§11), concurrent serving on hybrid
+models (§12), and the in-place conv state (§13). **Prefill on the *default* `prefix_cache_mode=radix`
+was never measured until 2026-07-25c, and it was getting barely half the headline number** — §14
+and §15 close that gap almost completely:
+
+| pp512, `radix` (the default) | start of 2026-07-25c | now | vs `disable` |
+|---|---:|---:|---:|
+| 35B-A3B | 355 | **629 (+77%)** | 646 — **1.03×** |
+| 0.8B | 1469 | **3934 (+168%)** | 4070 — **1.04×** |
+
+**Everything through §14 is committed; §15 is not yet — see §9.** **Next session: start at §9.**
 **Primary target:** Qwen3.6-35B-A3B · **Fast-iteration vehicle:** Qwen3.5-0.8B
 
 > **Two traps that cost most of session 2026-07-25b. Read before benching or gating anything.**
@@ -450,6 +456,11 @@ regardless, because §4.6 shows 30% of the budget is kernels that do not stream 
 | 0.8B `q0f16` 4-way concurrent **JSON-schema** generation (jump-forward) | ✅ no abort, schema-valid output (§12) |
 | 0.8B `q0f16` greedy parity **after the in-place conv state**, radix **and** disable | ✅ **5/5 prompts, 50/50 tokens, both modes** (§13) |
 | 0.8B `q0f16` greedy parity **after the history-path conv fusion**, radix **and** disable | ✅ **5/5 prompts, 50/50 tokens, both modes** (§14) |
+| 0.8B `q0f16` greedy parity **after the history-path recurrent fusion**, radix **and** disable | ✅ **5/5 prompts, 50/50 tokens, both modes** (§15) |
+| 0.8B `q0f16` **bit-exactness** after the history-path recurrent fusion, radix | ✅ **5/5 byte-identical** — the first history-path change that manages it (§15) |
+| 0.8B `q0f16` long prompt (5814 tok, **3** prefill chunks) on the **history** path, radix | ✅ **byte-identical** (§15) |
+| fused **history recurrent** kernel vs the copy-path kernel, 9 seq_lens × 2 head configs | ✅ **output bit-exact, ring bit-exact, non-target slots untouched**; fp64 rel ≤4.1e-6 (§15) |
+| 35B-A3B fp8 tier-2 gate after the history recurrent fusion, **radix** | ✅ **1/15/2/5/50, identical to `lib_histconv`** (§15) |
 | 0.8B `q0f16` long prompt (3133 tok, crosses the 2048 prefill chunk) on the **history** path, radix | ✅ **byte-identical** (§14) |
 | fused **history** conv1d kernel vs fp64, 12 shapes × 2 widths × 4 ring configs incl. ring wrap | ✅ **within fp16 rounding; state bit-exact; non-target slots untouched** (§14) |
 | 35B-A3B fp8 tier-2 gate after the history conv fusion, **radix** | ✅ **1/15/2/5/50, identical to `lib_convfused`** (§14) |
@@ -610,7 +621,8 @@ footgun, and §3's note that `profile_decode.py` still trips it). Always pass `-
 
 | lib | what it is |
 |---|---|
-| `lib_histconv.so` | **the current build** — everything in `lib_convfused` plus the §14 history-path conv fusion. Bench and gate against this |
+| `lib_gdnhist.so` | **the current build** — everything in `lib_histconv` plus the §15 history-path recurrent fusion. Bench and gate against this |
+| `lib_histconv.so` | §14 history-path conv fusion — the §15 A/B baseline |
 | `lib_convfused.so` | §10 in_proj merge + §11 in-place recurrent state + §13 in-place conv state — the §14 A/B baseline |
 | `lib_inplace.so` | the §11 build — the §13 A/B baseline |
 | `lib_copypath.so` | same tree, same flags, `MLC_QWEN35_INPLACE_STATE=0` — the §11 A/B baseline. Note that toggle now disables the conv fusion too, since both hang off `state_io` |
@@ -637,6 +649,8 @@ top of them.
 | [scripts/greedy_snapshot.py](scripts/greedy_snapshot.py) | **new** — tier-3 bit-exactness gate (§6.1): capture greedy tokens, diff after a refactor |
 | [scripts/prefix_cache_roundtrip.py](scripts/prefix_cache_roundtrip.py) | **new (§11)** — PopN rollback gate under radix. Needs no reference model, so it runs on the 35B |
 | [scripts/batch_decode_parity.py](scripts/batch_decode_parity.py) | **new (§11)** — serial vs concurrent decode; covers per-batch state-slot indexing. **Runs and passes as of §12**, and now also reports the concurrency speedup |
+| [scripts/long_prompt_gate.py](scripts/long_prompt_gate.py) | **new (§15)** — bit-exactness across a prompt long enough to span several prefill chunks, which is the only way `history_slot_id` advances *mid-prompt*. A single-chunk gate cannot reach that. Promoted from the ad-hoc check §14 ran |
+| [scripts/gdn_kernel_check.py](scripts/gdn_kernel_check.py) | **new (§15)** — the recurrent analogue of `conv1d_kernel_check`. Gates both GDN in-place kernels against the *copy-path kernel* (so the bar is bit-exactness, not a tolerance) plus an fp64 reference of the recurrence, across 9 seq_lens × 2 head configs including 5 that wrap the ring. Separates "ring misindexed" from "output wrong" — the off-by-one control leaves `out_bit` at 0 while `state_err` hits 130. No model, no weights, no engine |
 | [scripts/conv1d_kernel_check.py](scripts/conv1d_kernel_check.py) | **new (§13), extended (§14)** — now gates the history variant too, including ring-wrap shapes. Numerical unit gate for the fused conv1d: kernel vs fp64 across 12 shapes and both conv widths. Separates "wrong" from "rounded differently", which no token-diff can do on the 35B. Needs no model, no weights, no engine; runs in seconds |
 | [fp8_software_dequant.py](fp8_software_dequant.py) | **new** — software W8A16 fp8 path so the 37.5 GB fp8 checkpoint can be an HF reference on sm_87 (§6.1) |
 
@@ -690,6 +704,10 @@ python validate.py --reference-only --model Qwen/Qwen3.5-0.8B --device cuda:0 \
 python validate.py --greedy-parity --model Qwen/Qwen3.5-0.8B --device cuda:0 \
     --mlc-model-dir dist/qwen3_5-0.8B-q0f16 \
     --mlc-lib dist/qwen3_5-0.8B-q0f16/lib.so --cache reference_outputs.pt
+
+# kernel unit gates — no model, no engine, seconds. Run these FIRST on any state change.
+python scripts/gdn_kernel_check.py                     # §15, recurrent; add --seq-lens to narrow
+python scripts/conv1d_kernel_check.py                  # §13/§14, conv
 
 # recurrent-state gates — run BOTH modes; `disable` alone is blind to a whole bug class (§6)
 python scripts/prefix_cache_roundtrip.py \
@@ -754,6 +772,27 @@ Monitoring: **`nvidia-smi` does not report iGPU utilization or processes on Tegr
   both prefix-cache modes and on both libs. Two pre-existing grammar-path aborts fixed on the way.
   Closes §11's coverage gap on the fused kernel's per-batch slot indexing.
 
+### Done 2026-07-25d
+
+- **§9 item 0a landed (§15)** — in-place GDN *recurrent* state on the history path. **35B pp512
+  +59.1%, 0.8B +119.4%**, decode neutral, `disable` path unmoved (645.4 → 646.1). The recurrent
+  pair fell 365.2 ms → 95.6 ms (**3.82×**) in an A/B trace whose whole-run delta (268 ms) is
+  accounted for by those two kernels alone (269.6 ms) — no side effects.
+- **The default configuration is no longer the slow one.** radix vs `disable` prefill: 35B
+  1.64× → **1.03×**, 0.8B 2.77× → **1.04×**.
+- **First bit-exact history-path change** — `greedy_snapshot` 5/5 byte-identical under radix, and
+  the unit gate predicted it (output bit-exact against the copy-path kernel).
+- **`scripts/gdn_kernel_check.py` added** with **three** negative controls, one of which
+  (guard removed entirely → still passes) refuted the assumption that the skip guard is what makes
+  the kernel correct. It is a pure optimization; a second control shows it is nonetheless placed
+  exactly on the boundary.
+- **A latent race removed rather than preserved** — `create_set_with_history_func` writes every
+  `t` from a flat parallel grid, so at prefill (512–2048 positions into 64 slots) `t` and
+  `t + max_hist` race for the same slot. §15.3.
+- **Estimation post-mortem worth reading (§15.2)**: the headline prediction landed in band, but two
+  mechanism errors cancelled. New rule — renormalize against a trace of the *actual* A/B baseline,
+  and never mix a whole-run denominator with a prefill-only metric.
+
 ### Done 2026-07-25b
 
 - **§9 item 2 landed (§13)** — in-place GDN *conv* state. **35B +2.40% tg, +15.3% pp**; 0.8B
@@ -803,19 +842,21 @@ that §7 said to commit was still ignored; the exception now covers both names a
 also found that *every* prefill number in this document predates any measurement of the default
 configuration — see §14.1 — and fixed the two harness bugs that made it unmeasurable.
 
-**0a. NEW, and now the biggest item in this document: fuse the *recurrent* state on the history
-path.** §14.2 traced it: `rnn_state_set_with_history_0` (24.8% of GPU time) and `gdn_func_history`
-(23.9%) are **48.7% of the radix prefill budget**, versus the 17.7% the conv was worth. The 35B is
-still at pp512 394 under `radix` against 645 under `disable`, and this pair is the bulk of what
-remains. Two compounding wins are available, the second unpredicted by any earlier estimate:
-  1. *Fuse the scatter into the recurrence*, the §11/§13/§14 treatment — `gdn_func_history` writes
-     directly into the ring, `set_with_history_0` disappears.
-  2. *Stop materializing dead state.* At `seq_len=512`, `n_vh=16`, `K=V=128` the per-position
-     history tensor is **537 MB** — but `max_history=64`, so `EndForward` caps reachability at 63
-     positions and **~87% of it is overwritten before anything can read it** (32× at a 2048 chunk).
-     §14.3's skip guard is the same idea applied to the conv state; here the tensor is ~350× larger.
-  Gate under `--prefix-cache-mode radix` — `disable` never runs this path. The 0.8B has a bit-exact
-  reference and is the vehicle; `conv1d_kernel_check.py` is the model for the unit gate.
+**0a. ~~Fuse the *recurrent* state on the history path~~ — DONE, see §15.** Both compounding wins
+landed as scoped. **35B pp512 395 → 629 (+59.1%), 0.8B 1793 → 3934 (+119.4%)**, decode neutral,
+and the recurrent pair went 365.2 ms → 95.6 ms (3.82×) in an A/B trace. **The radix-vs-`disable`
+prefill gap is now 1.03× on the 35B and 1.04× on the 0.8B** — §14.1's 2.77× default-configuration
+penalty is closed. It is also the first history-path change here that is bit-exact end-to-end.
+
+**0c. NEW, and now the biggest prefill item by 5×: the GDN recurrence is parallelism-starved.**
+§15.6 measured it — `gdn_func_history_inplace` is 95.6 ms against 19.3 ms for the next kernel, and
+it runs at **202 GFLOP/s, ~3.8% of sm_87 fp32 peak**, because it launches `batch × n_vh` blocks of
+`V` threads (**2048 threads on the 0.8B**, on 16 SMs) and each walks the sequence sequentially.
+There is no bandwidth left to reclaim; the fix is the **chunked linear-attention formulation** that
+`../flash-linear-attention/fla/layers/gated_deltanet.py` and vLLM's `qwen3_next.py` use. That
+changes the arithmetic, so bit-exactness is off the table and the tier-2 gate decides it, and it
+is a substantially bigger piece of work than §10–§15 — **scope it deliberately.** Check the cheap
+occupancy hypothesis in §15.6 first. Note it does nothing for decode.
 
 **0-old. Fuse the conv state on the *history* path** — the successor to §13, and the biggest
 remaining prefill item. `forward_with_history` still runs the TE conv that §13 measured at
@@ -903,7 +944,7 @@ Main repo:
 
 | file | what |
 |---|---|
-| `python/mlc_llm/model/qwen35/qwen35_model.py` | **§14** `create_causal_conv1d_func_with_history_inplace` + `state_io` threaded through `forward_with_history`; the per-model hoist block factored into `_maybe_hoist_state_io`. **§10–13:** `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle; **§13** `create_causal_conv1d_func_inplace` + `conv_storages` on `_GDNStateIO` |
+| `python/mlc_llm/model/qwen35/qwen35_model.py` | **§15** `create_gated_delta_net_func_with_history_inplace` + the recurrent half of `forward_with_history` behind `state_io`. **§14** `create_causal_conv1d_func_with_history_inplace` + `state_io` threaded through `forward_with_history`; the per-model hoist block factored into `_maybe_hoist_state_io`. **§10–13:** `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle; **§13** `create_causal_conv1d_func_inplace` + `conv_storages` on `_GDNStateIO` |
 | `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§11** same state_io wiring (the 35B's model file; VL reuses `Qwen35Model` and needed none). **§13**: it has its *own* `_hoist_gdn_state_io` call site — changing that helper's signature breaks the 35B compile while the 0.8B still builds |
 | `scripts/{prefix_cache_roundtrip,batch_decode_parity}.py` | **§11 new** — rollback and batch-slot gates; `batch_decode_parity` gained phase timing in **§12** |
 | `cpp/serve/engine_actions/batch_prefill_base.cc` | **§12** one-sequence prefill cap for RNN-state models; no decode-folding |
@@ -1656,3 +1697,193 @@ instead.** The 35B spec compiles 18 entry points, **14 of them full 48-layer tra
 those (`batch_verify_g1..g4`) exist only for speculative decoding. Skipping them on
 correctness-iteration builds should cut ~20–25% of the dominant phase. Not implemented — it changes
 what the lib can do, so it needs a deliberate opt-in flag rather than a silent default.
+---
+
+## 15. Landed: the history-path *recurrent* fusion — the radix prefill gap closes (2026-07-25d)
+
+§9 item 0a, the item §14.2's trace had just promoted to "the biggest in this document". It was,
+and it is the largest single measured win in the whole workplan.
+
+### 15.1 Measured
+
+Both libs `MLC_MOE_GEMM_V2=1`-clean (`nm -D | grep -c` → 4) and differing only by this change.
+Three runs each, spread ≤0.3%, clocks unpinned (§8), `--prefix-cache-mode radix`:
+
+| | 35B `q4f16_1` | 0.8B `q0f16` |
+|---|---:|---:|
+| pp512 before → after | 395.4 → **629.1** | 1793.0 → **3934.5** |
+| | **+59.1%** | **+119.4%** |
+| ttft @ pp512 | 1294.8 → **813.7 ms** (−37.2%) | 285.5 → **130.1 ms** (−54.4%) |
+| tg512 before → after | 59.86 → 59.68 (−0.3%) | 90.47 → 90.54 (+0.08%) |
+| pp512 under `disable` (regression check) | 645.4 → **646.1** (unchanged) | 4053 → 4070 (unchanged) |
+| `lib.so` | 160 → **113 MB** | 22 → **18 MB** |
+
+**The 2.77× default-configuration prefill penalty §14.1 found is gone on the 0.8B.** That section
+measured `radix` at 1462 against `disable`'s 4053 and called it "a 2.77× prefill gap on the
+configuration that ships". After §14 and this change the same comparison is **3934 vs 4070 —
+1.035×**. The default path now does essentially the same work as the fast path, which is what it
+should always have done: the only remaining difference is scattering 64 ring slots instead of
+advancing one. The 35B closes the same way: **1.64× (394 vs 645) → 1.027× (629 vs 646)**.
+
+The `disable` row is the regression check that matters here — this change touches only
+`forward_with_history`, so the fused-prefill path must not move, and it does not (645.4 → 646.1,
+within run-to-run spread).
+
+### 15.2 The trace, and an honest scoring of the prediction
+
+Both libs traced identically (`nsys`, 0.8B, radix, 36 GDN-layer history calls), so this is
+apples-to-apples rather than a comparison against §14.2's pre-§14 table:
+
+| kernel | `lib_histconv` | `lib_gdnhist` |
+|---|---:|---:|
+| `rnn_state_set_with_history_0` | 5176.5 µs × 36 = **186.4 ms** (10.1%) | **gone** |
+| `gdn_func_history` | 4966.6 µs × 36 = **178.8 ms** (9.7%) | — |
+| `gdn_func_history_inplace` | — | 2654.7 µs × 36 = **95.6 ms** (6.1%) |
+| **the recurrent pair** | **365.2 ms** | **95.6 ms — 3.82×** |
+| `conv1d_history_inplace` (untouched control) | 363.7 µs × 36 = 13.1 ms | 365.8 µs × 36 = 13.2 ms |
+| **whole-trace GPU time** | **1847 ms** | **1579 ms** |
+
+The whole-trace delta is **268 ms** and the two kernels account for **269.6 ms** of it. Nothing
+else moved — the untouched conv kernel is within 0.6%, and every `NT_matmul` is within 0.3%. That
+is the cleanest no-side-effects evidence in this document, and it is worth noting that it only
+exists because the change was traced against its own A/B baseline rather than against an older
+table.
+
+**The prediction was recorded before any lib was built** and is scored here in full:
+
+| claim | predicted | measured |
+|---|---|---|
+| `set_with_history_0` removed outright | 100% | ✅ 100% |
+| `gdn_func_history` is store-bound, so most of it goes | **60–90%** | ❌ **46.6%** (4966.6 → 2654.7 µs) |
+| total saving | **47–56%** | ✅ **54.4%** (0.8B ttft 285.5 → 130.1 ms) |
+| 0.8B pp512 | **3200–3900** | ✅ **3934** |
+| radix approaches `disable` from below without reaching it | — | ✅ 3934 vs 4070 |
+| decode unchanged | 0% | ✅ +0.08% / −0.3% |
+
+**Four for four on the headline, but the mechanism accounting had two errors that cancelled**, and
+that is worth more than the score. The store-bound inference was too strong: `gdn_func_history`'s
+537 MB at 5003 µs reads as 107 GB/s, but removing 87.5% of those stores bought only 46.6% of the
+kernel, so the recurrence arithmetic is a bigger share than the achieved-bandwidth figure implied.
+Offsetting that, the renormalization used §14.2's **whole-run** percentages as if they were
+**prefill** percentages — two different denominators — which understated the pair's share of the
+thing ttft actually measures. Right answer, partly for the wrong reason.
+
+**Rule for the next estimate: renormalize against a trace of the actual A/B baseline, not against
+the table from two sessions ago, and never mix a whole-run denominator with a prefill-only
+metric.** Both halves of that were avoidable here — the baseline trace this section is built on
+took three minutes and would have caught both.
+
+### 15.3 The kernel
+
+`create_gated_delta_net_func_with_history_inplace` collapses three kernels — `rnn_state_get_0`,
+`gdn_func_history`, `rnn_state_set_with_history_0` — into one, with the same ring addressing
+§14's conv kernel uses: load from `storage[seq, hist]`, flush position `t` to
+`storage[seq, (hist + 1 + t) % max_hist]`.
+
+**The copy elimination is the smaller half.** The bigger half is not materializing dead state.
+The kernel it replaces emits a `(batch, seq_len, n_vh, K, V)` fp32 tensor — **537 MB per layer
+per call** at pp512 on the 0.8B — which the scatter then reads straight back. But `EndForward`
+caps `available_history_num` at `max_history - 1`, so only the last 63 of those 512 positions can
+ever be read: **~87% of the tensor is overwritten in the ring before anything can reach it**, 32×
+at a full 2048 chunk. Guarding the flush on `t + max_history >= seq_len` turns 537 MB written +
+537 MB read + a scatter into one ~67 MB scatter.
+
+**It is also better-defined than the path it replaces.** `create_set_with_history_func` documents
+the precondition "caller must guarantee `max_history >= seq_len + 1` so writes do not collide" —
+and prefill violates it on every chunk (512–2048 positions into 64 slots). Its writes are a flat
+parallel `T.grid(batch_size, seq_len)`, so `t` and `t + max_hist` race for the same slot and the
+winner is whichever warp retires last. That was only harmless because the racing writes all land
+in slots nothing can read — *except* at the boundary. Skipping the doomed writes removes the race
+by construction: each ring slot now has exactly one writer.
+
+**No register staging, unlike §14's conv kernel.** Every read of the storage buffer happens in the
+preload loop before the `t` loop starts, so even when the flush wraps far enough to overwrite
+`hist_slot` itself, no read can observe it. §14.5 discovered its staging was defence-in-depth
+rather than load-bearing; here the read/write ordering makes the question disappear.
+
+### 15.4 Correctness — bit-exact, which no previous history-path change managed
+
+| gate | result |
+|---|---|
+| [scripts/gdn_kernel_check.py](scripts/gdn_kernel_check.py) — 9 seq_lens × 2 head configs, incl. 5 wrapping | ✅ **output bit-exact vs the copy-path kernel, ring bit-exact, non-target slots untouched** |
+| ” fp64 reference of the recurrence | ✅ rel ≤4.1e-6 |
+| `--greedy-parity` vs HF fp16, radix **and** disable | ✅ **5/5 prompts, 50/50 tokens, both** |
+| `greedy_snapshot` bit-exactness, radix | ✅ **5/5 byte-identical** |
+| long prompt (5814 tok, **3** prefill chunks), radix | ✅ **byte-identical** |
+| `prefix_cache_roundtrip` (PopN rollback), radix | ✅ **20/20** |
+| `batch_decode_parity` 6-way, radix **and** disable | ✅ **6/6 both**, 2.68× concurrency |
+| 35B fp8 tier-2 semantic gate, radix | ✅ **1/15/2/5/50, identical to `lib_histconv` prompt for prompt** |
+
+**This is the first change on the history path that is bit-exact end-to-end**, and the unit gate
+predicted it before the engine ran. §10, §13 and §14 all had to argue their divergences were
+rounding order; here there is nothing to argue, because the fused kernel runs the same two passes
+in the same order over the same fp32 registers as `gdn_func_history` — only the destination of the
+flush changed. §14's conv fusion could not be bit-exact because the TE conv it replaced used a
+cross-thread tree reduction; this one replaces a kernel that was already sequential per thread.
+
+New rule to go with §13's: **when a fusion changes only where a result is written, demand
+bit-exactness.** It is available, and settling for a tolerance would have hidden the ring bugs the
+negative controls below produce.
+
+### 15.5 Three negative controls, one of which refutes a design assumption
+
+`gdn_kernel_check.py` is only worth running if it fails when it should. All three were built:
+
+| control | result |
+|---|---|
+| ring off-by-one (`hist + t` instead of `hist + 1 + t`) | ❌ **fails**, `state_err` 3.2–130, `other_slots` fires — while `out_bit` stays **0** |
+| skip guard one position tighter (`>` for `>=`) | ❌ **fails** the wrapping shapes, `state_err` 2.4–520 |
+| skip guard removed entirely (write every `t`) | ✅ **passes every shape** |
+
+The first is the instrument working exactly as designed: a misindexed ring leaves the *output*
+untouched, so a token-diff can never see it, and `state_err`/`other_slots` separate it from
+rounding cleanly.
+
+The third is the interesting one. **The skip guard is a pure optimization, not what makes the
+kernel correct** — writing all 512 positions is equally correct, because within a thread the `t`
+loop is sequential so the last write wins deterministically. The guard is worth ~8× of this
+kernel's store traffic and nothing else. The second control shows it is nevertheless placed
+exactly: one position tighter and reachable state is lost. So the guard is neither loose nor
+tight by one, and both sides of that were measured rather than argued — the §14.5 lesson applied
+prospectively for once.
+
+### 15.6 What is now the biggest prefill item, and why it is a different kind of problem
+
+With both state fusions landed, the remaining radix prefill budget on the 0.8B looks like this
+(same trace, prefill-only kernels — 36 instances = 18 GDN layers × 2 chunks, 48 = attention):
+
+| kernel | ms | what it is |
+|---|---:|---|
+| `gdn_func_history_inplace` | **95.6** | the GDN recurrence itself |
+| `NT_matmul8_kernel_2` | 19.3 | attention `c_attn` |
+| `NT_matmul6_kernel_2` | 18.5 | GDN `in_proj_qkvzab` |
+| `conv1d_history_inplace` | 13.2 | the §14 fused conv |
+| `NT_matmul9_kernel_2` | 9.8 | attention `o_proj` |
+| `fused_split7_silu5_multiply5` | 8.5 | |
+| `split5` | 7.6 | |
+
+**The recurrence is now 5× the next item, and it is not a bandwidth problem — it is parallelism
+starvation.** The kernel launches `batch × n_vh` blocks of `V` threads: on the 0.8B that is
+**16 blocks of 128 threads = 2048 threads total**, on a GPU with 16 SMs. Each thread walks the
+sequence strictly sequentially because the recurrence is sequential in `t`. Measured:
+2048 threads × 512 positions × 2 passes × 128 rows × 2 flops = 537 MFLOP in 2655 µs =
+**202 GFLOP/s, about 3.8% of the sm_87 fp32 peak**. Removing the stores was worth 1.88× and there
+is nothing left to remove — the kernel is now latency-bound on a dependency chain.
+
+This is the same diagnosis §5 tier-3 gave `in_proj_a`/`in_proj_b` (`grid=(1,1,1)`, 1/16 of the
+GPU), and it has the same shape of fix: **more parallelism, which for a linear-attention
+recurrence means the chunked formulation** — process the sequence in chunks of C positions with
+matmuls over the chunk instead of a scalar loop, which is exactly what
+`../flash-linear-attention/fla/layers/gated_deltanet.py` and vLLM's `qwen3_next.py` do and why
+their prefill is fast. That is a substantially bigger piece of work than anything in §10–§15: it
+changes the arithmetic (so bit-exactness is off the table and the tier-2 gate is what decides it),
+and it needs its own chunk-state intermediate. **Scope it deliberately; do not start it as a
+follow-on to this session.** Note also that it would not help decode at all — at `seq_len=1` the
+chunked form degenerates to the current one, and `gdn_func_inplace` is already only 2.1% of the
+whole-run budget.
+
+Cheaper things to check first, in case they move it without the restructure: the kernel uses
+`K=128` fp32 registers per thread, which at 128 threads/block is 64 KB of registers per block and
+almost certainly caps occupancy at 1 block/SM — worth confirming, since a smaller register
+footprint (splitting `K` across two blocks with a cross-thread reduction per `t`) might raise
+occupancy without changing the algorithm.

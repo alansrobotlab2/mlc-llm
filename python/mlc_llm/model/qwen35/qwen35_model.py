@@ -1008,6 +1008,173 @@ def create_gated_delta_net_func_with_history(
     return gdn_func_history
 
 
+def create_gated_delta_net_func_with_history_inplace(
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    dtype: str,
+):
+    """GatedDeltaNet recurrence that scatters per-position state straight into the ring.
+
+    The history-path analogue of `create_gated_delta_net_func_inplace`, and the recurrent
+    counterpart to `create_causal_conv1d_func_with_history_inplace`. It replaces three
+    kernels — `rnn_state_get_0`, `gdn_func_history`, `rnn_state_set_with_history_0` —
+    with one, and this pair is the largest single item on the radix prefill path: traced
+    on the 0.8B at **24.8% + 23.9% = 48.7% of all GPU time** (workplan §14.2), against the
+    17.7% the conv fusion was worth.
+
+    Slot addressing mirrors `RNNState.create_set_with_history_func` exactly:
+
+        load  from storage[seq_slot, hist_slot,                  head, row, col]
+        flush into storage[seq_slot, (hist_slot + 1 + t) % max_hist, head, row, col]
+
+    for each position `t`, where the flushed value is the recurrent state AFTER `t`.
+
+    **The bigger win is not the copy — it is not materializing dead state.** The kernel
+    this replaces emits a `(batch, seq_len, n_vh, K, V)` fp32 tensor: at `seq_len=512`,
+    `n_vh=16`, `K=V=128` that is **537 MB per layer per call**, written once by
+    `gdn_func_history` and read straight back by the scatter. But `EndForward` caps
+    `available_history_num` at `max_history - 1`, so of those 512 positions only the last
+    63 are ever reachable — ~87% of the tensor is overwritten in the ring before anything
+    can read it (32x at a full 2048 chunk). Skipping the writes that cannot survive turns
+    537 MB + 537 MB + a scatter into a single ~67 MB scatter.
+
+    **Writes that cannot survive are skipped**, on exactly the guard
+    `create_causal_conv1d_func_with_history_inplace` uses and for the same reason: position
+    `t` lands in slot `(hist + 1 + t) % max_hist` and is overwritten by any later
+    `t' == t (mod max_hist)`, so only `t >= seq_len - max_hist` survives — which is also
+    where `EndForward`'s `min(available + seq_length, max_history - 1)` cap lands. Ascending
+    `t` within one thread means the surviving write is the last one, matching the copy
+    path's intended ring content.
+
+    **The guard sits on the exact semantic boundary, and both sides were built and
+    measured** (`scripts/gdn_kernel_check.py`, §15). Removing it entirely — writing every
+    `t` — still passes every shape, so the guard is a pure optimization and not what makes
+    the kernel correct. Tightening it by one position (`>` instead of `>=`, dropping
+    `t == seq_len - max_history`) **fails** the wrapping shapes with `state_err` 2.4-520
+    while the output stays bit-exact. So it is neither too loose nor too tight by one.
+
+    ⚠️ **This is strictly better defined than the copy path it replaces, not merely equal
+    to it.** `create_set_with_history_func` writes *every* `t` and documents the
+    precondition "caller must guarantee `max_history >= seq_len + 1` so writes do not
+    collide" — which prefill violates on every chunk (512-2048 positions into 64 slots).
+    Its writes are a flat parallel `T.grid(batch_size, seq_len)`, so `t` and `t + max_hist`
+    race for the same slot and the winner is whichever warp retires last. The result was
+    correct in practice only because the racing writes are all to unreachable slots *except*
+    at the boundary. Skipping the doomed writes removes the race by construction: each ring
+    slot is written by exactly one `t`.
+
+    **No staging is needed here, unlike the conv kernel.** Every read of `storage_buf`
+    happens in the preload loop, before the `t` loop starts and therefore before any write
+    — the recurrence itself runs entirely out of the register-resident `state_local`
+    column. So even when the flush wraps far enough to overwrite `hist_slot` itself
+    (`seq_len >= max_history`), no read can observe it. §14.5's negative control showed the
+    conv kernel's register staging was defence-in-depth rather than load-bearing; here the
+    read/write ordering makes the question disappear entirely.
+
+    Per-element ownership is unchanged from `create_gated_delta_net_func_inplace`: thread
+    `(b_idx, h_idx, col)` touches only `storage[seq_id, *, h_idx, *, col]`, so the write
+    sets are disjoint across threads at every slot.
+    """
+    heads_per_group = num_value_heads // num_key_heads
+    K = key_head_dim
+    V = value_head_dim
+
+    @T.prim_func
+    def gdn_func_history_inplace(
+        q_handle: T.handle,
+        k_handle: T.handle,
+        v_handle: T.handle,
+        gate_handle: T.handle,  # exp(g), already exponentiated
+        beta_handle: T.handle,  # sigmoid(beta_raw)
+        storage_handle: T.handle,  # the whole (max_batch, max_hist, H, K, V) state buffer
+        seq_slot_handle: T.handle,  # device-side per-batch seq slot ids
+        hist_slot_handle: T.handle,  # device-side per-batch history slot ids
+        out_handle: T.handle,
+    ):
+        T.func_attr({"op_pattern": 8, "tirx.noalias": True, "tirx.is_scheduled": 1})
+        batch_size, seq_len = T.int64(), T.int64()
+        max_batch_size, max_history = T.int64(), T.int64()
+        q_buf = T.match_buffer(q_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        k_buf = T.match_buffer(k_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        v_buf = T.match_buffer(v_handle, (batch_size, seq_len, num_value_heads, V), dtype=dtype)
+        gate_buf = T.match_buffer(
+            gate_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        beta_buf = T.match_buffer(
+            beta_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        storage_buf = T.match_buffer(
+            storage_handle,
+            (max_batch_size, max_history, num_value_heads, K, V),
+            dtype="float32",
+        )
+        seq_slot_buf = T.match_buffer(seq_slot_handle, (batch_size,), dtype="int32")
+        hist_slot_buf = T.match_buffer(hist_slot_handle, (batch_size,), dtype="int32")
+        out_buf = T.match_buffer(
+            out_handle, (batch_size, seq_len, num_value_heads, V), dtype="float32"
+        )
+
+        scale = T.float32(1.0 / math.sqrt(K))
+
+        for b_idx in T.thread_binding(batch_size, thread="blockIdx.y"):
+            for h_idx in T.thread_binding(num_value_heads, thread="blockIdx.x"):
+                for col in T.thread_binding(V, thread="threadIdx.x"):
+                    with T.sblock("gdn_history_inplace_thread"):
+                        state_local = T.sblock_alloc_buffer((K,), "float32", scope="local")
+                        dot_sk = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                        dot_sq = T.sblock_alloc_buffer((1,), "float32", scope="local")
+
+                        kh = h_idx // heads_per_group
+
+                        seq_id: T.int64 = T.cast(seq_slot_buf[b_idx], "int64")
+                        hist_in: T.int64 = T.cast(hist_slot_buf[b_idx], "int64")
+
+                        # The only reads of storage in this kernel, and they all happen
+                        # before the first write — see the docstring on why that is what
+                        # makes the wrapping flush below safe without staging.
+                        for row in range(K):
+                            state_local[row] = storage_buf[seq_id, hist_in, h_idx, row, col]
+
+                        for t in range(seq_len):
+                            gate_val = gate_buf[b_idx, t, h_idx]
+                            beta_val = beta_buf[b_idx, t, h_idx]
+                            v_val = T.cast(v_buf[b_idx, t, h_idx, col], "float32")
+
+                            # Pass 1: decay + dot(S, k) fused
+                            dot_sk[0] = T.float32(0)
+                            for row in range(K):
+                                state_local[row] = state_local[row] * gate_val
+                                dot_sk[0] = dot_sk[0] + state_local[row] * T.cast(
+                                    k_buf[b_idx, t, kh, row], "float32"
+                                )
+
+                            # Pass 2: delta + dot(S', q) fused
+                            coef = beta_val * (v_val - dot_sk[0])
+                            dot_sq[0] = T.float32(0)
+                            for row in range(K):
+                                state_local[row] = state_local[row] + T.cast(
+                                    k_buf[b_idx, t, kh, row], "float32"
+                                ) * coef
+                                dot_sq[0] = dot_sq[0] + state_local[row] * T.cast(
+                                    q_buf[b_idx, t, kh, row], "float32"
+                                )
+
+                            out_buf[b_idx, t, h_idx, col] = dot_sq[0] * scale
+
+                            # Scatter the post-`t` state into the ring, skipping the
+                            # positions a later `t` provably overwrites.
+                            if t + max_history >= seq_len:
+                                hist_out: T.int64 = (hist_in + T.int64(1) + t) % max_history
+                                for row in range(K):
+                                    storage_buf[seq_id, hist_out, h_idx, row, col] = (
+                                        state_local[row]
+                                    )
+
+    return gdn_func_history_inplace
+
+
 # ============================================================================
 # GatedDeltaNet Linear Attention Layer
 # ============================================================================
@@ -1270,10 +1437,12 @@ class Qwen35GatedDeltaNet(nn.Module):
         kernel emits a full per-position state history and the conv state is also recorded
         per position; both are written via `state.set_with_history(...)`.
 
-        When `state_io` is supplied the conv half runs as one fused kernel that scatters
-        straight into the ring, replacing `rnn_state_get_1` + `update_conv_state_history` +
-        the TE conv + `rnn_state_set_with_history_1`; otherwise the original copy path runs
-        unchanged. The recurrent half is untouched by this — see §14.
+        When `state_io` is supplied **both** halves run as fused kernels that scatter
+        straight into the ring: the conv one replaces `rnn_state_get_1` +
+        `update_conv_state_history` + the TE conv + `rnn_state_set_with_history_1` (§14),
+        and the recurrent one replaces `rnn_state_get_0` + `gdn_func_history` +
+        `rnn_state_set_with_history_0` (§15). Otherwise the original copy path runs
+        unchanged. Between them those were 66% of all GPU time on this path (§14.2).
         """
         b, s, _ = hidden_states.shape
         K = self.key_head_dim
@@ -1351,29 +1520,58 @@ class Qwen35GatedDeltaNet(nn.Module):
 
         gate, beta = self._compute_gate_beta(alpha, beta_raw)
 
-        state_in_layer = state.get(layer_idx, 0, (b, n_vh, K, V), "float32")
+        if state_io is not None:
+            # Fused path: the kernel scatters each position's state straight into the ring,
+            # so `rnn_state_get_0` and `rnn_state_set_with_history_0` both disappear — and
+            # so does the (b, s, n_vh, K, V) history tensor between them, which is 537 MB
+            # per layer at pp512 and ~87% dead on arrival. See §14.2.
+            storage = state_io.storages[layer_idx]
+            args = [q, k, v, gate, beta, storage, state_io.seq_slot_ids, state_io.history_slot_ids]
+            # Identity, not `.index()` — see the recurrent call site in `forward`.
+            storage_idx = next(i for i, a in enumerate(args) if a is storage)
+            out_recurrent, _ = op.tensor_ir_inplace_op(
+                create_gated_delta_net_func_with_history_inplace(
+                    num_key_heads=n_kh,
+                    num_value_heads=n_vh,
+                    key_head_dim=K,
+                    value_head_dim=V,
+                    dtype=self.dtype,
+                ),
+                "gated_delta_net_with_history_inplace",
+                args,
+                # Output 0 is the recurrent output; output 1 aliases the storage argument,
+                # which is what makes the in-place ring scatter visible downstream.
+                inplace_indices=[-1, storage_idx],
+                out=[
+                    Tensor.placeholder([b, s, n_vh, V], "float32"),
+                    Tensor(_expr=storage._expr),
+                ],
+            )
+            out_recurrent = op.astype(out_recurrent, self.dtype)
+        else:
+            state_in_layer = state.get(layer_idx, 0, (b, n_vh, K, V), "float32")
 
-        # Recurrence kernel that emits the full (b, s, n_vh, K, V) history.
-        out_recurrent, state_history_layer = op.tensor_ir_op(
-            create_gated_delta_net_func_with_history(
-                num_key_heads=n_kh,
-                num_value_heads=n_vh,
-                key_head_dim=K,
-                value_head_dim=V,
-                dtype=self.dtype,
-            ),
-            "gated_delta_net_with_history",
-            [q, k, v, gate, beta, state_in_layer],
-            [
-                Tensor.placeholder([b, s, n_vh, V], "float32"),
-                Tensor.placeholder([b, s, n_vh, K, V], "float32"),
-            ],
-        )
+            # Recurrence kernel that emits the full (b, s, n_vh, K, V) history.
+            out_recurrent, state_history_layer = op.tensor_ir_op(
+                create_gated_delta_net_func_with_history(
+                    num_key_heads=n_kh,
+                    num_value_heads=n_vh,
+                    key_head_dim=K,
+                    value_head_dim=V,
+                    dtype=self.dtype,
+                ),
+                "gated_delta_net_with_history",
+                [q, k, v, gate, beta, state_in_layer],
+                [
+                    Tensor.placeholder([b, s, n_vh, V], "float32"),
+                    Tensor.placeholder([b, s, n_vh, K, V], "float32"),
+                ],
+            )
 
-        out_recurrent = op.astype(out_recurrent, self.dtype)
+            out_recurrent = op.astype(out_recurrent, self.dtype)
 
-        # Scatter recurrent state per position.
-        state = state.set_with_history(layer_idx, 0, state_history_layer)
+            # Scatter recurrent state per position.
+            state = state.set_with_history(layer_idx, 0, state_history_layer)
 
         out_normed = self.norm(out_recurrent)
         out_flat = op.reshape(out_normed, (b, s, n_vh * V))

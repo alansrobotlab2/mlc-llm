@@ -6,6 +6,64 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-07-25d — History-path recurrent state fused; the default config stops being the slow one (35B pp +59%, 0.8B +119%)
+
+Continuation of the CUDA-13 perf sessions. Target was [workplan-cuda-13.md](workplan-cuda-13.md)
+§9 item 0a — the item the previous session's trace had just promoted to "the biggest in this
+document". It was, and it is the largest single win in the workplan.
+
+**Done**
+- `create_gated_delta_net_func_with_history_inplace` in
+  [qwen35_model.py](python/mlc_llm/model/qwen35/qwen35_model.py) — collapses `rnn_state_get_0`,
+  `gdn_func_history` and `rnn_state_set_with_history_0` into one kernel that scatters each
+  position's recurrent state straight into the history ring. Wired into `forward_with_history`
+  behind the existing `state_io` toggle; the 35B reuses `Qwen35GatedDeltaNet`, so no second edit.
+- [scripts/gdn_kernel_check.py](scripts/gdn_kernel_check.py) — new numerical unit gate. Bar is
+  **bit-exactness against the copy-path kernel** rather than a tolerance, plus an fp64 reference of
+  the recurrence, over 9 seq_lens × 2 head configs including 5 that wrap the ring.
+- Measured under `--prefix-cache-mode radix` (the default), three runs, spread ≤0.3%:
+  **35B pp512 395.4 → 629.1 (+59.1%)**, ttft 1294.8 → 813.7 ms; **0.8B 1793.0 → 3934.5 (+119.4%)**,
+  ttft 285.5 → 130.1 ms. Decode neutral both (−0.3% / +0.08%). `disable` path unmoved
+  (35B 645.4 → 646.1), which is the regression check that matters for a `forward_with_history`
+  change.
+- Gates: greedy-parity vs HF fp16 5/5 × 50/50 under **both** modes; `greedy_snapshot` **5/5
+  byte-identical**; long prompt **5814 tok / 3 prefill chunks byte-identical**;
+  `prefix_cache_roundtrip` 20/20; `batch_decode_parity` 6/6 both modes; 35B fp8 tier-2
+  1/15/2/5/50, identical to `lib_histconv` prompt for prompt.
+
+**Learned**
+- **The copy elimination was the smaller half.** The kernel it replaces materializes a
+  `(batch, seq_len, n_vh, K, V)` fp32 tensor — 537 MB per layer per call at pp512 — of which
+  `EndForward`'s `available_history_num` cap makes **~87% unreadable before it is overwritten**.
+  Skipping the doomed writes is most of the win.
+- **The copy path had a latent race and this removes it.** `create_set_with_history_func` writes
+  every `t` from a flat parallel grid while documenting a precondition
+  (`max_history >= seq_len + 1`) that prefill violates on every chunk, so `t` and `t + max_hist`
+  race for the same slot. It was harmless only because the racing writes land in unreachable slots.
+- **First bit-exact history-path change.** The fused kernel runs the same passes in the same order
+  over the same registers — only the flush destination changed. New rule: when a fusion changes
+  only *where* a result is written, demand bit-exactness rather than accepting a tolerance.
+- **A negative control refuted the design assumption again** (twice running now). Removing the skip
+  guard entirely still passes every shape — it is a pure optimization, not what makes the kernel
+  correct — while tightening it by one position fails. Both sides measured, not argued.
+- **Estimation post-mortem.** The prediction was written down before any lib was built and the
+  headline landed in band (predicted 47–56% saving, measured 54.4%), but two mechanism errors
+  cancelled: `gdn_func_history` was less store-bound than its achieved bandwidth implied (46.6%
+  removed, not the predicted 60–90%), and the renormalization mixed a whole-run denominator with a
+  prefill-only metric. Rule added: renormalize against a trace of the *actual* A/B baseline.
+- **The next item is a different kind of problem.** With both states fused, `gdn_func_history_inplace`
+  is 95.6 ms against 19.3 ms for the next prefill kernel — and it runs at **202 GFLOP/s, ~3.8% of
+  sm_87 fp32 peak**, launching 2048 threads on 16 SMs. There is no bandwidth left; it is
+  parallelism starvation, and the fix is the chunked linear-attention formulation.
+
+**Next**
+- workplan §9 item 0c — scope the chunked GDN recurrence deliberately (it changes the arithmetic).
+  Check the cheap register-occupancy hypothesis in §15.6 first.
+- Still open from before: §9 item 1 (35B dynamic-batch decode), item 0b (deterministic 35B state
+  gate via a high-margin prompt set).
+
+---
+
 ## 2026-07-25c — Radix prefill was never measured; history-path conv fused (35B pp +10.9%, 0.8B +22.4%)
 
 Continuation of the CUDA-13 perf sessions. Target was [workplan-cuda-13.md](workplan-cuda-13.md)
