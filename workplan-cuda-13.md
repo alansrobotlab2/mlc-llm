@@ -1071,9 +1071,10 @@ makes `high_margin_gate.py` a regression check rather than a judgement call, unl
 ⚠️ **§16.9 tried the obvious form and it does not work.** A source-level `if e_v >= 0:` around the
 loop nests dies at `sch.compute_at(w_shared, k_o_o)` with `InternalError: unordered_map::at` — an
 `IfThenElse` between an sblock and its target loop breaks the scope bookkeeping. **The guard has to
-be applied after `_schedule_v2()` returns**, as a stmt mutator over the scheduled body; budget time
-for finding this fork's node classes (`tvm.tir` is `tvm.s_tir` here and the stmt/expr classes moved)
-and for `thread_extent` hoisting, since the bindings land inside the conditional. The no-conditional
+be applied after `_schedule_v2()` returns**, as a stmt mutator over the scheduled body. The nodes and
+the mutator live in **`tvm.tirx`** / `tvm.tirx.stmt_functor.ir_transform` (§16.9 has the details);
+the remaining unknown is `thread_extent` hoisting, since the bindings land inside the conditional.
+The no-conditional
 fallback is to stop *launching* those CTAs — compact the dispatch table with an exclusive scan over
 `ceildiv(count_e, BLK_M)` — but the grid extent is a compile-time shape expression, so that needs a
 host round-trip per call and should be costed first.
@@ -2992,11 +2993,15 @@ sch.compute_at(w_shared, k_o_o, preserve_unit_loops=True)
 
 An `IfThenElse` between the sblock and its target loop breaks the scope bookkeeping `compute_at`
 relies on. So the guard has to be applied to the *scheduled* function, not the source one — wrap the
-CTA body after `_schedule_v2()` returns. That route was scoped and not attempted: the thread bindings
-end up inside the conditional, which is legal CUDA (the sentinel is CTA-uniform) but is exactly what
-TVM's `thread_extent` hoisting is unhappy about, and this TVM fork renames `tvm.tir` to `tvm.s_tir`
-with the stmt/expr node classes moved, so a stmt mutator is not the ten-line job it is upstream.
-**Anyone picking this up: find the node classes first, then wrap post-schedule.**
+CTA body after `_schedule_v2()` returns. That route was scoped and not attempted.
+
+**The API archaeology is done, so start here.** The stmt/expr nodes are in **`tvm.tirx`**, not
+`tvm.s_tir` (which holds only `Schedule`/`ScheduleState`/`TensorIntrin`/dlight) and not `tvm.tir`
+(which does not exist in this fork). `tvm.tirx` has `PrimFunc`, `For`, `SeqStmt`, `IfThenElse`, and
+`tvm.tirx.stmt_functor` provides **`ir_transform`**, `post_order_visit`, `pre_order_visit`,
+`substitute` — enough for the wrap. **The one unknown left is `thread_extent` hoisting**: the thread
+bindings end up inside the conditional, which is legal CUDA because the sentinel is CTA-uniform, but
+is what TVM's lowering normally objects to. That is a build-and-see, not an argument.
 
 #### (b) Widening `BLK_M` is a regression, and the reason is a loop order
 
