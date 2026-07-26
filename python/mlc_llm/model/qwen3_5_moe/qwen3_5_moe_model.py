@@ -278,6 +278,10 @@ class Qwen35MoEModel(nn.Module):
                 [l.linear_attn.linear_layer_idx for l in gdn_layers],
                 hidden_states.shape[0],
                 (gdn.num_value_heads, gdn.key_head_dim, gdn.value_head_dim),
+                # conv1d_weight is (qkv_dim, 1, kernel_size), so its leading dim is the
+                # conv width — read it off the parameter rather than re-deriving it.
+                (gdn.config.linear_conv_kernel_dim - 1, gdn.conv1d_weight.shape[0]),
+                gdn.dtype,
             )
         for layer in self.layers:
             hidden_states, state = layer.forward(hidden_states, paged_kv_cache, state, state_io)
