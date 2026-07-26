@@ -31,7 +31,10 @@ import argparse
 import numpy as np
 import tvm
 
-from mlc_llm.model.qwen35.qwen35_model import create_causal_conv1d_func_inplace
+from mlc_llm.model.qwen35.qwen35_model import (
+    create_causal_conv1d_func_inplace,
+    create_causal_conv1d_func_with_history_inplace,
+)
 
 # (conv_dim, label). 0.8B is 2*16*128 + 16*128; 35B is 2*16*128 + 32*128.
 WIDTHS = [(6144, "0.8B"), (8192, "35B-A3B")]
@@ -92,6 +95,85 @@ def run_shape(conv_dim, seq_len, ks, batch, max_hist, hist_slot_id, seed):
     return rel, state_err, clobber
 
 
+def reference_history(qkv, weight, state, seq_len, ks, storage, seq_slot, hist_slot, max_hist):
+    """fp64 conv reference plus the exact ring content `set_with_history` would leave.
+
+    The per-position state after `t` is `cat[t+1 : t+1+ks-1]`, scattered to slot
+    `(hist + 1 + t) % max_hist`. Applying the writes in ascending `t` reproduces
+    last-write-wins, which is what makes the wrapped ring well-defined when
+    `seq_len > max_hist` -- and slots that are never written must come back untouched.
+    """
+    ks_m1 = ks - 1
+    out, _ = reference(qkv, weight, state, seq_len, ks)
+    cat = np.concatenate([state, qkv], axis=1)  # keep native dtype: the state is a pure copy
+    expected = storage.copy()
+    for bi in range(qkv.shape[0]):
+        for t in range(seq_len):
+            slot = (int(hist_slot[bi]) + 1 + t) % max_hist
+            expected[int(seq_slot[bi]), slot] = cat[bi, t + 1 : t + 1 + ks_m1, :]
+    return out, expected
+
+
+def run_shape_history(conv_dim, seq_len, ks, batch, max_hist, hist_slot_id, seed):
+    """Same three checks as `run_shape`, against the history-path kernel.
+
+    The interesting case is `seq_len > max_hist` (a real prefill chunk is 512-2048 against
+    64 slots): the flush wraps and overwrites the slot the conv reads its old state from,
+    so this is what proves the register staging in
+    `create_causal_conv1d_func_with_history_inplace` is doing its job.
+    """
+    rng = np.random.default_rng(seed)
+    dev = tvm.cuda(0)
+    f = create_causal_conv1d_func_with_history_inplace(
+        conv_dim=conv_dim, kernel_size=ks, dtype="float16"
+    )
+    mod = tvm.compile(tvm.IRModule({"main": f}), target="cuda")
+
+    qkv = (rng.standard_normal((batch, seq_len, conv_dim)) * 0.5).astype(np.float16)
+    weight = (rng.standard_normal((conv_dim, 1, ks)) * 0.5).astype(np.float16)
+    storage = (rng.standard_normal((batch, max_hist, ks - 1, conv_dim)) * 0.5).astype(np.float16)
+    seq_slot = np.arange(batch, dtype=np.int32)
+    hist_slot = np.full((batch,), hist_slot_id, dtype=np.int32)
+
+    state_in = storage[seq_slot, hist_slot].copy()
+    ref_out, ref_storage = reference_history(
+        qkv, weight, state_in, seq_len, ks, storage, seq_slot, hist_slot, max_hist
+    )
+
+    args = [
+        tvm.runtime.tensor(x, dev)
+        for x in (qkv, weight, storage, seq_slot, hist_slot,
+                  np.zeros((batch, seq_len, conv_dim), np.float16))
+    ]
+    mod["main"](*args)
+    dev.sync()
+
+    got_out = args[5].numpy().astype(np.float64)
+    got_storage = args[2].numpy()
+
+    scale = max(float(np.abs(ref_out).max()), 1e-6)
+    rel = float(np.abs(got_out - ref_out).max()) / scale
+
+    # Split the storage verdict: slots the scatter should have written (bit-exact, it is a
+    # copy) vs slots it must not have touched at all. Reporting them together would let a
+    # ring-addressing bug hide inside a "storage differs" number.
+    written = {
+        (int(seq_slot[bi]), (int(hist_slot[bi]) + 1 + t) % max_hist)
+        for bi in range(batch)
+        for t in range(seq_len)
+    }
+    state_err, clobber = 0.0, 0.0
+    for si in range(batch):
+        for h in range(max_hist):
+            d = float(np.abs(got_storage[si, h].astype(np.float64)
+                             - ref_storage[si, h].astype(np.float64)).max())
+            if (si, h) in written:
+                state_err = max(state_err, d)
+            else:
+                clobber = max(clobber, d)
+    return rel, state_err, clobber
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernel-size", type=int, default=4)
@@ -104,19 +186,24 @@ def main() -> None:
     print(f"fp16 eps ~ {FP16_EPS:.1e}; rounding-order differences stay at that scale.")
     print(f"batch={args.batch} max_history={args.max_history} hist_slot={args.hist_slot}\n")
     bad = 0
-    for conv_dim, label in WIDTHS:
-        for seq_len in SEQ_LENS:
-            rel, se, cl = run_shape(conv_dim, seq_len, args.kernel_size, args.batch,
-                                    args.max_history, args.hist_slot % args.max_history,
-                                    args.seed)
-            fail = rel > REL_TOL or se != 0.0 or cl != 0.0
-            bad += fail
-            print(f"  {label:<8} conv_dim={conv_dim:5d} seq_len={seq_len:4d}  "
-                  f"out_rel={rel:.2e}  state_err={se:.1e}  other_slots={cl:.1e}"
-                  f"{'   <-- FAIL' if fail else ''}")
+    for name, fn in (("decode/fused-prefill (state_id=1, single ring advance)", run_shape),
+                     ("history path (per-position scatter, radix default)", run_shape_history)):
+        print(f"{name}:")
+        for conv_dim, label in WIDTHS:
+            for seq_len in SEQ_LENS:
+                rel, se, cl = fn(conv_dim, seq_len, args.kernel_size, args.batch,
+                                 args.max_history, args.hist_slot % args.max_history,
+                                 args.seed)
+                fail = rel > REL_TOL or se != 0.0 or cl != 0.0
+                bad += fail
+                wrap = " WRAP" if fn is run_shape_history and seq_len > args.max_history else ""
+                print(f"  {label:<8} conv_dim={conv_dim:5d} seq_len={seq_len:4d}  "
+                      f"out_rel={rel:.2e}  state_err={se:.1e}  other_slots={cl:.1e}"
+                      f"{wrap}{'   <-- FAIL' if fail else ''}")
+        print()
     if bad:
-        raise SystemExit(f"\n{bad} shape(s) FAILED")
-    print("\nALL SHAPES PASS — output within fp16 rounding, state bit-exact, ring clean")
+        raise SystemExit(f"{bad} shape(s) FAILED")
+    print("ALL SHAPES PASS — output within fp16 rounding, state bit-exact, ring clean")
 
 
 if __name__ == "__main__":

@@ -220,6 +220,7 @@ class Qwen35MoEDecoderLayer(nn.Module):
         hidden_states: Tensor,
         paged_kv_cache: PagedKVCache,
         state: RNNState,
+        state_io: Optional["_GDNStateIO"] = None,
     ):
         """Verify-path variant — scatters per-position GDN state into history slots.
 
@@ -231,7 +232,7 @@ class Qwen35MoEDecoderLayer(nn.Module):
         if self.layer_type == "full_attention":
             out = self.self_attn(out, paged_kv_cache, self.category_id)
         else:
-            out, state = self.linear_attn.forward_with_history(out, state)
+            out, state = self.linear_attn.forward_with_history(out, state, state_io)
         hidden_states = self._apply_residual(out, residual=hidden_states)
         out = self.post_attention_layernorm(hidden_states)
         out = self.mlp(out)
@@ -268,25 +269,33 @@ class Qwen35MoEModel(nn.Module):
         state: RNNState,
     ):
         hidden_states = inputs
-        # Hoisted above the loop on purpose — see `_GDNStateIO` in qwen35_model.py.
-        gdn_layers = [l for l in self.layers if l.layer_type != "full_attention"]
-        state_io = None
-        if gdn_layers and os.environ.get("MLC_QWEN35_INPLACE_STATE", "1") != "0":
-            gdn = gdn_layers[0].linear_attn
-            state_io = _hoist_gdn_state_io(
-                state,
-                [l.linear_attn.linear_layer_idx for l in gdn_layers],
-                hidden_states.shape[0],
-                (gdn.num_value_heads, gdn.key_head_dim, gdn.value_head_dim),
-                # conv1d_weight is (qkv_dim, 1, kernel_size), so its leading dim is the
-                # conv width — read it off the parameter rather than re-deriving it.
-                (gdn.config.linear_conv_kernel_dim - 1, gdn.conv1d_weight.shape[0]),
-                gdn.dtype,
-            )
+        state_io = self._maybe_hoist_state_io(state, hidden_states.shape[0])
         for layer in self.layers:
             hidden_states, state = layer.forward(hidden_states, paged_kv_cache, state, state_io)
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
+
+    def _maybe_hoist_state_io(self, state: RNNState, batch_size):
+        """Hoisted above the layer loop on purpose — see `_GDNStateIO` in qwen35_model.py.
+
+        Kept as its own copy rather than shared with `Qwen35Model`: this file's layer stack
+        is `Qwen35MoEDecoderLayer`, and the two models' `forward` signatures already differ
+        (no mRoPE here). `MLC_QWEN35_INPLACE_STATE=0` disables §11, §13 and §14 together.
+        """
+        gdn_layers = [l for l in self.layers if l.layer_type != "full_attention"]
+        if not gdn_layers or os.environ.get("MLC_QWEN35_INPLACE_STATE", "1") == "0":
+            return None
+        gdn = gdn_layers[0].linear_attn
+        return _hoist_gdn_state_io(
+            state,
+            [l.linear_attn.linear_layer_idx for l in gdn_layers],
+            batch_size,
+            (gdn.num_value_heads, gdn.key_head_dim, gdn.value_head_dim),
+            # conv1d_weight is (qkv_dim, 1, kernel_size), so its leading dim is the
+            # conv width — read it off the parameter rather than re-deriving it.
+            (gdn.config.linear_conv_kernel_dim - 1, gdn.conv1d_weight.shape[0]),
+            gdn.dtype,
+        )
 
     def forward_with_history(
         self,
@@ -295,9 +304,10 @@ class Qwen35MoEModel(nn.Module):
         state: RNNState,
     ):
         hidden_states = inputs
+        state_io = self._maybe_hoist_state_io(state, hidden_states.shape[0])
         for layer in self.layers:
             hidden_states, state = layer.forward_with_history(
-                hidden_states, paged_kv_cache, state
+                hidden_states, paged_kv_cache, state, state_io
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states, state

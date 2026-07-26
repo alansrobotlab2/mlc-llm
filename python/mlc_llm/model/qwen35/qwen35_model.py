@@ -724,6 +724,180 @@ def create_causal_conv1d_func_inplace(
     return conv1d_inplace
 
 
+def create_causal_conv1d_func_with_history_inplace(
+    conv_dim: int,
+    kernel_size: int,
+    dtype: str,
+    threads: int = 256,
+):
+    """Causal conv1d that scatters per-position conv state straight into the ring.
+
+    The history-path analogue of `create_causal_conv1d_func_inplace`, and it collapses
+    four kernels. The copy path emits `rnn_state_get_1` (slot -> temp),
+    `update_conv_state_history` (a TE op that materializes the whole
+    `(b, seq, ks-1, conv_dim)` per-position history as a new tensor), the TE conv, then
+    `rnn_state_set_with_history_1` (scatter temp -> ring). Traced on the 0.8B at
+    3026 + 477 + 184 us per call for the last three -- and the conv is the same
+    catastrophically mis-scheduled TE op §13 measured at ~42x off roofline, which the
+    `disable` path already stopped using.
+
+    This is the path `prefix_cache_mode="radix"` -- the **default** -- takes for prefill,
+    so unlike §13 the win here is one that a default-configured user actually receives.
+
+    Slot addressing mirrors `RNNState.create_set_with_history_func` exactly:
+
+        load  from storage[seq_slot, hist_slot, ks-1, conv_dim]
+        flush into storage[seq_slot, (hist_slot + 1 + t) % max_hist, ks-1, conv_dim]
+
+    for each position `t`, where the state after position `t` is the `ks-1`-element
+    window of `[old_state ++ qkv]` ending at `t`.
+
+    **Why this needs a stronger safety argument than §13's kernel.** There `seq_len` is 1
+    and exactly one slot is written, so staging `ks-1` registers between the reads and
+    the write was enough. Here `seq_len` is a prefill chunk -- 512, up to 2048 -- while
+    `max_history` is 64, so the flush **wraps the ring** and slot `hist_slot` is itself
+    overwritten at `t == max_history - 1`. A kernel that flushed naively would clobber the
+    old state while the conv still needed it, and every output past that point would be
+    wrong -- a bug no `disable`-mode gate could see, since there `max_history == 1`.
+
+    The kernel handles this by staging the single write that targets `hist_slot` and
+    flushing it after every read, exactly as §13 does -- the register array is indexed only
+    by the static Python loop var `j`, never dynamically, which is the constraint §13's
+    docstring records. At most one surviving write can target `hist_slot`, because the
+    surviving writes span at most `max_history` consecutive `t` (see below) so each ring
+    slot is hit at most once. Registers are pre-loaded with the slot's current contents, so
+    the trailing write is unconditional and correct whether or not any `t` landed there.
+
+    ⚠️ **The deferral is defence-in-depth, not what makes the tested shapes correct.** A
+    negative control -- same kernel writing `hist_slot` directly, no staging -- was built
+    and **passed all 12 shapes**, including the wrapping ones. The reason is the skip guard
+    below: it drops exactly the early positions (`t < ks-2`) whose flush would re-read the
+    old state, so with `kernel_size=4` no write to `hist_slot` can precede a read of it at
+    any `(max_history, seq_len)`. The staging is kept because that argument depends on
+    `ks-1 == 3` and costs ~3 registers, not because the direct version was observed to
+    fail. Do not cite it as the reason this kernel is safe.
+
+    **Writes that cannot survive are skipped.** Position `t` lands in slot
+    `(hist + 1 + t) % max_hist`, so it is overwritten by any later `t' == t (mod
+    max_hist)`. Only `t >= seq_len - max_hist` survives to be read by anyone, and
+    `EndForward` caps `available_history_num` at `max_history - 1` regardless. Guarding on
+    that turns a 512-position scatter into a 64-position one at pp512 (32x at a full 2048
+    chunk) with no semantic change -- and it is also what bounds the surviving range to
+    `max_history` consecutive positions, which the one-write-per-slot argument above needs.
+    Ascending `t` within one thread means the surviving write is the last one, matching the
+    copy path's intended ring content.
+
+    Accumulation is in `dtype`, summed in ascending `kk`, matching what `te.sum` over the
+    4-element reduction axis lowers to -- same bit-exactness argument as §13.
+    """
+    ks_m1 = kernel_size - 1
+    n_blocks = (conv_dim + threads - 1) // threads
+
+    @T.prim_func
+    def conv1d_history_inplace(
+        qkv_handle: T.handle,
+        weight_handle: T.handle,
+        storage_handle: T.handle,  # whole (max_batch, max_hist, ks-1, conv_dim) buffer
+        seq_slot_handle: T.handle,  # device-side per-batch seq slot ids
+        hist_slot_handle: T.handle,  # device-side per-batch history slot ids
+        out_handle: T.handle,
+    ):
+        T.func_attr({"op_pattern": 8, "tirx.noalias": True, "tirx.is_scheduled": 1})
+        batch_size, seq_len = T.int64(), T.int64()
+        max_batch_size, max_history = T.int64(), T.int64()
+        qkv_buf = T.match_buffer(qkv_handle, (batch_size, seq_len, conv_dim), dtype=dtype)
+        weight_buf = T.match_buffer(weight_handle, (conv_dim, 1, kernel_size), dtype=dtype)
+        storage_buf = T.match_buffer(
+            storage_handle, (max_batch_size, max_history, ks_m1, conv_dim), dtype=dtype
+        )
+        seq_slot_buf = T.match_buffer(seq_slot_handle, (batch_size,), dtype="int32")
+        hist_slot_buf = T.match_buffer(hist_slot_handle, (batch_size,), dtype="int32")
+        out_buf = T.match_buffer(out_handle, (batch_size, seq_len, conv_dim), dtype=dtype)
+
+        for b_idx in T.thread_binding(batch_size, thread="blockIdx.y"):
+            for d_outer in T.thread_binding(n_blocks, thread="blockIdx.x"):
+                for d_inner in T.thread_binding(threads, thread="threadIdx.x"):
+                    with T.sblock("conv1d_history_thread"):
+                        acc = T.sblock_alloc_buffer((1,), dtype, scope="local")
+                        staged = T.sblock_alloc_buffer((ks_m1,), dtype, scope="local")
+
+                        d_idx: T.int64 = T.cast(d_outer, "int64") * T.int64(
+                            threads
+                        ) + T.cast(d_inner, "int64")
+                        if d_idx < T.int64(conv_dim):
+                            seq_id: T.int64 = T.cast(seq_slot_buf[b_idx], "int64")
+                            hist_in: T.int64 = T.cast(hist_slot_buf[b_idx], "int64")
+
+                            # Pre-load the read slot's current contents so the deferred
+                            # write below is unconditional: if no surviving `t` lands on
+                            # `hist_in`, this writes the slot back unchanged.
+                            for j in range(ks_m1):
+                                staged[j] = storage_buf[seq_id, hist_in, j, d_idx]
+
+                            # --- 1. conv outputs (reads only) ---------------------
+                            # out[si] = sum_kk cat[si + kk] * w[kk], where cat is the
+                            # concatenation [old_state ++ qkv] of length ks-1 + seq_len.
+                            for si in range(seq_len):
+                                acc[0] = T.cast(0, dtype)
+                                for kk in range(kernel_size):
+                                    acc[0] = acc[0] + T.if_then_else(
+                                        si + kk < T.int64(ks_m1),
+                                        storage_buf[
+                                            seq_id,
+                                            hist_in,
+                                            T.min(si + kk, T.int64(ks_m1 - 1)),
+                                            d_idx,
+                                        ],
+                                        qkv_buf[
+                                            b_idx,
+                                            T.max(si + kk - T.int64(ks_m1), T.int64(0)),
+                                            d_idx,
+                                        ],
+                                    ) * weight_buf[d_idx, 0, kk]
+                                out_buf[b_idx, si, d_idx] = acc[0]
+
+                            # --- 2. scatter per-position state into the ring ------
+                            # State after position t is cat[t + 1 .. t + ks_m1]. Writes to
+                            # `hist_in` are staged, not stored, so every read above and in
+                            # this loop still sees the original old state.
+                            for t in range(seq_len):
+                                # Skip writes a later position provably overwrites; this
+                                # also bounds the live range to <= max_history positions,
+                                # which is what makes "one write per slot" true.
+                                if t + max_history >= seq_len:
+                                    hist_out: T.int64 = (
+                                        hist_in + T.int64(1) + t
+                                    ) % max_history
+                                    for j in range(ks_m1):
+                                        val = T.if_then_else(
+                                            t + T.int64(1 + j) < T.int64(ks_m1),
+                                            storage_buf[
+                                                seq_id,
+                                                hist_in,
+                                                T.min(t + T.int64(1 + j), T.int64(ks_m1 - 1)),
+                                                d_idx,
+                                            ],
+                                            qkv_buf[
+                                                b_idx,
+                                                T.max(
+                                                    t + T.int64(1 + j) - T.int64(ks_m1),
+                                                    T.int64(0),
+                                                ),
+                                                d_idx,
+                                            ],
+                                        )
+                                        if hist_out == hist_in:
+                                            staged[j] = val
+                                        else:
+                                            storage_buf[seq_id, hist_out, j, d_idx] = val
+
+                            # --- 3. the one deferred slot (writes only) -----------
+                            for j in range(ks_m1):
+                                storage_buf[seq_id, hist_in, j, d_idx] = staged[j]
+
+    return conv1d_history_inplace
+
+
 def create_gated_delta_net_func_with_history(
     num_key_heads: int,
     num_value_heads: int,
@@ -1085,14 +1259,21 @@ class Qwen35GatedDeltaNet(nn.Module):
         return self.out_proj(out_gated), state
 
     def forward_with_history(
-        self, hidden_states: Tensor, state: RNNState
+        self, hidden_states: Tensor, state: RNNState, state_io: Optional["_GDNStateIO"] = None
     ) -> Tuple[Tensor, RNNState]:  # noqa: UP006
         """Forward variant that scatters per-position state into RNNState history slots.
 
         Used by the verify path for speculative decoding so partial accept can roll back
-        the recurrent state to any intermediate position. Mirrors `forward()` step-for-step
-        but the GDN kernel emits a full per-position state history and the conv state is
-        also recorded per position; both are written via `state.set_with_history(...)`.
+        the recurrent state to any intermediate position, **and by prefill whenever
+        `prefix_cache_mode` is not `"disable"`** — which is the engine default, so this is
+        the path most real prefill takes. Mirrors `forward()` step-for-step but the GDN
+        kernel emits a full per-position state history and the conv state is also recorded
+        per position; both are written via `state.set_with_history(...)`.
+
+        When `state_io` is supplied the conv half runs as one fused kernel that scatters
+        straight into the ring, replacing `rnn_state_get_1` + `update_conv_state_history` +
+        the TE conv + `rnn_state_set_with_history_1`; otherwise the original copy path runs
+        unchanged. The recurrent half is untouched by this — see §14.
         """
         b, s, _ = hidden_states.shape
         K = self.key_head_dim
@@ -1112,18 +1293,49 @@ class Qwen35GatedDeltaNet(nn.Module):
         )
 
         qkv_dim = qkv.shape[-1]
-        conv_state = state.get(
-            layer_idx,
-            1,
-            (b, self.config.linear_conv_kernel_dim - 1, qkv_dim),
-            self.dtype,
-        )
+        if state_io is not None:
+            # Fused path: one kernel does the conv and scatters the per-position conv
+            # state into the ring, so `rnn_state_get_1`, `update_conv_state_history` and
+            # `rnn_state_set_with_history_1` all disappear along with the TE conv.
+            conv_storage = state_io.conv_storages[layer_idx]
+            conv_args = [
+                qkv,
+                self.conv1d_weight,
+                conv_storage,
+                state_io.seq_slot_ids,
+                state_io.history_slot_ids,
+            ]
+            # Identity, not `.index()` — see the recurrent call site in `forward`.
+            conv_storage_idx = next(i for i, a in enumerate(conv_args) if a is conv_storage)
+            qkv, _ = op.tensor_ir_inplace_op(
+                create_causal_conv1d_func_with_history_inplace(
+                    conv_dim=qkv_dim,
+                    kernel_size=self.config.linear_conv_kernel_dim,
+                    dtype=self.dtype,
+                ),
+                "causal_conv1d_history_inplace",
+                conv_args,
+                # Output 0 is the conv result; output 1 aliases the storage argument, which
+                # is what makes the in-place ring scatter visible to the rest of the graph.
+                inplace_indices=[-1, conv_storage_idx],
+                out=[
+                    Tensor.placeholder([b, s, qkv_dim], self.dtype),
+                    Tensor(_expr=conv_storage._expr),
+                ],
+            )
+        else:
+            conv_state = state.get(
+                layer_idx,
+                1,
+                (b, self.config.linear_conv_kernel_dim - 1, qkv_dim),
+                self.dtype,
+            )
 
-        # Causal conv1d that also yields the per-position conv state history.
-        qkv, conv_state_history = self._causal_conv1d_with_state_history(qkv, conv_state)
-        # Scatter per-position conv state to history slots. The "current" state at the
-        # end of position t is conv_state_history[:, t, :, :].
-        state = state.set_with_history(layer_idx, 1, conv_state_history)
+            # Causal conv1d that also yields the per-position conv state history.
+            qkv, conv_state_history = self._causal_conv1d_with_state_history(qkv, conv_state)
+            # Scatter per-position conv state to history slots. The "current" state at the
+            # end of position t is conv_state_history[:, t, :, :].
+            state = state.set_with_history(layer_idx, 1, conv_state_history)
 
         qkv = op.silu(qkv)
 
@@ -1448,13 +1660,14 @@ class Qwen35DecoderLayer(nn.Module):
         paged_kv_cache: PagedKVCache,
         state: RNNState,
         position_embeddings: Optional[Tuple[Tensor, Tensor]] = None,  # noqa: UP006
+        state_io: Optional["_GDNStateIO"] = None,
     ):
         """Verify-path variant that scatters per-position GDN state into history slots."""
         out = self.input_layernorm(hidden_states)
         if self.layer_type == "full_attention":
             out = self.self_attn(out, paged_kv_cache, self.category_id, position_embeddings)
         else:
-            out, state = self.linear_attn.forward_with_history(out, state)
+            out, state = self.linear_attn.forward_with_history(out, state, state_io)
         hidden_states = self._apply_residual(out, residual=hidden_states)
         out = self.post_attention_layernorm(hidden_states)
         out = self.mlp(out)
@@ -1588,29 +1801,36 @@ class Qwen35Model(nn.Module):
             )
             cos, sin = self.rotary_emb(hidden_states, position_ids)
             position_embeddings = (cos, sin)
-        # Hoisted above the loop on purpose — see `_GDNStateIO`.
-        # MLC_QWEN35_INPLACE_STATE=0 compiles the old get/set copy path instead, so an A/B
-        # can be source- and flag-identical rather than a rebuild against an older tree.
-        gdn_layers = [l for l in self.layers if l.layer_type != "full_attention"]
-        state_io = None
-        if gdn_layers and os.environ.get("MLC_QWEN35_INPLACE_STATE", "1") != "0":
-            gdn = gdn_layers[0].linear_attn
-            state_io = _hoist_gdn_state_io(
-                state,
-                [l.linear_attn.linear_layer_idx for l in gdn_layers],
-                hidden_states.shape[0],
-                (gdn.num_value_heads, gdn.key_head_dim, gdn.value_head_dim),
-                # conv1d_weight is (qkv_dim, 1, kernel_size), so its leading dim is the
-                # conv width — read it off the parameter rather than re-deriving it.
-                (gdn.config.linear_conv_kernel_dim - 1, gdn.conv1d_weight.shape[0]),
-                gdn.dtype,
-            )
+        state_io = self._maybe_hoist_state_io(state, hidden_states.shape[0])
         for layer_id, layer in enumerate(self.layers):
             hidden_states, state = layer.forward(
                 hidden_states, paged_kv_cache, state, position_embeddings, state_io
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
+
+    def _maybe_hoist_state_io(self, state: RNNState, batch_size):
+        """Hoisted above the layer loop on purpose — see `_GDNStateIO`.
+
+        `MLC_QWEN35_INPLACE_STATE=0` compiles the old get/set copy path instead, so an A/B
+        can be source- and flag-identical rather than a rebuild against an older tree. The
+        toggle covers the recurrent state (§11), the decode/fused-prefill conv (§13) and
+        the history-path conv (§14) together, since all three hang off `state_io`.
+        """
+        gdn_layers = [l for l in self.layers if l.layer_type != "full_attention"]
+        if not gdn_layers or os.environ.get("MLC_QWEN35_INPLACE_STATE", "1") == "0":
+            return None
+        gdn = gdn_layers[0].linear_attn
+        return _hoist_gdn_state_io(
+            state,
+            [l.linear_attn.linear_layer_idx for l in gdn_layers],
+            batch_size,
+            (gdn.num_value_heads, gdn.key_head_dim, gdn.value_head_dim),
+            # conv1d_weight is (qkv_dim, 1, kernel_size), so its leading dim is the
+            # conv width — read it off the parameter rather than re-deriving it.
+            (gdn.config.linear_conv_kernel_dim - 1, gdn.conv1d_weight.shape[0]),
+            gdn.dtype,
+        )
 
     def forward_with_history(
         self,
@@ -1627,9 +1847,10 @@ class Qwen35Model(nn.Module):
             )
             cos, sin = self.rotary_emb(hidden_states, position_ids)
             position_embeddings = (cos, sin)
+        state_io = self._maybe_hoist_state_io(state, hidden_states.shape[0])
         for layer_id, layer in enumerate(self.layers):
             hidden_states, state = layer.forward_with_history(
-                hidden_states, paged_kv_cache, state, position_embeddings
+                hidden_states, paged_kv_cache, state, position_embeddings, state_io
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states, state
