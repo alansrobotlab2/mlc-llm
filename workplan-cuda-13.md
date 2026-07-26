@@ -821,10 +821,19 @@ All work from both 2026-07-25 sessions is now in git on branch `qwen3_5`:
 | `3ff691f5` | §13 conv-state fusion + `conv1d_kernel_check.py` |
 | `c2fd8691` | §13 workplan, §8 build warning, §9 item 3 refutation |
 
-⚠️ **The TVM submodule commit is local-only.** `3rdparty/tvm` points at `4624d97`
-(branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork), which **has not been
-pushed**. It carries the three `vm.builtin.rnn_state_*` accessors that §11 and §13 both depend on.
-Push it before this box is rebuilt or that work does not reproduce.
+✅ **The TVM submodule commit IS pushed — this section said otherwise for three sessions and was
+wrong.** `3rdparty/tvm` points at `4624d97` (branch `qwen35-inplace-rnn-state` on the
+`alansrobotlab2/relax` fork), carrying the three `vm.builtin.rnn_state_*` accessors that §11, §13,
+§14 and §15 all depend on. Verified 2026-07-25d: `git ls-remote origin qwen35-inplace-rnn-state`
+returns `4624d972…`, identical to local `HEAD`.
+
+⚠️ **The check that produced the false alarm is the thing to remember.** That clone's
+`remote.origin.fetch` was narrowed to `+refs/heads/mlc:refs/remotes/origin/mlc` only, so no
+remote-tracking ref existed for this branch and **`git branch -r --contains HEAD` returned empty
+even though the commit was on the remote**. Fixed by adding the branch to the refspec and setting
+an upstream, so `git status -sb` now reads `...origin/qwen35-inplace-rnn-state` and the ordinary
+checks work. **On a submodule with a narrowed refspec, `git ls-remote` is the only trustworthy
+"is it pushed?" test** — everything local can be a false negative.
 
 `.gitignore`'s reference-cache exception named only `reference_outputs_35b.pt`, so the fp8 cache
 that §7 said to commit was still ignored; the exception now covers both names and the file is in
@@ -932,12 +941,13 @@ rebuild should just work.
 
 ### What changed, by file (all committed — see "Committed state" above)
 
-**The TVM submodule change is committed but NOT pushed** — easy to lose, and the mlc-llm build
-will not rebuild it (§2.1.1):
+**The TVM submodule change is committed and pushed** (verified 2026-07-25d — see "Committed
+state" above for why the earlier "NOT pushed" claim was a false alarm). It still has to be built
+separately: the mlc-llm build will not rebuild it (§2.1.1):
 
 ```
 3rdparty/tvm (fork alansrobotlab2/relax) -> 4624d97 on branch qwen35-inplace-rnn-state
-  src/runtime/vm/rnn_state.cc      # the three new builtins — LOCAL ONLY, push this
+  src/runtime/vm/rnn_state.cc      # the three new builtins — on the remote, verified
 ```
 
 Main repo:
