@@ -884,8 +884,10 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `7865c5de` | **§16.6** item 0d — `v_block` + `MLC_QWEN35_GDN_VBLOCK` + the `vb_exact` gate bar; opt-in at default `0` |
 | `6c0ef467` | **§16.7** the 35B prefill trace; item 0c.2 de-prioritised, item **0e** filed |
 | `8562fade` | **§9** handoff rewritten as a cold-start block; traps list gains the concurrency failure |
-| `6daef3e2` | **§16.9** item 0f's two obvious routes refuted; `MLC_MOE_GEMM_V2_BLKM` A/B knob (inert at 16); §16.8's dequant attribution corrected |
 | `5294dae4` | **§16.8** item 0e measured — v2 is CTA-bound, 27–50% padding CTAs; item **0f** filed; `bench_moe_kernel.py` large-B mode + two instrument fixes |
+| `0dd23758` | commit-table backfill for `5294dae4` and `8562fade` |
+| `6daef3e2` | **§16.9** item 0f's two obvious routes refuted; `MLC_MOE_GEMM_V2_BLKM` A/B knob (inert at 16); §16.8's dequant attribution corrected |
+| `88fce949` | commit-table backfill for `6daef3e2` |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
@@ -2855,14 +2857,14 @@ much less at B=4096 than at B=8, but check it before quoting absolutes.
 > rather than "died". The correctness results in this section are unaffected: `vb_exact` compares
 > tensor contents, which contention cannot perturb.
 
-### 16.8 Item 0e measured — v2 is CTA-bound, and half its CTAs are padding
+### 16.8 Item 0e measured — v2 is CTA-bound, and 27–50% of its CTAs are padding
 
 §16.7 asked three questions before any building: at prefill's `B = 4096`, is
 `dequantize_group_gemm_v2` bandwidth-, compute- or schedule-bound, and does it use tensor cores at
 all. `bench_moe_kernel.py` gained a prefill-scale B sweep (`gate_up_b512` … `gate_up_b8192`, and the
 same for `down`), roofline reporting against both walls, and a replay of v2's dispatch-table
 construction so the CTA count is known for every point. **Answers: tensor cores yes, schedule-bound,
-and the specific schedule fault is that ~half the CTAs at the production shape do a full tile of
+and the specific schedule fault is that 27–50% of the CTAs at the production shape do a full tile of
 work and throw the result away.**
 
 #### Tensor cores: yes, and they are nowhere near the limit
