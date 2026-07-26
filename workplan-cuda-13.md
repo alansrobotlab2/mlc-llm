@@ -880,19 +880,8 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 #### Open
 
-**0b. A deterministic 35B state gate — do this first; it is cheap and it unblocks two others.**
-Neither existing 35B gate can adjudicate a state change. §13 quantified that
-`prefix_cache_roundtrip` fails on the *unmodified baseline* in 3 of 4 runs, and §6.2 says the same
-of the fp8 tier-2 gate — 1/15/2/5/50 is 4-bit-vs-8-bit near-tie noise, and it has now scored
-*identically* across four consecutive libs, which is reassuring but carries almost no information.
-Both have one root cause and one fix: **a high-margin prompt set** — arithmetic, exact-continuation
-sequences, closed-form factual lookups — where the top-1 logit gap is wide enough to survive
-quantization. Prompt 5 (`1, 1, 2, 3, 5, 8, 13, 21,`) is 50/50 on every lib ever tested, which is
-the proof the signal exists when the margin does; the rest of the set is open-ended continuation
-inherited from an fp16-vs-fp16 era. `scripts/gdn_kernel_check.py` and
-`scripts/conv1d_kernel_check.py` are the model for what a gate should look like — deterministic,
-no engine, and separating "wrong" from "rounded differently". *(Was item 4; promoted here in
-2026-07-25b.)*
+> As of 2026-07-26 the open list is **one item plus one blocked precondition**. Items 0b, 1 and 5
+> closed this session (§16); 0c's step 1 is done and measured, leaving only step 2.
 
 **0c. The GDN recurrence is parallelism-starved — the biggest prefill item, by 5×.**
 §15.6 measured it: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the next kernel**,
@@ -918,7 +907,11 @@ steps, in order:
      decode** — at `seq_len=1` the chunked form degenerates, and `gdn_func_inplace` is already
      only 2.1% of the whole-run budget.
 
-**The VL path has not been re-gated.** `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward` and
+**The VL path has not been re-gated — and it is blocked on an artifact, not on work.** Checked
+2026-07-26: there is **no VL checkpoint in the HF cache and no VL build in `dist/`**, so this needs
+a multi-GB download before any of it can start. The package is registered
+(`python/mlc_llm/model/qwen3_5_vl`, `model.py:487`) and all three loaders already carry the 4-way
+`in_proj` concat, so the rebuild itself should be uneventful. `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward` and
 `forward_with_history`, so it inherits §11's in-place state, §13's conv fusion, §14's history conv
 and §15's history recurrence — but there is **no compiled VL model on this box**, so the 176/180
 multimodal gate from `f667b07e` has not been re-run since. Rebuild and re-gate before trusting a
@@ -934,6 +927,7 @@ should just work.
 | **0-old** | 🗑 **Deleted** — was a verbatim duplicate of item 0's pre-completion text |
 | **2** | ✅ **Landed, §13** — in-place GDN *conv* state, 35B +2.40% tg / +15.3% pp. The decode estimate was right and the stated rationale was not: the real prize was the TE conv itself at ~42× off roofline, not the state copies |
 | **3** | ❌ **Refuted by measurement, §13 — do not build.** Allowlisting the `rnn_state_*` handle builtins as static in `rewrite_cuda_graph.cc` to make the fused kernel capturable. The capture prediction was correct and everything built on it was wrong: eager launches went *up* 131 → 183/token, idle did not move (1.016 → 1.065 ms/token), and an eager launch costs ~0.9 µs at the margin, so the whole lane is worth ≤0.38 ms/token. §13 has the trace |
+| **0b** | ✅ **Landed, §16.1** — a deterministic 35B state gate. Teacher forcing removes the cascade that made §6.2's counts uninterpretable, and margin-gated scoring replaces the inherited 48/50 bar. 35B: **139/139 wide-margin positions**, identical across both libs × both prefix-cache modes. `prefix_cache_roundtrip` moved to the same prompt set: **4/4** vs **0/2** for the legacy set on the identical lib. Calibrated on the 0.8B (4-bit flips 11 of 400, all at margin ≤1.031) with a `stale1` negative control that fails 342/361 |
 | **4** | ➡ **Promoted to 0b** (2026-07-25b) — a high-margin prompt set now unblocks two gates rather than one |
 | **1** | ✅ **Settled by measurement, §16.4 — keep the b=1 specialization.** The "~6×" source comment understates it by 8×: at b=1 the top-8 gemv pair is **0.100 ms vs 5.112 ms** for `dequantize_group_gemm` v2 (**51×**; v1 is 1.957 ms, 20×). v2 is a dispatch-table kernel sized for all 256 experts, so its cost is flat in batch and crossover is ~50 sequences. Option (a) (a Relax `If`) is therefore pointless — the dynamic path never wins. If batched decode is ever wanted, widen the per-token gemv split that already ships for spec-decode verify (option **(d)**, which the original option list missed). Comment corrected in source |
 | **5** | ❌ **Refuted by measurement, §16.3 — do not build.** The premise was wrong twice over. At fixed N=2048 efficiency *rises* with K (48% → 68% → 84% → **90%** at K=4096), so K=4096 is the best case rather than the shortfall; and across six tile configurations the shipped sm_87 tile is within 0.5% of the best at every shape, with nothing improving K=4096 at all. `o_proj`'s traced 75% is a memory-system effect — it streams 40 distinct weight tensors per token with no reuse — not a schedule defect, so a GEMV retune cannot recover it. The sweep also exposed an instrument bug worth remembering: `bench_moe_kernel.py` reuses one weight tensor, which inflates small-footprint kernels by up to 20% via L2 (`lm_head` at 70× L2 agrees with the trace to 3.3%; `o_proj` at 1.2× L2 is 20.6% high) |
