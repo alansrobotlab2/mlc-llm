@@ -827,8 +827,86 @@ def _dequantize_group_gemm_v2(
 
         return sch.mod["main"]
 
+    # ---------- item 0f: skip the dispatch table's padding CTAs ----------
+    def _guard_padding_ctas(func):
+        """Give the reduction loop a zero trip count on the sentinel tiles.
+
+        v2's grid is `(ceildiv(B, BLK_M) + Ne) * tiles_per_n`; the `+ Ne` slack gives
+        each expert a private index range without a prefix scan, and those slack CTAs
+        carry `te[bx] = -1`. Un-guarded they load and dequantize a full BLK_N x K
+        weight tile and run the whole wmma reduction before the store predicate
+        discards it — §16.8 measured them at 92-94% of a real CTA's cost and 27-50%
+        of the grid at prefill's B=4096.
+
+        Two things this is *not*, both of which were tried first (§16.9):
+
+        - not an `if` in the source prim_func: an IfThenElse between an sblock and its
+          target loop breaks the scope bookkeeping, and `sch.compute_at` dies with
+          `InternalError: unordered_map::at`.
+        - not an IfThenElse around the scheduled CTA body either. The cooperative
+          loads carry `__syncthreads()`, and ThreadSync refuses on principle:
+          `Check failed: condition_counter() == 0 : Cannot insert syncs inside
+          condition`. The barrier here is uniform across the CTA, but the pass cannot
+          know that.
+
+        Rewriting the *extent* of the k_o_o loop to `Select(e_v >= 0, K/BLK_K, 0)`
+        sidesteps both. There is no conditional, so ThreadSync is satisfied; the
+        extent is CTA-uniform, so every thread agrees on the trip count and the
+        barriers inside the loop are either all executed or all skipped.
+
+        Bit-exact by construction. A skipped CTA still fills its accumulator with
+        zeros and still stores it to `O_tile`, and the global store is predicated on
+        `row_end`, which is 0 exactly when `e_v < 0` — so nothing it writes was ever
+        observable.
+        """
+        k_outer = K // BLK_K
+        # Locate `e_v`, bound by the first Bind in the CTA block, which is an
+        # ancestor of every loop below and so is in scope at the extent.
+        found = []
+        tirx.stmt_functor.post_order_visit(
+            func.body,
+            lambda n: found.append(n.block.body.seq[0].var)
+            if isinstance(n, tirx.SBlockRealize) and n.block.name_hint == "CTA"
+            else None,
+        )
+        if len(found) != 1:
+            raise RuntimeError(f"expected exactly one CTA sblock, found {len(found)}")
+        e_v_var = found[0]
+
+        hits = []
+
+        def _rewrite(node):
+            if (
+                not isinstance(node, tirx.For)
+                or node.thread_binding is not None
+                or node.kind != tirx.ForKind.SERIAL
+                or not isinstance(node.extent, tirx.IntImm)
+                or int(node.extent) != k_outer
+            ):
+                return None
+            hits.append(node)
+            return tirx.For(
+                node.loop_var, node.min,
+                tirx.Select(e_v_var >= 0, node.extent, tirx.IntImm(node.extent.dtype, 0)),
+                node.kind, node.body, node.thread_binding, node.annotations,
+            )
+
+        body = tirx.stmt_functor.ir_transform(func.body, None, _rewrite, ["tirx.For"])
+        # The k_o_o loop is the only serial loop at K/BLK_K trips. If the schedule
+        # ever grows a second one this silently halves the win, so fail instead.
+        if len(hits) != 1:
+            raise RuntimeError(
+                f"expected exactly one serial loop of extent {k_outer} (k_o_o), "
+                f"found {len(hits)}; the 0f rewrite needs updating"
+            )
+        return func.with_body(body)
+
+    scheduled = _schedule_v2()
+    if os.environ.get("MLC_MOE_GEMM_V2_SKIPPAD", "0") == "1":
+        scheduled = _guard_padding_ctas(scheduled)
+
     return op.tensor_ir_op(
-        _schedule_v2(),
+        scheduled,
         "dequantize_group_gemm_v2",
         args=[x, w, scale, indptr, te_t, tm_t, tn_t],
         out=Tensor.placeholder([x.shape[0], out_features], model_dtype),

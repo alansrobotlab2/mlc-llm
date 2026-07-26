@@ -1162,6 +1162,7 @@ Main repo:
 | file | what |
 |---|---|
 | `python/mlc_llm/model/qwen35/qwen35_model.py` | **§16.6** `v_block` on the ksplit kernel + `_gdn_v_block()` (`MLC_QWEN35_GDN_VBLOCK`, **default 0 = inert**): grid becomes `(n_vh × V/v_block, batch)`, block `v_block × k_split` threads. Bit-exact with `v_block=V` by construction. **§16.5** `create_gated_delta_net_func_with_history_inplace_ksplit` + `_gdn_k_split()` (`MLC_QWEN35_GDN_KSPLIT`, **default 4**) and the two-way selection at the `forward_with_history` call site. Uses `T.tvm_warp_shuffle` — there is no `_xor` variant in this TVM, so the partner lane is computed as `(tid % 32) ^ d`; it lowers to a real `__shfl_sync` at sm_87 (the legacy `__shfl` compat macro is gated on `__CUDA_ARCH__ < 700`). **§15** `create_gated_delta_net_func_with_history_inplace` + the recurrent half of `forward_with_history` behind `state_io`. **§14** `create_causal_conv1d_func_with_history_inplace` + `state_io` threaded through `forward_with_history`; the per-model hoist block factored into `_maybe_hoist_state_io`. **§10–13:** `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle; **§13** `create_causal_conv1d_func_inplace` + `conv_storages` on `_GDNStateIO` |
+| `python/mlc_llm/op/moe_matmul.py` | **§16.9/§16.10** — `MLC_MOE_GEMM_V2_BLKM` (A/B knob, inert at 16) and `MLC_MOE_GEMM_V2_SKIPPAD` (item 0f's padding-CTA skip, default `0` pending pp512). The skip is a post-schedule rewrite of the `k_o_o` loop *extent* to `Select(e_v >= 0, K/BLK_K, 0)` — **not** an `IfThenElse`, because `ThreadSync` refuses to put a barrier inside a condition |
 | `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§11** same state_io wiring (the 35B's model file; VL reuses `Qwen35Model` and needed none). **§13**: it has its *own* `_hoist_gdn_state_io` call site — changing that helper's signature breaks the 35B compile while the 0.8B still builds |
 | `scripts/{prefix_cache_roundtrip,batch_decode_parity}.py` | **§11 new** — rollback and batch-slot gates; `batch_decode_parity` gained phase timing in **§12** |
 | `cpp/serve/engine_actions/batch_prefill_base.cc` | **§12** one-sequence prefill cap for RNN-state models; no decode-folding |
@@ -1178,6 +1179,7 @@ Main repo:
 | `scripts/high_margin_gate.py` | **§16.1 new** — the 35B state gate. `--capture` builds a margin-annotated reference from an HF model; `--check` teacher-forces an MLC lib against it and scores only where the reference had margin. `--negative-control stale1` proves it is not vacuous |
 | `scripts/gdn_recurrence_probe.cu` | **§16.2 new** — standalone CUDA probe, four variants of the GDN recurrence (base / acc4 / ksplit2 / ksplit4). No model, no TVM. **§16.5** added a header warning: its `grid(n_kh, batch)` is the 0.8B's geometry, and quoting its ratios against the 35B over-predicts by 2.3× |
 | `scripts/gdn_kernel_bench.py` | **§16.5 new** — the GDN recurrence A/B on the kernels MLC actually compiles: real grid (`n_vh` blocks, so 32 on the 35B), ring flush included, `k_split` 1/2/4/8 × seq_len. `--trace-share` prints an Amdahl bound. Timing goes through `mod.mod.time_evaluator`, **not** `Executable.time_evaluator`, which does not exist. **§16.6** `--v-blocks` crosses the `v_block` axis with `--k-splits`; header warns to run only one instance at a time and to check with `pgrep -af`, not `ps -C python` |
+| `scripts/moe_gemm_check.py` | **§16.10 new** — the numerical gate for `dequantize_group_gemm_v2`. Builds the kernel twice in one process (`MLC_MOE_GEMM_V2_SKIPPAD` off/on) and requires **`np.array_equal`**, not a tolerance, on the §16.6 `vb_exact` precedent. Sweeps even / uniform-random routing and `B=777`, which is a multiple of neither `BLK_M` nor `Ne` and is the case a wrong guard breaks |
 | `scripts/prefix_cache_roundtrip.py` | **§16.1** — prompt families replaced with the high-margin set; `--legacy-prompts` reproduces §13's numbers. **Propagate any new flag to the subprocess `common` list** — the two phases run as separate processes and mismatched sets fail everything |
 | `bench_moe_kernel.py` | **§16.3/§16.4** — K-sweep at fixed N and N-sweep at fixed K, plus achieved-bandwidth reporting against the 156 GB/s wall. ⚠️ it reuses one weight tensor, so absolute numbers are L2-inflated for small kernels (§16.3); A/Bs at a fixed shape are fine. **§16.8** added the prefill-scale sweep (`{gate_up,down}_b512…b8192`), FLOP reporting against both the tensor and CUDA-core ceilings, `v2_grid()` (replays v2's dispatch table to count real vs padding CTAs), and `spread="random"` routing. Two fixes went with it: the active-expert count is now taken from the indptr instead of assumed to be `top_k`, which understated prefill traffic by 32×, and the indptr is drawn **once** and shared by the timed call and the accounting — two draws under random routing would report a different routing than the one measured |
 | `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§16.4** — the batch-1 MoE comment now carries the measurement (51×, not ~6×) and points at option (d) |
@@ -3045,3 +3047,84 @@ a literal `16`, so the moment the A/B knob existed it reported CTA counts for a 
 not launching (4096 CTAs at every BLK_M). It now reads the same env var the kernel does. The first
 BLK_M table produced this way was wrong in its CTA and µs/CTA columns and was re-measured; the
 medians were unaffected.
+
+### 16.10 Item 0f built — the guard is a loop extent, not a branch, and it is bit-exact
+
+The early exit exists, behind `MLC_MOE_GEMM_V2_SKIPPAD=1`, **default `0` pending the end-to-end
+numbers**. It is bit-exact on every shape and routing tested and worth **1.28×–1.73× on the kernel**.
+
+#### Two refusals, and the formulation that gets past both
+
+§16.9 recorded the first: a source-level `if e_v >= 0:` dies in `sch.compute_at`. Applying the guard
+*after* `_schedule_v2()` — the fix §16.9 recommended — gets further and then hits a second, more
+interesting refusal. The mutation applies cleanly, lowering starts, and:
+
+```
+src/s_tir/transform/thread_storage_sync.cc:119
+  Check failed: condition_counter() == 0 (1 vs. 0) : Cannot insert syncs inside condition
+```
+
+The cooperative loads carry `__syncthreads()`, and `ThreadSync` will not place a barrier inside an
+`IfThenElse` — a correct rule in general, since a divergent barrier hangs, and unnecessary here
+because `te[bx]` is CTA-uniform. The pass has no way to know that, and there is no annotation for it.
+
+**So the guard is not a conditional at all.** The `k_o_o` reduction loop's extent is rewritten from
+`K / BLK_K` to `Select(e_v >= 0, K / BLK_K, 0)`. A padding CTA runs it zero times. There is no
+`IfThenElse`, so `ThreadSync` is satisfied; the extent is CTA-uniform, so every thread agrees on the
+trip count and the barriers inside are either all taken or all skipped. The rewrite is ~40 lines in
+`_guard_padding_ctas()`, and it asserts that exactly one serial loop of that extent exists — if the
+schedule ever grows a second, it fails loudly instead of silently halving the win.
+
+Node classes are `tvm.tirx` (§16.9); `tvm.tirx.stmt_functor.ir_transform` plus `post_order_visit` to
+pick up the `e_v` Bind is the whole API surface needed.
+
+#### Bit-exact, on the bar §16.6 set
+
+`scripts/moe_gemm_check.py` builds the kernel twice in one process and requires `np.array_equal` —
+**not** a tolerance. The claim is that padding CTAs never produced anything observable, so anything
+but exact equality means a live tile was skipped.
+
+| shape | B | routing | exact | before → after | |
+|---|---:|---|---|---:|---:|
+| `gate_up` | 8 | even | ✅ | — | |
+| `gate_up` | 4096 | even | ✅ | 7.341 → 4.234 ms | **1.73×** |
+| `gate_up` | 4096 | random | ✅ | 7.382 → 5.516 ms | **1.34×** |
+| `gate_up` | 777 | random | ✅ | — | |
+| `down` | 8 | even | ✅ | — | |
+| `down` | 4096 | even | ✅ | 3.210 → 1.924 ms | **1.67×** |
+| `down` | 4096 | random | ✅ | 3.245 → 2.530 ms | **1.28×** |
+| `down` | 777 | random | ✅ | — | |
+
+`B=777` is in there because it is a multiple of neither `BLK_M` nor `Ne`: tiles are partially filled
+and the store predicate is doing real work on most experts' last tile. That is the case a wrong guard
+would break, and it is exact.
+
+#### A skipped CTA costs 20% of a full one, not 0
+
+§16.8 predicted 1.93× / 1.35× for a *free* exit. The random-routing results land almost exactly there
+(1.34 measured vs 1.35 predicted; 1.28 vs 1.34) but the even-spread ones fall short (1.73 vs 1.93).
+Solving the two-cost model on the new points explains it — one consistent residual across both
+shapes:
+
+| | c_real after | c_skip | c_skip / c_pad before |
+|---|---:|---:|---:|
+| `gate_up` | 1.713 µs | 0.355 µs | **20.5%** |
+| `down` | 0.395 µs | 0.074 µs | **19.8%** |
+
+A skipped CTA still fills its accumulator, still stores it to `O_tile`, and still runs the
+predicated-off `O_tile → global` store loop; only the k-loop disappears. 80% of the padding cost is
+gone, not 100%, and the shortfall shows up most where padding is most of the grid. **Recovering the
+last 20% means zeroing those trailing loops too**, which is the same trick on loops of extent 1 and 2
+— extents that are not unique in this kernel, so it needs a targeted match rather than the
+extent-equality search used here. Worth ~7% more on the pair; not done.
+
+#### End-to-end: estimated, not yet measured
+
+Pair at B=4096: **10.63 → 8.05 ms (1.32×) under uniform-random routing**, 10.55 → 6.16 ms (1.71×)
+under even spread. Amdahl at §16.7's 52.5% of pp512 gives **+14.6% to +28.0% prefill**.
+
+⚠️ **Both of those are projections from a microbench, and the default stays `0` until pp512 is
+actually measured.** That is the whole failure mode §9's traps list is about. The remaining work is:
+rebuild the 35B lib with `MLC_MOE_GEMM_V2_SKIPPAD=1`, A/B pp512, and run the state gate — which
+**cannot** change (the kernel is bit-exact, so the gate is a regression check on the plumbing, not a
+judgement on the arithmetic). Flip the default on those numbers, not on these.
