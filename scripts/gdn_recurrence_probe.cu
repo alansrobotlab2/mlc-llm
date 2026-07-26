@@ -34,6 +34,14 @@
 // would blend a bandwidth term into a latency measurement. A speedup seen here is an
 // upper bound on what the shipped kernel would gain.
 //
+// ⚠️ THE GRID HERE IS THE 0.8B's, NOT THE 35B's — do not quote these ratios against a 35B
+// number. `grid(n_kh, batch)` below launches 16 blocks, but the real kernel binds
+// blockIdx.x to `num_value_heads`: 16 on the 0.8B (so this is faithful) and **32 on the
+// 35B**, where `base` therefore fits 2 blocks/SM and starts at 8 warps/SM instead of 4.
+// Measured in TIR at the real geometry (workplan §16.5), ksplit4 is 1.94x on the 0.8B and
+// only 1.21x on the 35B at seq_len=512, and ksplit2 is a 0.96x REGRESSION on the 35B. Use
+// `scripts/gdn_kernel_bench.py` for anything that has to be true of a shipped kernel.
+//
 //   nvcc -arch=sm_87 -O3 -o gdn_probe scripts/gdn_recurrence_probe.cu && ./gdn_probe
 //
 // Prints per-variant ms and the implied speedup. Correctness against `base` is checked

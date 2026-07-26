@@ -1175,6 +1175,281 @@ def create_gated_delta_net_func_with_history_inplace(
     return gdn_func_history_inplace
 
 
+def _gdn_k_split() -> int:
+    """Read `MLC_QWEN35_GDN_KSPLIT` — the lane-split width for the history recurrence.
+
+    `4` is the default: measured **0.8B pp512 3912 → 4888 tps (+25.0%)** with decode neutral to
+    0.04%, and 361/361 on the high-margin state gate under both prefix-cache modes (§16.5).
+    `1` selects `create_gated_delta_net_func_with_history_inplace`, the bit-exact kernel §15
+    landed, which is the A/B baseline and the fallback if the re-associated reduction ever
+    needs to be ruled out. `2` is **slower than 1 on the 35B** — see the split kernel's
+    docstring for why. Kept as an environment toggle rather than a config field for the same
+    reason as `MLC_QWEN35_INPLACE_STATE`: an A/B has to be buildable from an unmodified
+    checkout.
+    """
+    raw = os.environ.get("MLC_QWEN35_GDN_KSPLIT", "4")
+    try:
+        k_split = int(raw)
+    except ValueError as err:
+        raise ValueError(f"MLC_QWEN35_GDN_KSPLIT must be an integer, got {raw!r}") from err
+    if k_split not in (1, 2, 4, 8):
+        raise ValueError(f"MLC_QWEN35_GDN_KSPLIT must be one of 1/2/4/8, got {k_split}")
+    return k_split
+
+
+def create_gated_delta_net_func_with_history_inplace_ksplit(
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    dtype: str,
+    k_split: int = 4,
+):
+    """The history recurrence with the `K` reduction split across `k_split` lanes.
+
+    Same arithmetic and the same ring addressing as
+    `create_gated_delta_net_func_with_history_inplace` — read that docstring first; every
+    claim it makes about the skip guard, the read-before-write ordering and per-element
+    ownership carries over unchanged. Only the *reduction order* differs, and that is the
+    whole point.
+
+    **Why.** §15.6 traced `gdn_func_history_inplace` at **95.6 ms against 19.3 ms for the
+    next kernel** on the **0.8B** pp512 path, running at **202 GFLOP/s — 3.8% of sm_87 fp32
+    peak**. §16.2 disassembled it and found three causes:
+
+      1. `float state_local[128]` is 512 B/thread. ptxas lands on the **255-register
+         ceiling** and still spills — `192 B stack frame, 192 B spill stores, 192 B spill
+         loads` on the kernel this file emits, ~47 of the 128 rows. Both inner loops touch
+         all 128 rows every position, so those rows are reloaded and restored **per
+         timestep**. It is L1/L2 traffic, which is why §15's DRAM-only bandwidth analysis
+         concluded there was nothing left to reclaim.
+      2. Each dot is **one serial FMA chain**: §16.2 found 115 consecutive
+         `FFMA R124, R125, R###, R124` into a single accumulator, ~4 cycles apiece.
+      3. The grid is `(num_value_heads, batch)` — **16 blocks at batch=1 on the 0.8B**, on a
+         16-SM GPU, so 1 block/SM = 4 warps of the 48 an SM holds (8.3%) and there is nothing
+         to interleave against the chain. Note that this is *grid*-bound, not register-bound:
+         255 registers at 128 threads still permits 2 blocks/SM. **On the 35B `n_vh = 32`, so
+         the grid is 32 blocks and that second block/SM is actually available** — which is why
+         the two models respond differently below.
+
+    Splitting `K` across **lanes** attacks all three at once — `K/k_split` floats per thread
+    gets the state off the register ceiling, the chain shortens by the same factor, and the
+    block widens to `V * k_split` threads. §15's proposal to split across **blocks** cannot
+    be built: `K` is reduced *inside* a thread, so a block split needs a global barrier per
+    position, which is fatal for a sequential recurrence.
+
+    **Layout.** `tid = col * k_split + part`, so the `k_split` lanes that share a value
+    column `col` are **adjacent** and warp-aligned (`k_split` divides 32). The cross-lane sum
+    is therefore a butterfly of `log2(k_split)` `__shfl_sync`s over lane `^ d` with **no
+    `__syncthreads` anywhere** — the reduction never leaves the warp. Both dots need to be
+    *all*-reduced rather than reduced-to-one, because every lane needs `coef` to advance its
+    own slice of the state.
+
+    The ring scatter partitions the same way: `part` owns rows `[part*K/k_split,
+    (part+1)*K/k_split)` of column `col`, so the write sets stay disjoint across threads and
+    the union is still exactly the rows the unsplit kernel wrote.
+
+    **Measured.** Static resources from `ptxas -v` on the emitted kernel; `blocks/SM` is
+    `65536 / (threads * registers)` on sm_87. Speedups from
+    [gdn_kernel_bench.py](scripts/gdn_kernel_bench.py) at `seq_len=512`, Orin, clocks pinned:
+
+    | k_split | threads | floats/thread | registers | spill | blocks/SM | 0.8B × | 35B × |
+    |---:|---:|---:|---:|---:|---:|---:|---:|
+    | 1 (§15's kernel) | 128 | 128 | 255 | **192 B** | 2 | 1.00 | 1.00 |
+    | 2 | 256 | 64 | 171 | 0 | 1 | 1.45 | **0.96** |
+    | 4 (default) | 512 | 32 | 117 | 0 | 1 | **1.94** | **1.21** |
+    | 8 | 1024 | 16 | **62** | 0 | 1 | 1.82 | 1.15 |
+
+    ⚠️ **The two models do not behave the same, and `k_split=2` is a regression on the 35B.**
+    The grid is `(num_value_heads, batch)`: 16 blocks on the 0.8B, **32 on the 35B**. At 16
+    blocks on 16 SMs the unsplit kernel is grid-bound to 1 block/SM = 4 warps, so every
+    doubling of `k_split` doubles occupancy. At 32 blocks it already fits 2 blocks/SM = 8
+    warps in one wave, so `k_split=2` buys the *same* 8 warps in two waves and pays a shuffle
+    per dot on top. `k_split=4` is the first width that raises the 35B's occupancy at all.
+    See §16.5 — this is also why §16.2's probe, which hardcodes a 16-block grid, over-predicts
+    the 35B by 2.3×.
+
+    `8` wins at `seq_len=2048` on both models (2.29× / 1.37×) and loses at 128 and 512, so the
+    default is tuned for the benchmarked pp512 rather than for the 2048 chunk ceiling.
+
+    ⚠️ **The bit-exact bar does not apply to this kernel, by construction.** The fp32
+    `K`-reduction is re-associated, so neither the output nor the ring content can be
+    bit-identical to the copy path — `gdn_kernel_check.py --k-split` swaps checks 1 and 2 to
+    relative tolerances against the copy path and keeps the fp64 check and the
+    untouched-slots check as the real bars. "Untouched slots must be byte-clean" is
+    unaffected by reduction order and stays exact, which is what still catches a ring
+    misindex.
+
+    ⚠️ **`k_split` must divide 32** so a reduction group never straddles a warp, and
+    `V * k_split` must fit a block (`V=128` caps it at 8).
+    """
+    heads_per_group = num_value_heads // num_key_heads
+    K = key_head_dim
+    V = value_head_dim
+
+    if k_split not in (2, 4, 8):
+        # Must divide 32 so a reduction group never straddles a warp boundary.
+        raise ValueError(f"k_split must be 2, 4 or 8, got {k_split}")
+    if K % (2 * k_split):
+        # 2 because each lane keeps two accumulators; see the unrolled dot loops below.
+        raise ValueError(f"key_head_dim {K} must be divisible by 2 * k_split ({2 * k_split})")
+    threads = V * k_split
+    if threads > 1024:
+        raise ValueError(f"value_head_dim {V} x k_split {k_split} = {threads} threads > 1024")
+
+    K_LOCAL = K // k_split
+
+    @T.prim_func
+    def gdn_func_history_inplace_ksplit(
+        q_handle: T.handle,
+        k_handle: T.handle,
+        v_handle: T.handle,
+        gate_handle: T.handle,  # exp(g), already exponentiated
+        beta_handle: T.handle,  # sigmoid(beta_raw)
+        storage_handle: T.handle,  # the whole (max_batch, max_hist, H, K, V) state buffer
+        seq_slot_handle: T.handle,  # device-side per-batch seq slot ids
+        hist_slot_handle: T.handle,  # device-side per-batch history slot ids
+        out_handle: T.handle,
+    ):
+        T.func_attr({"op_pattern": 8, "tirx.noalias": True, "tirx.is_scheduled": 1})
+        batch_size, seq_len = T.int64(), T.int64()
+        max_batch_size, max_history = T.int64(), T.int64()
+        q_buf = T.match_buffer(q_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        k_buf = T.match_buffer(k_handle, (batch_size, seq_len, num_key_heads, K), dtype=dtype)
+        v_buf = T.match_buffer(v_handle, (batch_size, seq_len, num_value_heads, V), dtype=dtype)
+        gate_buf = T.match_buffer(
+            gate_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        beta_buf = T.match_buffer(
+            beta_handle, (batch_size, seq_len, num_value_heads), dtype="float32"
+        )
+        storage_buf = T.match_buffer(
+            storage_handle,
+            (max_batch_size, max_history, num_value_heads, K, V),
+            dtype="float32",
+        )
+        seq_slot_buf = T.match_buffer(seq_slot_handle, (batch_size,), dtype="int32")
+        hist_slot_buf = T.match_buffer(hist_slot_handle, (batch_size,), dtype="int32")
+        out_buf = T.match_buffer(
+            out_handle, (batch_size, seq_len, num_value_heads, V), dtype="float32"
+        )
+
+        scale = T.float32(1.0 / math.sqrt(K))
+
+        for b_idx in T.thread_binding(batch_size, thread="blockIdx.y"):
+            for h_idx in T.thread_binding(num_value_heads, thread="blockIdx.x"):
+                for tid in T.thread_binding(threads, thread="threadIdx.x"):
+                    with T.sblock("gdn_history_inplace_ksplit_thread"):
+                        # Two accumulators per dot, mirroring the probe: at K_LOCAL=32 a
+                        # single one is still a 32-deep chain, and nvcc will not
+                        # re-associate fp32 for us.
+                        state_local = T.sblock_alloc_buffer((K_LOCAL,), "float32", scope="local")
+                        acc_sk = T.sblock_alloc_buffer((2,), "float32", scope="local")
+                        acc_sq = T.sblock_alloc_buffer((2,), "float32", scope="local")
+                        dot_sk = T.sblock_alloc_buffer((1,), "float32", scope="local")
+                        dot_sq = T.sblock_alloc_buffer((1,), "float32", scope="local")
+
+                        kh = h_idx // heads_per_group
+
+                        # `tid = col * k_split + part`: adjacent lanes share a value column,
+                        # so the butterfly below stays inside one warp.
+                        col = tid // k_split
+                        part = tid % k_split
+                        row0 = part * K_LOCAL
+                        lane = tid % 32
+
+                        seq_id: T.int64 = T.cast(seq_slot_buf[b_idx], "int64")
+                        hist_in: T.int64 = T.cast(hist_slot_buf[b_idx], "int64")
+
+                        # As in the unsplit kernel, these are the only reads of storage and
+                        # they all precede every write, which is what makes a wrapping flush
+                        # safe without staging.
+                        for row in range(K_LOCAL):
+                            state_local[row] = storage_buf[seq_id, hist_in, h_idx, row0 + row, col]
+
+                        for t in range(seq_len):
+                            gate_val = gate_buf[b_idx, t, h_idx]
+                            beta_val = beta_buf[b_idx, t, h_idx]
+                            v_val = T.cast(v_buf[b_idx, t, h_idx, col], "float32")
+
+                            # Pass 1: decay + this lane's slice of dot(S, k)
+                            acc_sk[0] = T.float32(0)
+                            acc_sk[1] = T.float32(0)
+                            for row2 in range(K_LOCAL // 2):
+                                state_local[row2 * 2] = state_local[row2 * 2] * gate_val
+                                acc_sk[0] = acc_sk[0] + state_local[row2 * 2] * T.cast(
+                                    k_buf[b_idx, t, kh, row0 + row2 * 2], "float32"
+                                )
+                                state_local[row2 * 2 + 1] = state_local[row2 * 2 + 1] * gate_val
+                                acc_sk[1] = acc_sk[1] + state_local[row2 * 2 + 1] * T.cast(
+                                    k_buf[b_idx, t, kh, row0 + row2 * 2 + 1], "float32"
+                                )
+
+                            # Butterfly all-reduce across the k_split lanes. Every lane needs
+                            # the total, because every lane advances its own state slice with
+                            # `coef` — so xor-reduce, not reduce-to-one.
+                            dot_sk[0] = acc_sk[0] + acc_sk[1]
+                            dot_sk[0] = dot_sk[0] + T.tvm_warp_shuffle(
+                                T.uint32(0xFFFFFFFF), dot_sk[0], T.bitwise_xor(lane, 1), 32, 32
+                            )
+                            if k_split >= 4:
+                                dot_sk[0] = dot_sk[0] + T.tvm_warp_shuffle(
+                                    T.uint32(0xFFFFFFFF), dot_sk[0], T.bitwise_xor(lane, 2), 32, 32
+                                )
+                            if k_split >= 8:
+                                dot_sk[0] = dot_sk[0] + T.tvm_warp_shuffle(
+                                    T.uint32(0xFFFFFFFF), dot_sk[0], T.bitwise_xor(lane, 4), 32, 32
+                                )
+
+                            # Pass 2: delta + this lane's slice of dot(S', q)
+                            coef = beta_val * (v_val - dot_sk[0])
+                            acc_sq[0] = T.float32(0)
+                            acc_sq[1] = T.float32(0)
+                            for row2 in range(K_LOCAL // 2):
+                                state_local[row2 * 2] = state_local[row2 * 2] + T.cast(
+                                    k_buf[b_idx, t, kh, row0 + row2 * 2], "float32"
+                                ) * coef
+                                acc_sq[0] = acc_sq[0] + state_local[row2 * 2] * T.cast(
+                                    q_buf[b_idx, t, kh, row0 + row2 * 2], "float32"
+                                )
+                                state_local[row2 * 2 + 1] = state_local[row2 * 2 + 1] + T.cast(
+                                    k_buf[b_idx, t, kh, row0 + row2 * 2 + 1], "float32"
+                                ) * coef
+                                acc_sq[1] = acc_sq[1] + state_local[row2 * 2 + 1] * T.cast(
+                                    q_buf[b_idx, t, kh, row0 + row2 * 2 + 1], "float32"
+                                )
+
+                            dot_sq[0] = acc_sq[0] + acc_sq[1]
+                            dot_sq[0] = dot_sq[0] + T.tvm_warp_shuffle(
+                                T.uint32(0xFFFFFFFF), dot_sq[0], T.bitwise_xor(lane, 1), 32, 32
+                            )
+                            if k_split >= 4:
+                                dot_sq[0] = dot_sq[0] + T.tvm_warp_shuffle(
+                                    T.uint32(0xFFFFFFFF), dot_sq[0], T.bitwise_xor(lane, 2), 32, 32
+                                )
+                            if k_split >= 8:
+                                dot_sq[0] = dot_sq[0] + T.tvm_warp_shuffle(
+                                    T.uint32(0xFFFFFFFF), dot_sq[0], T.bitwise_xor(lane, 4), 32, 32
+                                )
+
+                            # One writer per output element; the rest of the group already
+                            # consumed the reduction above.
+                            if part == 0:
+                                out_buf[b_idx, t, h_idx, col] = dot_sq[0] * scale
+
+                            # Scatter the post-`t` state into the ring, skipping the positions
+                            # a later `t` provably overwrites. Each `part` writes only its own
+                            # `K_LOCAL` rows, so the union is the unsplit kernel's write set.
+                            if t + max_history >= seq_len:
+                                hist_out: T.int64 = (hist_in + T.int64(1) + t) % max_history
+                                for row in range(K_LOCAL):
+                                    storage_buf[seq_id, hist_out, h_idx, row0 + row, col] = (
+                                        state_local[row]
+                                    )
+
+    return gdn_func_history_inplace_ksplit
+
+
 # ============================================================================
 # GatedDeltaNet Linear Attention Layer
 # ============================================================================
@@ -1529,14 +1804,30 @@ class Qwen35GatedDeltaNet(nn.Module):
             args = [q, k, v, gate, beta, storage, state_io.seq_slot_ids, state_io.history_slot_ids]
             # Identity, not `.index()` — see the recurrent call site in `forward`.
             storage_idx = next(i for i, a in enumerate(args) if a is storage)
-            out_recurrent, _ = op.tensor_ir_inplace_op(
+            # `MLC_QWEN35_GDN_KSPLIT` picks the lane-split reduction (§16.2). Same
+            # arithmetic, re-associated across lanes, so it is not bit-exact with the
+            # k_split=1 kernel — see that function's docstring.
+            k_split = _gdn_k_split()
+            gdn_history_func = (
                 create_gated_delta_net_func_with_history_inplace(
                     num_key_heads=n_kh,
                     num_value_heads=n_vh,
                     key_head_dim=K,
                     value_head_dim=V,
                     dtype=self.dtype,
-                ),
+                )
+                if k_split == 1
+                else create_gated_delta_net_func_with_history_inplace_ksplit(
+                    num_key_heads=n_kh,
+                    num_value_heads=n_vh,
+                    key_head_dim=K,
+                    value_head_dim=V,
+                    dtype=self.dtype,
+                    k_split=k_split,
+                )
+            )
+            out_recurrent, _ = op.tensor_ir_inplace_op(
+                gdn_history_func,
                 "gated_delta_net_with_history_inplace",
                 args,
                 # Output 0 is the recurrent output; output 1 aliases the storage argument,

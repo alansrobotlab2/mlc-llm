@@ -27,6 +27,15 @@ A fourth, looser check runs the recurrence in fp64 from the mathematical definit
 the gate still has teeth if the copy-path kernel is itself wrong. Only that one gets a
 tolerance.
 
+`--k-split N` gates `create_gated_delta_net_func_with_history_inplace_ksplit` instead, and
+it **cannot be held to checks 1 and 2 as written**: that kernel re-associates the fp32 `K`
+reduction across N lanes by design (workplan §16.5), so neither the output nor the ring can
+be bit-identical to a kernel that sums in a different order. Under `--k-split` those two
+become relative-tolerance checks and the fp64 check becomes the primary bar. Check 3 is
+untouched -- reduction order cannot move a write into the wrong slot, so "every other slot
+byte-clean" stays exact and remains what catches a ring misindex. The decode kernel has no
+split variant, so its section keeps the exact bars either way.
+
 The interesting shapes are `seq_len > max_history`: a real prefill chunk is 512-2048
 positions against 64 ring slots, so the flush wraps and slot `hist_slot` -- the one the
 recurrence loaded its state from -- is itself overwritten mid-kernel.
@@ -36,6 +45,7 @@ Runs in seconds on any CUDA device. No model, no weights, no engine.
 from __future__ import annotations
 
 import argparse
+import functools
 
 import numpy as np
 import tvm
@@ -44,6 +54,7 @@ from mlc_llm.model.qwen35.qwen35_model import (
     create_gated_delta_net_func_inplace,
     create_gated_delta_net_func_with_history,
     create_gated_delta_net_func_with_history_inplace,
+    create_gated_delta_net_func_with_history_inplace_ksplit,
 )
 
 # (num_key_heads, num_value_heads, label). Head dims are 128 on both models; the 35B
@@ -99,19 +110,33 @@ def reference_fp64(q, k, v, gate, beta, state_in, n_kh, n_vh, K, V):
     return out
 
 
-def _compile(func):
+@functools.lru_cache(maxsize=None)
+def _compiled(kind, n_kh, n_vh, k_split):
+    """Compile once per (kind, head config, k_split) — NOT per seq_len.
+
+    `seq_len` is a runtime dimension, so the emitted code is identical across the sweep and
+    the default 9 lengths would otherwise pay for the same nvcc invocation nine times. That
+    is not a rounding error on the split kernels: ptxas spends 30-40 s apiece on them
+    (against 2-4 s unsplit) fitting the state into registers with zero spill under a
+    512- or 1024-thread launch bound, which is a 12-minute gate rather than a 2-minute one.
+    """
+    common = dict(num_key_heads=n_kh, num_value_heads=n_vh, key_head_dim=HEAD_DIM,
+                  value_head_dim=HEAD_DIM, dtype="float16")
+    if kind == "copy":
+        func = create_gated_delta_net_func_with_history(**common)
+    elif kind == "decode":
+        func = create_gated_delta_net_func_inplace(**common)
+    elif k_split == 1:
+        func = create_gated_delta_net_func_with_history_inplace(**common)
+    else:
+        func = create_gated_delta_net_func_with_history_inplace_ksplit(k_split=k_split, **common)
     return tvm.compile(tvm.IRModule({"main": func}), target="cuda")
 
 
 def _copy_path(q, k, v, gate, beta, state_in, n_kh, n_vh, K, V, dev):
     """Run the shipped `gdn_func_history` kernel — the trusted reference for check 1."""
     batch, seq_len = q.shape[0], q.shape[1]
-    mod = _compile(
-        create_gated_delta_net_func_with_history(
-            num_key_heads=n_kh, num_value_heads=n_vh, key_head_dim=K,
-            value_head_dim=V, dtype="float16",
-        )
-    )
+    mod = _compiled("copy", n_kh, n_vh, 1)
     out = np.zeros((batch, seq_len, n_vh, V), np.float32)
     hist = np.zeros((batch, seq_len, n_vh, K, V), np.float32)
     args = [tvm.runtime.tensor(x, dev)
@@ -126,20 +151,24 @@ def _verdict(got_storage, ref_storage, written, batch, max_hist):
 
     Reported separately on purpose: a single "storage differs" number would let a
     ring-addressing bug hide behind a legitimate write.
+
+    Also returns the magnitude of the reference over the written slots, so a caller that
+    cannot demand bit-exactness (`--k-split`) has something to normalize against.
     """
-    state_err, clobber = 0.0, 0.0
+    state_err, clobber, state_scale = 0.0, 0.0, 0.0
     for si in range(batch):
         for h in range(max_hist):
-            d = float(np.abs(got_storage[si, h].astype(np.float64)
-                             - ref_storage[si, h].astype(np.float64)).max())
+            ref = ref_storage[si, h].astype(np.float64)
+            d = float(np.abs(got_storage[si, h].astype(np.float64) - ref).max())
             if (si, h) in written:
                 state_err = max(state_err, d)
+                state_scale = max(state_scale, float(np.abs(ref).max()))
             else:
                 clobber = max(clobber, d)
-    return state_err, clobber
+    return state_err, clobber, max(state_scale, 1e-6)
 
 
-def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history):
+def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history, k_split=1):
     K = V = HEAD_DIM
     rng = np.random.default_rng(seed)
     dev = tvm.cuda(0)
@@ -153,10 +182,8 @@ def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history)
     ref_out, ref_hist = _copy_path(q, k, v, gate, beta, state_in, n_kh, n_vh, K, V, dev)
     fp64_out = reference_fp64(q, k, v, gate, beta, state_in, n_kh, n_vh, K, V)
 
-    maker = (create_gated_delta_net_func_with_history_inplace if history
-             else create_gated_delta_net_func_inplace)
-    mod = _compile(maker(num_key_heads=n_kh, num_value_heads=n_vh,
-                         key_head_dim=K, value_head_dim=V, dtype="float16"))
+    # The decode kernel has no split variant; it only ever sees seq_len 1.
+    mod = _compiled("history" if history else "decode", n_kh, n_vh, k_split)
     out = np.zeros((batch, seq_len, n_vh, V), np.float32)
     args = [tvm.runtime.tensor(x, dev)
             for x in (q, k, v, gate, beta, storage, seq_slot, hist_slot, out)]
@@ -182,10 +209,15 @@ def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history)
             written.add((int(seq_slot[bi]), slot))
 
     scale = max(float(np.abs(ref_out).max()), 1e-6)
-    bitexact = float(np.abs(got_out.astype(np.float64) - ref_out.astype(np.float64)).max())
+    out_diff = float(np.abs(got_out.astype(np.float64) - ref_out.astype(np.float64)).max())
     fp64_rel = float(np.abs(got_out.astype(np.float64) - fp64_out).max()) / scale
-    state_err, clobber = _verdict(got_storage, expected, written, batch, max_hist)
-    return bitexact, fp64_rel, state_err, clobber
+    state_err, clobber, state_scale = _verdict(got_storage, expected, written, batch, max_hist)
+    if k_split > 1:
+        # Re-associated reduction: normalize both copy-path comparisons instead of
+        # demanding 0. `clobber` is deliberately left absolute.
+        out_diff /= scale
+        state_err /= state_scale
+    return out_diff, fp64_rel, state_err, clobber
 
 
 def main() -> None:
@@ -196,15 +228,26 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--seq-lens", type=str, default="",
                     help="comma-separated override for the default sweep")
+    ap.add_argument("--k-split", type=int, default=1, choices=(1, 2, 4, 8),
+                    help="gate the lane-split history kernel (§16.5); >1 drops the "
+                         "bit-exact bar on output and ring, see the module docstring")
     args = ap.parse_args()
 
     seq_lens = ([int(s) for s in args.seq_lens.split(",")] if args.seq_lens else SEQ_LENS)
-    print(f"batch={args.batch} max_history={args.max_history} hist_slot={args.hist_slot}")
-    print("out_bit / state_err must be exactly 0; fp64_rel is the only tolerance.\n")
+    print(f"batch={args.batch} max_history={args.max_history} hist_slot={args.hist_slot} "
+          f"k_split={args.k_split}")
+    if args.k_split == 1:
+        print("out_bit / state_err must be exactly 0; fp64_rel is the only tolerance.\n")
+    else:
+        print(f"k_split={args.k_split} re-associates the K reduction, so on the history path "
+              f"out_bit/state_err\nare RELATIVE (bar {REL_TOL:.0e}) and fp64_rel is the primary "
+              "check. other_slots stays exact.\n")
     bad = 0
     for label, history in (("decode (state_id=0, single ring advance)", False),
                            ("history path (per-position scatter, radix default)", True)):
         print(f"{label}:")
+        # Only the history kernel has a split variant; decode keeps the exact bars.
+        k_split = args.k_split if history else 1
         for n_kh, n_vh, name in HEAD_CONFIGS:
             for seq_len in seq_lens:
                 if not history and seq_len != 1:
@@ -212,8 +255,11 @@ def main() -> None:
                 be, rel, se, cl = run_shape(n_kh, n_vh, seq_len, args.batch,
                                             args.max_history,
                                             args.hist_slot % args.max_history,
-                                            args.seed, history)
-                fail = be != 0.0 or se != 0.0 or cl != 0.0 or rel > REL_TOL
+                                            args.seed, history, k_split)
+                if k_split == 1:
+                    fail = be != 0.0 or se != 0.0 or cl != 0.0 or rel > REL_TOL
+                else:
+                    fail = cl != 0.0 or rel > REL_TOL or be > REL_TOL or se > REL_TOL
                 bad += fail
                 wrap = " WRAP" if history and seq_len > args.max_history else ""
                 print(f"  {name:<8} n_vh={n_vh:3d} seq_len={seq_len:4d}  "
@@ -222,7 +268,11 @@ def main() -> None:
         print()
     if bad:
         raise SystemExit(f"{bad} shape(s) FAILED")
-    print("ALL SHAPES PASS — output bit-exact vs the copy path, ring bit-exact, slots clean")
+    if args.k_split == 1:
+        print("ALL SHAPES PASS — output bit-exact vs the copy path, ring bit-exact, slots clean")
+    else:
+        print(f"ALL SHAPES PASS — k_split={args.k_split} within {REL_TOL:.0e} of the copy path "
+              "and of fp64, slots byte-clean")
 
 
 if __name__ == "__main__":

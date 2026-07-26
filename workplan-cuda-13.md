@@ -3,19 +3,28 @@
 **Sessions:** 2026-07-24 (Stage 0/1), 2026-07-25a (kernel attribution, re-scope, options 1 and 2
 landed, concurrent serving fixed), 2026-07-25b (conv-state fusion, §9 item 3 refuted, everything
 committed), 2026-07-25c (history-path conv fusion — §14), 2026-07-25d (history-path *recurrent*
-fusion — §15)
-**Status:** **35B-A3B tg512 54.13 → 60.20 (+11.2%)** from four landed changes: the GDN
+fusion — §15), 2026-07-26a (the 35B state gate, items 1 and 5 refuted by measurement — §16.1–§16.4),
+2026-07-26b (the lane-split recurrence built, measured and gated — §16.5)
+**Status:** **35B-A3B tg512 54.13 → 60.00 (+10.8%)** from four landed changes: the GDN
 input-projection merge (§10), the in-place recurrent state (§11), concurrent serving on hybrid
-models (§12), and the in-place conv state (§13). **Prefill on the *default* `prefix_cache_mode=radix`
-was never measured until 2026-07-25c, and it was getting barely half the headline number** — §14
-and §15 close that gap almost completely:
+models (§12), and the in-place conv state (§13). Everything since — §14, §15 and §16.5 — is on the
+**prefill** path and leaves decode where it is. **Prefill on the *default* `prefix_cache_mode=radix`
+was never measured until 2026-07-25c, and it was getting barely half the headline number** — §14,
+§15 and §16.5 close that gap and then some:
 
-| pp512, `radix` (the default) | start of 2026-07-25c | now | vs `disable` |
+| pp512, `radix` (the default) | start of 2026-07-25c | after §15 | **now (§16.5)** |
 |---|---:|---:|---:|
-| 35B-A3B | 355 | **629 (+77%)** | 646 — **1.03×** |
-| 0.8B | 1469 | **3934 (+168%)** | 4070 — **1.04×** |
+| 35B-A3B | 355 | 628 | **642 (+81% overall, +2.3% from §16.5)** |
+| 0.8B | 1469 | 3912 | **4888 (+233% overall, +25.0% from §16.5)** |
 
-**Everything through §14 is committed; §15 is not yet — see §9.** **Next session: start at §9.**
+§16.5 is the lane-split GDN recurrence; decode is neutral on both models (≤0.1%). The two models
+differ by 10× on it because the kernel's grid is `(num_value_heads, batch)` — 16 blocks on the 0.8B,
+32 on the 35B — so only the 0.8B was ever grid-starved. **This is the standing trap for anything
+that tunes this kernel: a ratio measured on one model does not transfer to the other.**
+
+**Everything through §16.4 is committed.** **Next session: start at §9** — the open list is item
+**0c step 2** (chunked reformulation) and the new item **0d** (split `V` across blocks, which should
+be bit-exact and should help the 35B most).
 **Primary target:** Qwen3.6-35B-A3B · **Fast-iteration vehicle:** Qwen3.5-0.8B
 
 > **Two traps that cost most of session 2026-07-25b. Read before benching or gating anything.**
@@ -660,7 +669,7 @@ top of them.
 | [scripts/prefix_cache_roundtrip.py](scripts/prefix_cache_roundtrip.py) | **new (§11)** — PopN rollback gate under radix. Needs no reference model, so it runs on the 35B |
 | [scripts/batch_decode_parity.py](scripts/batch_decode_parity.py) | **new (§11)** — serial vs concurrent decode; covers per-batch state-slot indexing. **Runs and passes as of §12**, and now also reports the concurrency speedup |
 | [scripts/long_prompt_gate.py](scripts/long_prompt_gate.py) | **new (§15)** — bit-exactness across a prompt long enough to span several prefill chunks, which is the only way `history_slot_id` advances *mid-prompt*. A single-chunk gate cannot reach that. Promoted from the ad-hoc check §14 ran |
-| [scripts/gdn_kernel_check.py](scripts/gdn_kernel_check.py) | **new (§15)** — the recurrent analogue of `conv1d_kernel_check`. Gates both GDN in-place kernels against the *copy-path kernel* (so the bar is bit-exactness, not a tolerance) plus an fp64 reference of the recurrence, across 9 seq_lens × 2 head configs including 5 that wrap the ring. Separates "ring misindexed" from "output wrong" — the off-by-one control leaves `out_bit` at 0 while `state_err` hits 130. No model, no weights, no engine |
+| [scripts/gdn_kernel_check.py](scripts/gdn_kernel_check.py) | **new (§15)** — the recurrent analogue of `conv1d_kernel_check`. Gates both GDN in-place kernels against the *copy-path kernel* (so the bar is bit-exactness, not a tolerance) plus an fp64 reference of the recurrence, across 9 seq_lens × 2 head configs including 5 that wrap the ring. Separates "ring misindexed" from "output wrong" — the off-by-one control leaves `out_bit` at 0 while `state_err` hits 130. No model, no weights, no engine. **§16.5:** `--k-split N` gates the lane-split kernel, where output and ring necessarily drop to relative tolerances (the reduction is re-associated by design) while **"every other ring slot byte-clean" stays exact** and the fp64 check becomes the primary bar. Also memoizes the compile on `(kind, n_kh, n_vh, k_split)` — it was recompiling per `seq_len`, which is a *runtime* dimension, and ptxas costs 30–42 s on a split kernel |
 | [scripts/conv1d_kernel_check.py](scripts/conv1d_kernel_check.py) | **new (§13), extended (§14)** — now gates the history variant too, including ring-wrap shapes. Numerical unit gate for the fused conv1d: kernel vs fp64 across 12 shapes and both conv widths. Separates "wrong" from "rounded differently", which no token-diff can do on the 35B. Needs no model, no weights, no engine; runs in seconds |
 | [fp8_software_dequant.py](fp8_software_dequant.py) | **new** — software W8A16 fp8 path so the 37.5 GB fp8 checkpoint can be an HF reference on sm_87 (§6.1) |
 
@@ -715,9 +724,19 @@ python validate.py --greedy-parity --model Qwen/Qwen3.5-0.8B --device cuda:0 \
     --mlc-model-dir dist/qwen3_5-0.8B-q0f16 \
     --mlc-lib dist/qwen3_5-0.8B-q0f16/lib.so --cache reference_outputs.pt
 
-# kernel unit gates — no model, no engine, seconds. Run these FIRST on any state change.
-python scripts/gdn_kernel_check.py                     # §15, recurrent; add --seq-lens to narrow
+# kernel unit gates — no model, no engine. Run these FIRST on any state change.
+python scripts/gdn_kernel_check.py                     # §15, recurrent, ~51 s; --seq-lens narrows
+python scripts/gdn_kernel_check.py --k-split 4         # §16.5, the lane-split kernel, ~120 s
+python scripts/gdn_kernel_check.py --k-split 4 --max-history 1   # ...and the `disable` ring
 python scripts/conv1d_kernel_check.py                  # §13/§14, conv
+
+# GDN recurrence A/B on the kernels MLC compiles (§16.5). Includes the ring flush, unlike the
+# probe below, and uses the real grid — n_vh blocks, so 32 on the 35B and 16 on the 0.8B.
+python scripts/gdn_kernel_bench.py                     # add --trace-share for an Amdahl bound
+
+# lane-split recurrence: COMPILE-time flag, read while tracing (like MLC_QWEN35_INPLACE_STATE).
+# 4 is the default; 1 restores §15's bit-exact kernel for an A/B.
+MLC_QWEN35_GDN_KSPLIT=1 python -m mlc_llm compile ... -o .../lib_ksplit1.so
 
 # high-margin state gate (§16.1) — the only 35B gate that can adjudicate a state change.
 # Capture once per reference model, then check any lib against it. Run BOTH modes.
@@ -858,6 +877,8 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `8ce123dc` | **§16.2/§16.3/§16.4** items 0c.1, 5 and 1 measured; MoE comment corrected |
 | `2341bb92` | **§16.1** 35B fp8 high-margin reference + the four gate runs |
 | `0c4af0e5` | **§9** restructured — 0b/1/5 closed, 0c step 1 done, VL blocker pinned down |
+| `cd314bb7` | **§9** handoff block, by-file table, the unpushed-submodule analysis |
+| *(this session)* | **§16.5** the lane-split GDN recurrence in TIR + `gdn_kernel_bench.py`, `--k-split` on the gate, item **0d** filed |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
@@ -897,18 +918,29 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 ### Start here next session
 
-> **Handoff, 2026-07-26.** Working tree is clean on branch `qwen3_5`; four commits this session
-> (`dc695262`, `8ce123dc`, `2341bb92`, `0c4af0e5`). **One action is outstanding and it is not
-> code:** the `3rdparty/tvm` commit `dff702c` (the §16.3 `MLC_GEMV_TSTR` hook) is unpushed and the
-> parent pointer is deliberately not advanced — see "Committed state" for the exact commands and
-> why. Nothing else depends on it.
+> **Handoff, 2026-07-26b.** Branch `qwen3_5`. **The lane-split GDN recurrence is built, measured
+> and gated (§16.5)** — `MLC_QWEN35_GDN_KSPLIT` now defaults to **4**, 0.8B pp512 **+25.0%** with
+> decode neutral and 361/361 on the state gate in both prefix-cache modes.
 >
-> **The one substantive thing to build is the lane-split GDN recurrence (§16.2).** It is measured
-> at 2.24–2.79× on the biggest prefill kernel, the design is settled, and it is cheaper than the
-> chunked reformulation it partly substitutes for. Two things to know before starting: the
-> bit-exact bar in `gdn_kernel_check.py` **cannot** apply (the reduction order changes by design),
-> so its fp64 check becomes the bar; and per §15.2, renormalize any published estimate against a
-> trace of the actual A/B baseline rather than against the probe's numbers.
+> **The same action is still outstanding and it is still not code:** the `3rdparty/tvm` commit
+> `dff702c` (the §16.3 `MLC_GEMV_TSTR` hook) is unpushed, re-verified 2026-07-26b, and the parent
+> pointer is deliberately not advanced — see "Committed state" for the commands and why. Nothing in
+> §16.5 touches TVM, so this is unchanged rather than newly blocking.
+>
+> **The next thing to build is item 0d — splitting `V` across blocks.** §16.5's occupancy analysis
+> is what surfaced it: the binding constraint is `threads × registers` per SM and the grid is only
+> 16–32 blocks, and the `V` axis is **embarrassingly parallel** — nothing in the recurrence crosses
+> value columns, so unlike `K` it needs no shuffle, no barrier and no re-association. That last part
+> matters: it should be **bit-exact**, so `gdn_kernel_check.py`'s full exact bar applies rather than
+> §16.5's relaxed one. It should help the 35B most, which is where §16.5 delivered least.
+>
+> **Three traps §16.5 paid for, in order of how much time they cost:**
+> 1. **Do not quote `gdn_recurrence_probe.cu` ratios against the 35B.** Its grid is `n_kh = 16`,
+>    which is the 0.8B's `n_vh`; the 35B launches 32 blocks and behaves qualitatively differently
+>    (`k_split=2` is a *regression* there). Use `gdn_kernel_bench.py`, which uses the real grid.
+> 2. **ptxas takes 30–42 s on a split kernel**, so anything that recompiles in a loop gets slow
+>    fast. The gate now memoizes; check before adding a sweep axis.
+> 3. `Executable` has no `time_evaluator` — it lives on `.mod`.
 
 > **Item IDs are stable, not sequential.** They are referenced from §12–§15 and from the Done
 > sections above, so closed items keep their number rather than being renumbered away. Ordering
@@ -916,32 +948,49 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 #### Open
 
-> As of 2026-07-26 the open list is **one item plus one blocked precondition**. Items 0b, 1 and 5
-> closed this session (§16); 0c's step 1 is done and measured, leaving only step 2.
+> As of 2026-07-26b the open list is **two items plus one blocked precondition**. Items 0b, 1 and 5
+> closed 2026-07-26a; **0c step 1 landed in §16.5** and left behind a cheaper follow-on than the
+> step 2 it was meant to precede — filed as the new item **0d**.
 
-**0c. The GDN recurrence is parallelism-starved — the biggest prefill item, by 5×.**
-§15.6 measured it: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the next kernel**,
-running at **202 GFLOP/s, ~3.8% of sm_87 fp32 peak**, because it launches `batch × n_vh` blocks of
-`V` threads (**2048 threads on the 0.8B**, on a 16-SM GPU) and each walks the sequence
-sequentially. §15 said there was no bandwidth left to reclaim; §16.2 shows that was DRAM-only —
-the kernel spills 47 of its 128 state rows to local memory and re-reads them every position. Two
-steps, in order:
-  1. ✅ **Done, §16.2 — and it is worth ~2.8×, so do it before considering step 2.** The
-     hypothesis was half right. Registers hit the 255 ceiling but permit 2 blocks/SM; the *grid*
-     (16 blocks on 16 SMs) is what pins occupancy at 1. Splitting `K` across two **blocks** is not
-     buildable — the reduction is inside a thread, so it would need a global barrier per position
-     — but splitting it across **lanes** (`tid = v*2 + half`, one `__shfl_xor_sync`, no
-     `__syncthreads`) is, and it measures **2.24–2.44×**; a 4-way split reaches **2.79×**. Most of
-     that is getting `state_local` off the register ceiling, not occupancy: 4 accumulators alone
-     buy only 1.27×. Measured with [gdn_recurrence_probe.cu](scripts/gdn_recurrence_probe.cu);
-     **not yet built in TIR**.
-  2. **Then scope the chunked linear-attention formulation** — matmuls over a chunk of C positions
-     instead of a scalar loop, as in `../flash-linear-attention/fla/layers/gated_deltanet.py` and
-     vLLM's `qwen3_next.py`. Substantially bigger than anything in §10–§15: it **changes the
-     arithmetic**, so bit-exactness is off the table and item 0b is a prerequisite for judging it
-     on the 35B, and it needs its own chunk-state intermediate. Note it does **nothing for
-     decode** — at `seq_len=1` the chunked form degenerates, and `gdn_func_inplace` is already
-     only 2.1% of the whole-run budget.
+**0c. The GDN recurrence is parallelism-starved — still the biggest prefill item after §16.5.**
+§15.6 measured it on the **0.8B**: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the
+next kernel**, at **202 GFLOP/s, ~3.8% of sm_87 fp32 peak**, because it launches `batch × n_vh`
+blocks of `V` threads (**16 blocks of 128 threads** there, on a 16-SM GPU) and each walks the
+sequence sequentially.
+  1. ✅ **Landed, §16.5 — the lane split, worth +25.0% pp512 on the 0.8B, and it is *not* worth
+     what §16.2 predicted.** `k_split=4` in TIR: 0 spill, 0 barriers, 361/361 on the state gate in
+     both prefix-cache modes. The kernel A/B is **1.94× on the 0.8B and 1.21× on the 35B** against
+     the probe's 2.79×, and **`k_split=2` is a 0.96× regression on the 35B** — the probe's grid is
+     the 0.8B's `n_vh = 16`, and the 35B's `n_vh = 32` already fits 2 blocks/SM. Default flipped to
+     4; `MLC_QWEN35_GDN_KSPLIT=1` restores §15's bit-exact kernel.
+  2. **Do item 0d first, then re-scope the chunked linear-attention formulation** — matmuls over a
+     chunk of C positions instead of a scalar loop, as in
+     `../flash-linear-attention/fla/layers/gated_deltanet.py` and vLLM's `qwen3_next.py`.
+     Substantially bigger than anything in §10–§16: it **changes the arithmetic**, so bit-exactness
+     is off the table and item 0b is a prerequisite for judging it on the 35B, and it needs its own
+     chunk-state intermediate. Note it does **nothing for decode** — at `seq_len=1` the chunked form
+     degenerates, and `gdn_func_inplace` is already only 2.1% of the whole-run budget.
+
+**0d. The `V` axis is embarrassingly parallel and the kernel has never used it — no reduction, no
+shuffle, no barrier.** ⚠️ **Unmeasured; this is an argument, not a result.** §16.5 established that
+the binding constraint is `threads × registers ≤ 65536` per SM, and that the grid — `(n_vh, batch)`,
+so **16 or 32 blocks on a 16-SM GPU** — is what starves the kernel. The lane split raises warps per
+block but cannot raise the block *count*, which is why `k_split=8` starts losing.
+
+But nothing in the recurrence crosses value columns. Every term is indexed by `col`: the state slice
+is `storage[seq, hist, h, row, col]`, both dots reduce over `row` *within* a column, `coef` depends
+on `v[.., col]` and `dot_sk[col]`, and the output and ring scatter are both per-`col`. **Splitting
+`V` across blocks needs no communication at all** — unlike `K`, which is why §15's block-split
+proposal was unbuildable. A grid of `(n_vh × V/Vb, batch)` with `Vb` columns per block multiplies the
+block count by `V/Vb` for free, and composes with the lane split: at `Vb=32, k_split=4` that is 128
+threads and 117 registers = 14976 registers/block → **4 blocks/SM (16 warps) across 64 blocks on the
+0.8B and 128 on the 35B**, where today's best is 1 block/SM across 16 or 32. It should help the 35B
+most, which is exactly where §16.5 delivered least.
+
+Cost: `k`/`q`/`gate`/`beta` get re-read by each column block (broadcast reads, already L2-resident),
+and the per-block preload/flush loops shorten rather than duplicate. Gate it with
+`gdn_kernel_check.py` — a pure grid refactor at fixed `k_split` should be **bit-exact**, since it
+changes no reduction order, so the full exact bar applies rather than §16.5's relaxed one.
 
 **The VL path has not been re-gated — and it is blocked on an artifact, not on work.** Checked
 2026-07-26: there is **no VL checkpoint in the HF cache and no VL build in `dist/`**, so this needs
@@ -983,7 +1032,7 @@ Main repo:
 
 | file | what |
 |---|---|
-| `python/mlc_llm/model/qwen35/qwen35_model.py` | **§15** `create_gated_delta_net_func_with_history_inplace` + the recurrent half of `forward_with_history` behind `state_io`. **§14** `create_causal_conv1d_func_with_history_inplace` + `state_io` threaded through `forward_with_history`; the per-model hoist block factored into `_maybe_hoist_state_io`. **§10–13:** `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle; **§13** `create_causal_conv1d_func_inplace` + `conv_storages` on `_GDNStateIO` |
+| `python/mlc_llm/model/qwen35/qwen35_model.py` | **§16.5** `create_gated_delta_net_func_with_history_inplace_ksplit` + `_gdn_k_split()` (`MLC_QWEN35_GDN_KSPLIT`, **default 4**) and the two-way selection at the `forward_with_history` call site. Uses `T.tvm_warp_shuffle` — there is no `_xor` variant in this TVM, so the partner lane is computed as `(tid % 32) ^ d`; it lowers to a real `__shfl_sync` at sm_87 (the legacy `__shfl` compat macro is gated on `__CUDA_ARCH__ < 700`). **§15** `create_gated_delta_net_func_with_history_inplace` + the recurrent half of `forward_with_history` behind `state_io`. **§14** `create_causal_conv1d_func_with_history_inplace` + `state_io` threaded through `forward_with_history`; the per-model hoist block factored into `_maybe_hoist_state_io`. **§10–13:** `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle; **§13** `create_causal_conv1d_func_inplace` + `conv_storages` on `_GDNStateIO` |
 | `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§11** same state_io wiring (the 35B's model file; VL reuses `Qwen35Model` and needed none). **§13**: it has its *own* `_hoist_gdn_state_io` call site — changing that helper's signature breaks the 35B compile while the 0.8B still builds |
 | `scripts/{prefix_cache_roundtrip,batch_decode_parity}.py` | **§11 new** — rollback and batch-slot gates; `batch_decode_parity` gained phase timing in **§12** |
 | `cpp/serve/engine_actions/batch_prefill_base.cc` | **§12** one-sequence prefill cap for RNN-state models; no decode-folding |
@@ -998,7 +1047,8 @@ Main repo:
 | `scripts/{analyze_decode_trace,greedy_snapshot,active_params,profile_decode_35b}.py`, `scripts/bw_probe.cu` | **new/promoted**. `analyze_decode_trace` reworked in **§13** to verify kernel identity against launch geometry |
 | `scripts/conv1d_kernel_check.py` | **§13 new** — numerical unit gate for the fused conv1d |
 | `scripts/high_margin_gate.py` | **§16.1 new** — the 35B state gate. `--capture` builds a margin-annotated reference from an HF model; `--check` teacher-forces an MLC lib against it and scores only where the reference had margin. `--negative-control stale1` proves it is not vacuous |
-| `scripts/gdn_recurrence_probe.cu` | **§16.2 new** — standalone CUDA probe, four variants of the GDN recurrence (base / acc4 / ksplit2 / ksplit4). No model, no TVM |
+| `scripts/gdn_recurrence_probe.cu` | **§16.2 new** — standalone CUDA probe, four variants of the GDN recurrence (base / acc4 / ksplit2 / ksplit4). No model, no TVM. **§16.5** added a header warning: its `grid(n_kh, batch)` is the 0.8B's geometry, and quoting its ratios against the 35B over-predicts by 2.3× |
+| `scripts/gdn_kernel_bench.py` | **§16.5 new** — the GDN recurrence A/B on the kernels MLC actually compiles: real grid (`n_vh` blocks, so 32 on the 35B), ring flush included, `k_split` 1/2/4/8 × seq_len. `--trace-share` prints an Amdahl bound. Timing goes through `mod.mod.time_evaluator`, **not** `Executable.time_evaluator`, which does not exist |
 | `scripts/prefix_cache_roundtrip.py` | **§16.1** — prompt families replaced with the high-margin set; `--legacy-prompts` reproduces §13's numbers. **Propagate any new flag to the subprocess `common` list** — the two phases run as separate processes and mismatched sets fail everything |
 | `bench_moe_kernel.py` | **§16.3/§16.4** — K-sweep at fixed N and N-sweep at fixed K, plus achieved-bandwidth reporting against the 156 GB/s wall. ⚠️ it reuses one weight tensor, so absolute numbers are L2-inflated for small kernels (§16.3); A/Bs at a fixed shape are fine |
 | `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§16.4** — the batch-1 MoE comment now carries the measurement (51×, not ~6×) and points at option (d) |
@@ -1009,6 +1059,11 @@ Main repo:
 | `qwen3_5.md` | §14.5 + 5 stale-item corrections |
 | `workplan-cuda-13.md` | **new** — this file |
 | `.gitignore` | exception for `reference_outputs_35b.pt` **and `reference_outputs_35b_fp8.pt`** — the fp8 name was still ignored, so §7's "commit this" silently had not happened |
+
+**§16.5 artifacts:** `tuning/mlc_tg_{0.8b,35b}_{gdnhist,ksplit4}_radix_20260726.json` — all four legs
+of the A/B, committed. `dist/qwen3_5-0.8B-q0f16_fused/lib_ksplit4.so` and
+`dist/qwen3_6-35B-A3B-q4f16_1_fused/lib_ksplit4.so` are the built libs (`dist/` is gitignored); both
+were compiled with `MLC_QWEN35_GDN_KSPLIT=4` explicitly and the 35B with `MLC_MOE_GEMM_V2=1`.
 
 Artifacts: `reference_outputs_35b_fp8.pt` (3.5 kB, **committed** in `fce533aa` — it is the only 35B
 reference that runs on this box), `tuning/greedy_35b_{before,after}.json`,
@@ -1943,7 +1998,10 @@ occupancy without changing the algorithm.
 
 ---
 
-## 16. Session 2026-07-26 — the gates get teeth, two items refuted, one answered at 2.8×
+## 16. Session 2026-07-26 — the gates get teeth, two items refuted, and the last one built
+
+> §16.1–§16.4 are session **2026-07-26a**; §16.5 is **2026-07-26b**, which built the kernel §16.2
+> designed and **corrected two of §16.2's conclusions in the process** — see the callout there.
 
 Four §9 items were open at the start of this session: **0b** (a deterministic 35B state gate),
 **0c** (the parallelism-starved GDN recurrence), **1** (should the 35B decode more than one
@@ -2155,16 +2213,25 @@ than that it raises occupancy.
 
 **Bounding the claim honestly.** The probe measures the recurrence only — no ring flush (see the
 header comment), one head config, and a synthetic input distribution matched to the model's ranges.
-`gdn_func_history_inplace` is 95.6 ms of the 35B pp512 budget (§15.6); at 2.79× that lane would
+`gdn_func_history_inplace` is 95.6 ms of the **0.8B** pp512 budget (§15.6); at 2.79× that lane would
 fall to ~34 ms, but the flush is excluded and Amdahl applies to the rest of prefill, so treat ~2.8×
 as an upper bound on the kernel and *not* as a prefill prediction. Per §15.2's rule, the estimate
 to publish should be renormalized against a trace of the actual A/B baseline before any lib is
 built.
 
-**Status: not built in TIR.** This is a measured design decision, not a landed change — the TIR
-kernel would need the lane-split layout, the `__shfl_xor_sync` reduction, and a re-gate through
-`gdn_kernel_check.py` (bit-exactness against the copy path is **off the table**, since the
-reduction order changes; the fp64 check becomes the bar).
+> ⚠️ **Corrected 2026-07-26b, §16.5 — two claims above did not survive being built.** This section
+> originally said "the 35B pp512 budget"; §15.6's trace is the **0.8B**, which is also the geometry
+> the probe's `grid(n_kh, batch)` = 16 blocks reproduces. So the probe was faithful to its target,
+> but **its ratios do not transfer to the 35B**, where the real grid is `(n_vh, batch)` = 32 blocks
+> and `k_split=2` is a *regression*. And the ranking of causes above — "primarily that it takes the
+> state off the 255-register ceiling rather than that it raises occupancy" — is **geometry-dependent
+> rather than general**: at 32 blocks the spill is equally gone at `k_split=2` and the kernel is
+> still slower. Measured in TIR: **1.94× (0.8B) and 1.21× (35B)** at seq_len=512, against 2.79× here.
+
+**Status: built in TIR and landed — see §16.5.** `create_gated_delta_net_func_with_history_inplace_ksplit`,
+`MLC_QWEN35_GDN_KSPLIT` default 4. There is no `tvm_warp_shuffle_xor` in this TVM, so the partner
+lane is computed as `(tid % 32) ^ d` and passed to `T.tvm_warp_shuffle`; bit-exactness against the
+copy path is off the table as predicted, and the fp64 plus untouched-slots checks became the bar.
 
 ### 16.3 Item 5 — the sm_87 GEMV tile is K-blind, and the gap tracks N, not K
 
@@ -2329,3 +2396,192 @@ Crossover is around **b ≈ 50 sequences**, which a 64 GB Orin running a 35B wil
 
 **Caveat:** the same L2-reuse limitation as §16.3 applies to absolute numbers, but the gemv leg
 agrees with the trace to 3%, and a 51× ratio is not an L2 artifact.
+
+### 16.5 Item 0c.1 built in TIR — and the probe's 2.79× does not survive the real geometry
+
+`create_gated_delta_net_func_with_history_inplace_ksplit` now exists, behind
+`MLC_QWEN35_GDN_KSPLIT=1|2|4|8` (compile-time, read during tracing, exactly like
+`MLC_QWEN35_INPLACE_STATE`). `1` keeps §15's bit-exact kernel and is unchanged.
+
+**The static profile reproduces the probe almost exactly**, which is the part of §16.2 that held up.
+`ptxas -v` on the kernel TVM emits, `n_vh=32`:
+
+| k_split | threads | floats/thread | registers | spill | barriers | regs/block | **blocks/SM, reg ceiling** |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 128 | 255 | **192 B** | 0 | 32640 | **2** |
+| 2 | 256 | 64 | 171 | 0 | 0 | 43776 | 1 |
+| 4 | 512 | 32 | 117 | 0 | 0 | 59904 | 1 |
+| 8 | 1024 | 16 | **62** | 0 | 0 | 63488 | 1 |
+
+Zero spill from `k_split=2` up, and **zero barriers at every width** — the `tid = col*k_split + part`
+layout keeps each reduction group inside one warp, so the butterfly is `log2(k_split)`
+`__shfl_sync`es and no `__syncthreads` is emitted.
+
+The last column is `65536 / regs_per_block` on sm_87's 65536 registers/SM — a **ceiling, not the
+achieved value**, and the difference between the two is the whole story below: the *grid* can pin
+blocks/SM lower than the registers allow. Achieved warps/SM, which is what matters:
+
+| k_split | 0.8B (16 blocks / 16 SMs) | 35B (32 blocks / 16 SMs) |
+|---:|---|---|
+| 1 | 1 block/SM = **4 warps** (grid-bound; registers would allow 2) | 2 blocks/SM = **8 warps**, one wave |
+| 2 | 1 block/SM = 8 warps | 1 block/SM = **8 warps, two waves** |
+| 4 | 1 block/SM = 16 warps | 1 block/SM = 16 warps, two waves |
+| 8 | 1 block/SM = 32 warps | 1 block/SM = 32 warps, two waves |
+
+#### Measured on the kernels MLC actually compiles — and it is a lot less than 2.79×
+
+[scripts/gdn_kernel_bench.py](scripts/gdn_kernel_bench.py), Orin, clocks already pinned
+(`min_freq == max_freq == cur_freq == 1300.5 MHz`), batch=1, `max_history=64`, median of 3×20 calls.
+ms per call:
+
+| model (blocks) | seq_len | ks=1 | ks=2 | ks=4 | ks=8 | ks2 × | **ks4 ×** | ks8 × |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **0.8B** (16) | 128 | 1.0007 | 0.7437 | 0.5987 | 0.8441 | 1.35 | **1.67** | 1.19 |
+| | 512 | 2.9242 | 2.0156 | 1.5035 | 1.6043 | 1.45 | **1.94** | 1.82 |
+| | 2048 | 10.5991 | 7.1061 | 5.1574 | 4.6317 | 1.49 | 2.06 | **2.29** |
+| **35B** (32) | 128 | 1.4310 | 1.4683 | 1.2366 | 1.6673 | **0.97** | 1.16 | 0.86 |
+| | 512 | 3.6661 | 3.8301 | 3.0405 | 3.1775 | **0.96** | **1.21** | 1.15 |
+| | 2048 | 12.5709 | 13.2908 | 10.3254 | 9.2003 | **0.95** | 1.22 | **1.37** |
+
+**The 0.8B gets 1.94× where the probe said 2.79×, and the 35B gets 1.21× with `k_split=2` an
+outright regression.**
+
+#### Why: the probe's grid is the 0.8B's, and the 35B does not share it
+
+To be fair to §16.2: `gdn_recurrence_probe.cu` launches `dim3 grid(n_kh, batch)` with `n_kh = 16`,
+and §15.6's 95.6 ms trace **is the 0.8B** (`n_vh = 16`), so the probe matched the kernel it was
+diagnosing. The trap is that the real kernel binds `blockIdx.x` to **`num_value_heads`**, not
+`n_kh` — and on the 35B `n_vh = 32`, so it launches **32 blocks, not 16**. §16.2's ratio was never
+measured at that geometry, and it does not transfer:
+
+- **0.8B, 16 blocks on 16 SMs.** `k_split=1` gets 1 block/SM = **4 warps** however many registers
+  ptxas leaves free — this is §16.2's grid-bound case, and it is real. Each doubling of `k_split`
+  doubles warps/SM (4 → 8 → 16 → 32), and the measurements rise monotonically with it.
+- **35B, 32 blocks on 16 SMs.** `k_split=1` fits **2 blocks/SM** — so the baseline already runs at
+  **8 warps/SM**, twice what the probe measured, and the whole grid is resident in one wave. Every
+  split width drops to 1 block/SM, so `k_split=2` buys **the same 8 warps/SM in two waves instead of
+  one**, and pays for a shuffle per dot on top. That is the 0.95–0.97× regression, and it is a
+  mechanism rather than noise: it is a strict loss on both axes.
+
+`k_split=4` is the first width that actually raises the 35B's occupancy (16 warps vs 8), which is why
+it is also the first width that wins there. And it **refutes §16.2's ranking of the two causes** on
+that model: §16.2 concluded "most of the win is getting `state_local` off the register ceiling, not
+occupancy", from the 16-block case. At 32 blocks the spill is *equally* gone at `k_split=2` and the
+kernel is nonetheless **slower** — so where the grid already supplies 2 blocks/SM, occupancy is the
+term that decides and the spill fix alone buys nothing. The causal story is right; its weighting is
+geometry-dependent, which §16.2 had no way to see from one grid.
+
+The 0.8B's own shortfall (**1.94× against the probe's 2.79×**) is the other thing the probe excluded
+by design: the per-position ring flush. Note the baseline moved too — TIR `k_split=1` is 2.92 ms
+where the probe's hand-written `base` was 3.49 ms — so codegen differences are mixed in and the flush
+share is not separately isolated here.
+
+#### End to end: 0.8B pp512 +25.0%, decode neutral, 108% of the traced estimate
+
+`lib_gdnhist.so` vs `lib_ksplit4.so`, both benched in one session under `radix`, clocks pinned,
+3 runs + warmup, `--unique-prompts` on by default at `radix`. Both were compiled with
+`MLC_QWEN35_GDN_KSPLIT` set explicitly, so `lib_ksplit4.so` is the same configuration a default
+build now produces:
+
+| | pp512 tps | ttft | tg512 | tg1024 |
+|---|---:|---:|---:|---:|
+| `lib_gdnhist` (k_split=1) | 3911.80 | 130.9 ms | 89.20 | 90.58 |
+| `lib_ksplit4` | **4888.03** | **105.8 ms** | 89.22 | 90.62 |
+| | **+25.0%** | −25.1 ms | +0.02% | +0.04% |
+
+**Decode is neutral to 0.04%**, which is the regression check that matters: the change touches only
+`forward_with_history`, so `gdn_func_inplace` and the fused-prefill path must not move.
+
+Scoring the prediction, per §15.2's rule — predicted from a measured kernel at the target shape,
+renormalized against a trace of the actual A/B baseline:
+
+- **Absolute, from the trace:** §15.2's `gdn_func_history_inplace` = 2654.7 µs × 36 calls over
+  2 prefills × 18 GDN layers = **47.8 ms per pp512 prefill**, against a measured **130.9 ms** ttft —
+  36.5% of ttft. (§15's 3934 tps is 130.1 ms, so the trace and today's baseline are the same
+  configuration to 0.6%.)
+- **Ratio, from the bench** at exactly that shape (0.8B, seq_len=512, `max_history=64`, batch=1):
+  2.9242 → 1.5035 ms = 0.514. Applied to 47.8 ms: → 24.6 ms, a **23.2 ms** saving → predicted ttft
+  107.7 ms, pp512 4754 (**+21.5%**).
+- Measured: **25.1 ms** and **+25.0%**. **108% of the traced estimate** — the third in a row to land
+  in band under this method (§14 was 107%).
+
+**Taking the ratio from one instrument and the absolute from another is deliberate, and the two do
+not agree on the absolute:** the bench reads 2.92 ms/call where the trace read 2.65 ms — 10% high,
+plausibly synthetic inputs and no L2 warmth from neighbouring kernels. That is exactly why §15.2's
+rule says to renormalize against the real baseline's trace: had the bench's absolute been used
+throughout, the prediction would have inherited that 10%.
+
+#### End to end: 35B pp512 +2.3%, and that is the honest size of it there
+
+Same harness, same session, `radix`, `MLC_MOE_GEMM_V2=1` on both compiles (verified after the fact:
+`nm -D --defined-only` counts 4 `group_gemm_v2`/`moe_dispatch_tables` symbols in each, per §8's trap):
+
+| | pp512 tps | ttft | tg512 | tg1024 |
+|---|---:|---:|---:|---:|
+| `lib_gdnhist` (k_split=1) | 627.91 | 814.7 ms | 59.94 | 59.80 |
+| `lib_ksplit4` | **642.08** | **797.3 ms** | 60.00 | 59.77 |
+| | **+2.26%** | −17.4 ms | +0.10% | −0.05% |
+
+**+2.3%, not +25%** — and that is what the 32-block geometry predicts, so it is a confirmation rather
+than a disappointment. Checking it against the kernel bench, which is now the *only* instrument used
+(no 35B trace of this pair exists): 30 GDN layers × 0.6256 ms saved per call at seq_len=512 =
+**18.8 ms** predicted against **17.4 ms** measured, i.e. **93%**. Correcting for the bench's ~10%
+optimism on absolutes (measured on the 0.8B above) gives ~17.1 ms and **102%**. Either reading lands
+in band, which is a second, independent validation of `gdn_kernel_bench.py` as an instrument.
+
+**It still ships on the 35B**, because the flag is one knob for both models, the 35B moves the right
+way, and setting it to 1 to protect a +2.3% would cost the 0.8B its +25.0%.
+
+#### Correctness — the bar changed as §16.2 said it must, and the split kernel is *more* accurate
+
+`gdn_kernel_check.py --k-split N` (18 shapes: both head configs × 9 lengths, three of them wrapping).
+Bit-exactness against the copy path is off the table by construction; what replaces it:
+
+| bar | k_split=1 | k_split=2 | k_split=4 |
+|---|---|---|---|
+| output vs copy path | **0** (exact) | ≤4.8e-06 rel | ≤3.4e-06 rel |
+| ring content vs copy path | **0** (exact) | ≤4.9e-06 rel | ≤3.8e-06 rel |
+| **output vs fp64 reference** | ≤4.05e-06 | ≤2.72e-06 | **≤2.00e-06** |
+| **every other ring slot** | **0** | **0** | **0** |
+
+`--max-history 1` — the `disable` ring, where the skip guard fires for exactly one position instead
+of 64 — passes at `k_split=4` too, so the guard is not width-sensitive.
+
+Two things worth keeping. First, **the split kernels are closer to fp64 than the unsplit one**
+(2.00e-06 vs 4.05e-06 at the worst shape) — splitting a 128-term fp32 dot into four 32-term partials
+is a shallower reduction tree, so it rounds *less*. Second, **"every other ring slot byte-clean" stays
+exactly 0**, which is the check that catches a ring misindex; reduction order cannot move a write into
+the wrong slot, so dropping the other two exact bars costs no coverage there.
+
+#### The state gates on `lib_ksplit4.so`
+
+The kernel gate adjudicates the kernel; these adjudicate the lib. Unless noted, they run against
+`dist/qwen3_5-0.8B-q0f16_fused/lib_ksplit4.so` — the 0.8B is the only model with an fp16 reference
+that a token-level gate can be trusted against (§16.1's tier table). The 35B rows use §16.1's fp8
+high-margin reference, which is the tier-2 check built for exactly this kind of change:
+
+| gate | result |
+|---|---|
+| **35B** `high_margin_gate --check`, **`radix`** | ✅ **139/139** wide-margin at τ=2.0, near-ties 3/5 — identical to §16.1's baseline count |
+| **35B** `high_margin_gate --check`, **`disable`** | ✅ **139/139** — the same wide-margin count as `radix`; near-ties 2/5 vs 3/5, which is the informational band where quantization legitimately differs |
+| 0.8B `high_margin_gate --check`, **`radix`** | ✅ **361/361** wide-margin at τ=2.0 (376/376 at τ=1, 267/267 at τ=4, 64/64 at τ=8) |
+| 0.8B `high_margin_gate --check`, **`disable`** | ✅ **361/361** — identical to `radix`, position for position |
+| 0.8B `high_margin_gate --negative-control stale1` | ✅ **FAILS 342/361**, near-ties 0/39 — the same figure §16.1 calibrated, so the pass above is not vacuous |
+| `prefix_cache_roundtrip` (`radix`) | ✅ **4/4 checks, 5/5 prompts each** — cold, exact-match reuse, fork-from-base, and fork + `PopN` rollback |
+| `batch_decode_parity`, **`disable`** | ✅ **6/6** serial vs concurrent |
+| `batch_decode_parity`, **`radix`** | ✅ **6/6**, and the §12 concurrency win holds at **2.66×** for 6 × 40 tokens |
+
+The `disable` rows are the regression check: `disable` never enters `forward_with_history`, so a
+lane-split-only change must leave it untouched, and it does.
+
+#### Two harness notes
+
+**ptxas spends 30–42 s on each split kernel, against 2–4 s unsplit** — the cost of fitting the state
+into registers with zero spill under a 512- or 1024-thread launch bound. It is paid once per build
+(TVM emits one instance of the PrimFunc), but it made the 18-shape gate a 12-minute run, because
+`run_shape` recompiled per `seq_len`. `seq_len` is a *runtime* dimension, so the emitted code is
+identical across the sweep: `gdn_kernel_check.py` now memoizes on `(kind, n_kh, n_vh, k_split)` and
+the gate is **51 s at `k_split=1`, ~120 s at 2 or 4**.
+
+`Executable` has no `time_evaluator`; it is on `.mod` (`mod["main"](*args)` once to warm up, then
+`mod.mod.time_evaluator("main", dev, ...)`). `bench_moe_kernel.py` reaches it as `vm.module`.
