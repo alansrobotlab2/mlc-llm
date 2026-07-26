@@ -6,6 +6,153 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-07-25c — Radix prefill was never measured; history-path conv fused (35B pp +10.9%, 0.8B +22.4%)
+
+Continuation of the CUDA-13 perf sessions. Target was [workplan-cuda-13.md](workplan-cuda-13.md)
+§9 item 0 — fuse the conv state on the `forward_with_history` path. That landed, but **the
+headline result is the baseline it required.**
+
+**Every prefill number in this project came from a configuration nobody runs.**
+[scratch_mlc_tg_sweep.py:90](scratch_mlc_tg_sweep.py#L90) hardcoded `prefix_cache_mode="disable"`.
+On a hybrid (GDN/RNNState) model that setting *selects the prefill forward path*: `disable` takes
+the fused path §13 optimized, `radix` — the engine default — takes `forward_with_history`, which
+still ran the old copy chain. Same lib, same prompts, only the mode differing:
+
+```
+0.8B q0f16, lib_convfused     pp512      ttft     tg512
+  prefix_cache_mode=disable   4053 tps   126 ms   90.83
+  prefix_cache_mode=radix     1462 tps   350 ms   90.40   <-- the default
+```
+
+**2.77× prefill gap, +224 ms ttft, invisible for the whole project.** Decode is unaffected — the
+split is prefill-only. §13 predicted this qualitatively; this is the number.
+
+**Two harness bugs, not one.** After adding `--prefix-cache-mode`, the radix column initially read
+as a *win*: `build_prompt` returned an identical prompt every run, so runs 2+ were full radix cache
+hits and `pp_tps` was measuring a cache lookup. Sweep now salts each run's prompt
+(`--unique-prompts`, default on whenever the mode isn't `disable`) and reports the re-encoded
+length. `greedy_snapshot.py` and `profile_decode_35b.py` hardcoded `disable` too — for a
+history-path change that mode is inert, so a snapshot compares a build against itself and passes
+vacuously (§13's mistake, inverted). Both take the flag now.
+
+**Trace of the radix prefill path (0.8B, nsys)** — 66% of GPU time is history-path GDN work:
+
+| kernel | µs/call | % GPU |
+|---|---:|---:|
+| `rnn_state_set_with_history_0` | 5188 | 24.8% |
+| `gdn_func_history` | 5003 | 23.9% |
+| `depthwise_conv1d` (the ~42×-off-roofline TE conv) | 3026 | 14.5% |
+| `update_conv_state_history` | 477 | 2.3% |
+| `rnn_state_set_with_history_1` | 184 | 0.9% |
+
+§9 item 0 scoped the conv; the trace says the conv is the **third** prize (17.7% combined) and the
+recurrent pair is **48.7%**.
+
+**Landed:** `create_causal_conv1d_func_with_history_inplace` collapses four kernels into one,
+scattering per-position conv state straight into the ring. Two things harder than §13's kernel:
+the flush *wraps* (seq_len is a 512–2048 prefill chunk against `max_history=64`, so the slot the
+conv reads is overwritten mid-kernel), and most of the scatter is dead — `EndForward` caps
+reachability at `max_history-1`, so positions a later one provably overwrites are skipped, turning
+a 512-position scatter into a 64-position one.
+
+```
+                    35B q4f16_1              0.8B q0f16
+pp512 (radix)   355.3 -> 393.8 (+10.9%)   1468.6 -> 1797.6 (+22.4%)
+ttft @ pp512    1441 -> 1300 ms            350 -> 284 ms
+tg              60.02 -> 59.77 (noise)     90.69 -> 90.77 (noise)
+pp512 (disable) —                          4053 -> 4070 (unchanged)
+```
+
+107% of the estimate traced from the kernel's GPU-time share — three for three on the workplan's
+"predict from a measured kernel at the target shape" rule.
+
+**Gates** (all under `radix`, the only mode that exercises this): `conv1d_kernel_check.py` extended
+with a history variant — 12 shapes × 2 widths × 4 ring configs incl. ring wrap and `max_history=1`,
+all within fp16 rounding with **state bit-exact and non-target slots untouched**; greedy-parity vs
+HF fp16 **5/5 × 50/50 under both modes**; `prefix_cache_roundtrip` 4/4; `batch_decode_parity` 6/6
+both modes; a 3133-token prompt crossing the 2048 prefill chunk **byte-identical**; 35B fp8 tier-2
+gate **1/15/2/5/50, identical to `lib_convfused` prompt for prompt**.
+
+**Two things I got wrong, both caught by controls.**
+1. **The safety mechanism I built the kernel around is not what makes it correct.** I staged the
+   one ring-wrap write believing it prevented the conv reading clobbered state. Built the un-staged
+   version as a negative control: **it passes all 12 shapes.** The dead-write skip guard already
+   removes exactly the early positions whose flush re-reads the old state, so at `kernel_size=4` no
+   write to `hist_slot` can precede a read of it. Staging kept as defence-in-depth; docstring now
+   says it is not load-bearing. (A deliberate ring off-by-one *does* fail all 12 shapes with
+   `out_rel` clean, so the gate has teeth.)
+2. **`greedy_snapshot` diverges 1/5 and I confirmed why instead of assuming.** The baseline TE conv
+   launches `grid=(174720,1) block=(16,16)` — 44.7 M threads for 3.1 M outputs, ~14 per 4-tap
+   reduction, i.e. a cross-thread tree reduction. A sequential ascending fp16 sum cannot match that
+   bitwise, so bit-exactness was never available here. That geometry is also *why* it was 42× off
+   roofline.
+
+**Aside — "why is the 35B compile single-threaded?"** Measured: TVM/Relax/dlight passes are ~83% of
+a 35B build on one core of 12; `nvcc` is ~17%. On the 3.5 MB unit TVM emits, `-split-compile=12` is
+41.5s → 31.6s (−24%) while `-t 12` does nothing (`--threads` only parallelizes across `-gencode`
+targets; we build one arch). **Not made a default** — the fatbins disassemble to different SASS
+(23382 differing lines), so it is a codegen change and would invalidate A/Bs. Exposed as
+`MLC_NVCC_OPTIONS`, plus `MLC_DUMP_CUDA` so nvcc flags can be benchmarked in ~40s instead of a
+13-minute rebuild. The real lever is the pass pipeline: the 35B spec compiles 18 entry points, 14
+of them full 48-layer traversals, 4 of which (`batch_verify_g1..g4`) exist only for spec decode —
+skipping those on iteration builds should cut ~20–25% of the dominant phase. Not implemented; it
+changes what the lib can do, so it needs a deliberate flag.
+
+**Next (workplan §9 item 0a — now the largest item in the document): fuse the *recurrent* state on
+the history path.** `set_with_history_0` + `gdn_func_history` are 48.7% of radix prefill, and the
+35B is still 394 under `radix` vs 645 under `disable`. Two compounding wins: fuse the scatter into
+the recurrence (the §11/§13/§14 treatment), and **stop materializing dead state** — at seq_len=512
+the per-position history tensor is 537 MB, of which ~87% is overwritten before anything can read it
+because `max_history` is 64. Gate under `radix`; `disable` never runs this path.
+
+Commits: `640ec98a` (kernel + gate), `c5f6546e` (harness + nvcc tooling), `86533e6c` (workplan §14).
+
+---
+
+## 2026-07-24 → 2026-07-25b — JetPack 7.2 / CUDA 13.2 re-bootstrap and four perf landings (backfill)
+
+**Backfilled 2026-07-25c.** These three sessions logged to
+[workplan-cuda-13.md](workplan-cuda-13.md) rather than here, leaving a gap between 2026-05-01 and
+2026-07-25c. Summary only — the workplan is the record, section refs below.
+
+**Env (§2, §3).** Box re-bootstrapped Ubuntu 22.04/JetPack 6.2.2/CUDA 12.6/LLVM 15 →
+24.04.4/**7.2-b187**/**13.2**/18.1.3. Whole toolchain green: TVM built clean, FlashInfer live on
+sm_87, coherent generation. **CUDA 13 vs 12.6 is a wash** (35B tg512 54.46 → 54.13, pp512 561 →
+566). Landmines: configuring without `-DCMAKE_CUDA_ARCHITECTURES=87` falls through to a default
+list containing sm_75, **removed in CUDA 13**; `USE_NVTX OFF` is load-bearing (CUDA 13 dropped
+`libnvToolsExt`); `cutlass=1` is inert on sm_87 despite the docs calling it Orin-tuned.
+
+**Measurement corrections (§4.3, §4.6).** Achievable DRAM bandwidth measured for the first time:
+**156 GB/s, not the 204.8 spec figure** every prior roofline used — 31% of claimed headroom was
+never there. Decode budget re-derived from a single trace with every kernel identified from launch
+geometry: GPU idle is **5.3%, not 13.3%**, and `rnn_state_get/set` move **245 MiB/token**, not
+"~nothing" as previously written.
+
+**Four landings.** §10 GDN input-projection merge (4 Linears → 1, +2.8% tg / −1.1% pp);
+§11 in-place recurrent state (**+6.04% tg**, prefill neutral — best-behaved prediction in the
+document); §12 concurrent serving on hybrid models fixed (the break was multi-sequence *prefill*,
+not decode; 0.8B now 2.67× at 6-way); §13 in-place conv state (+2.40% tg, **+15.3% pp**) — where
+the TE conv turned out to be **~42× off roofline**, an unpredicted win larger than the stated
+target. Net across the sessions: **35B tg512 54.13 → 60.20 (+11.2%), pp512 566 → 645 (+14%)** —
+though §14.1 later showed the pp figure was measured in a non-default configuration.
+
+**Refuted by measurement (§13).** The proposed cudagraph allowlist for the `rnn_state_*` builtins
+should **not** be built: eager launches went *up* 131 → 183/token after §11, idle did not move, and
+an eager launch costs ~0.9 µs at the margin.
+
+**Two harness traps that cost most of 2026-07-25b**, both of which read as catastrophic model
+regressions: compiling the 35B without `MLC_MOE_GEMM_V2=1` silently drops to the v1 MoE GEMM
+(pp512 560 → 225) with nothing warning you; and a "bit-exactness" gate run at the engine default
+compared a build against itself on a path neither build touched, passing vacuously. Generalised in
+the workplan preamble as: **an A/B is only an A/B if the two libs differ by the change under test.**
+
+**Also:** the 35B got its first on-box reference via the fp8 checkpoint plus a software W8A16 shim
+([fp8_software_dequant.py](fp8_software_dequant.py)) — there is no configuration in which a
+bit-exact 35B-vs-bf16 comparison fits in 64 GB (§6.1) — and eight scripts were promoted into
+`scripts/`.
+
+---
+
 ## 2026-05-01 — Phase 10 Stage 5b update: real bug found & fixed — 2/25 → 21/25, mrope-collapse 50/50
 
 **Diagnostic-then-fix session.** Wrote [validate.py](validate.py) `--mrope-collapse` mode: drives the VL lib (mrope-on, RopeMode.NONE) on a TEXT-ONLY prompt with 3 identical position rows. mRoPE math collapses to 1D RoPE; output should match the text-only HF reference at 50/50. Initial result: **4/50** — first 4 decode tokens correct (`Paris.\nThe`), then collapse to `The The The The...` for 46 steps. That pattern (decontextualized decode after a working prefill) pointed to the cache attention API choice.
