@@ -894,6 +894,8 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `31283474` | **§16.9** node classes located (`tvm.tirx`), 0f's blocker narrowed |
 | `ec051589` | **§16.10** item 0f built — padding-CTA skip via a zero loop extent, bit-exact, 1.28–1.73×; `scripts/moe_gemm_check.py` |
 | `4b7d1be6` | item 0f marked built; handoff repointed at the end-to-end measurement |
+| `3f53eb24` | commit-table backfill |
+| `dbe3a51f` | **§16.11** item 0f measured end-to-end — pp512 644 → 769 (+19.4%), gate identical to baseline, default flipped to `1` |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
