@@ -6,7 +6,97 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
-## 2026-07-26 — Two open items closed by measurement, one answered at 2.8x, and the 35B gets a gate with teeth
+## 2026-07-26c — The MoE GEMM was bound by neither wall: 35B prefill 644 -> 769 tps
+
+Picked up the one queued item from the previous handoff: **0e**, and it was a measurement, not a
+build — is `dequantize_group_gemm_v2` bandwidth-, compute- or schedule-bound at prefill's B=4096, and
+does it use tensor cores. It ended with 0e and **0f** both closed. Details in §16.8-§16.11.
+
+**Done**
+- **Item 0e answered: neither wall.** v2 does use tensor cores (`nvcuda::wmma::mma_sync`) and sits at
+  **5.5% of the fp16 tensor ceiling and 28.6% of the 156 GB/s one**. It is **CTA-bound**:
+  `t = n_real*c_real + n_pad*c_pad` fits all 12 sweep points to **<=1.6%** (median 0.31%) across a
+  512x range in useful work and two routings, with `c_pad ~= 0.93 c_real`.
+- **The fault that fell out:** v2's grid carries `+ Ne` slack CTAs, and the sentinel path guards only
+  the `X` read and the store — so **27-50% of CTAs** run a full dequant + wmma and discard it.
+- **Item 0f built and shipped on** (§16.10-§16.11). `MLC_MOE_GEMM_V2_SKIPPAD`, default `1`.
+  **pp512 644.26 -> 769.18 tps (+19.4%)**, ttft -16.2%, decode neutral (60.16 -> 60.09). New 35B lib
+  is `lib_skippad.so`. 35B prefill is now **2.17x** its 2026-07-25c starting point.
+- New gate: [scripts/moe_gemm_check.py](scripts/moe_gemm_check.py) — `np.array_equal`, not a
+  tolerance, on §16.6's `vb_exact` precedent. **8/8 exact**, including `B=777`, a multiple of neither
+  `BLK_M` nor `Ne`.
+- `bench_moe_kernel.py`: prefill-scale B sweep, FLOP reporting against both ceilings, `v2_grid()`,
+  `spread="random"` routing, working `--dump-source`.
+
+**Learned**
+- **A kernel can be bound by neither wall, and then a roofline is the wrong instrument.** The thing
+  that cracked this was a cost model denominated in **CTAs**, not bytes or FLOPs. "3.6x off its
+  roofline" (§16.7) framed it as an efficiency problem; it was a *count* problem.
+- **"The gate passes" was not good enough.** `disable` mode showed one mismatch at tau=1.0 that
+  `radix` did not. A bit-exact kernel must reproduce the baseline's mismatch counts *exactly*, so I
+  re-ran `lib_ksplit4` through the identical check as a control — every column matched, near-tie
+  count included. Pre-existing q4-vs-fp8. **Passing is a bar; identical is the claim the change
+  actually makes.**
+- **Two failed routes are worth as much as the fix, written down** (§16.9). A source-level
+  `if e_v >= 0:` dies in `sch.compute_at` (`unordered_map::at`); an `IfThenElse` around the
+  *scheduled* body dies one pass later in `ThreadSync` — **"Cannot insert syncs inside condition"**,
+  correct in general, wrong here because the sentinel is CTA-uniform. The shipped guard is therefore
+  a `Select` on the k-loop's **extent**, not a branch: zero trip count, no conditional, barriers all
+  taken or all skipped.
+- **`BLK_M` widening looked free from the cost model and is a 0.64x/0.39x regression** — `i_o` sits
+  outside the k-loop, so every extra row-fragment re-runs the whole dequant. That also **corrected my
+  own §16.8 write-up**: `c ∝ K` alone does not separate dequant from matmul, and I had attributed the
+  per-CTA constant to the dequant. Caught by the follow-up measurement, not by review.
+- **Three instrument bugs, all found by controls rather than suspicion**: active experts were assumed
+  `top_k` (a **32x** understatement of prefill traffic), the indptr was drawn twice under random
+  routing so the accounting described a routing that was never timed, and `v2_grid()` mirrored
+  `BLK_M` as a literal so it reported a grid the kernel was not launching.
+- **`ncu` cannot run here** — no GPU performance-counter permission — so the within-CTA breakdown is
+  unmeasured and every bound classification had to come from A/B sweeps over shape and schedule.
+- **This fork is `tvm.tirx`**, not `tvm.tir` (absent) or `tvm.s_tir` (Schedule/dlight only).
+  `tvm.tirx.stmt_functor.ir_transform` is the mutator. `tvm.ffi.register_global_func` +
+  `tvm_callback_cuda_postproc` is how to see emitted CUDA; walking `ex.mod.imported_modules` finds
+  nothing and silently reports success.
+
+**Next** — no queued item. Three candidates, **none costed**, deliberately unranked:
+1. Register-block v2's inner loop (hoist the shared loads above `i_o`). Same fix as the `BLK_M`
+   regression, and the only thing that would lift v2 off 5.5% of the tensor ceiling. Biggest prize.
+2. The last 20% of a skipped CTA (§16.10) — zero the trailing store loops. ~3% end-to-end.
+3. A direct indptr histogram, to check §16.11's *inferred* ~40% production padding share.
+
+---
+
+## 2026-07-26b — The lane split lands, `v_block` does not, and the prefill trace re-ranks the list
+
+Reconstructed from [workplan-cuda-13.md](workplan-cuda-13.md) §16.5-§16.7 and commits `ad56b584`,
+`3c6edc2b`, `7865c5de`, `6c0ef467`, `8562fade` — that session ended without a worklog entry.
+
+**Done**
+- **Item 0c.1 shipped: the lane-split GDN recurrence in TIR.** `MLC_QWEN35_GDN_KSPLIT`, default **4**
+  (`1` restores §15's bit-exact kernel). **0.8B pp512 +25.0%, 35B +2.3%**, decode neutral on both.
+  Full gate battery green: 361/361 and 139/139 under *both* prefix-cache modes, negative control
+  still failing 342/361. New instrument: `scripts/gdn_kernel_bench.py`.
+- **Item 0d (`v_block`) measured and left opt-in at default `0`** — **+15.6% on the 0.8B, -8% on the
+  35B**. Bit-exact, and the gate proves it: `vb_exact` is `0.0e+00` on every shape.
+- **The 35B prefill trace** (§16.7): 754 ms, **99.1% kernel-busy**. `dequantize_group_gemm_v2`+`_v21`
+  are **52.5%**, MoE machinery ~64%, the GDN recurrence **11.1% and third**.
+
+**Learned**
+- **The probe over-promised because its grid was the wrong model's.** §16.2 predicted 2.79x from
+  `gdn_recurrence_probe.cu`; the real kernels give **1.94x on the 0.8B and 1.21x on the 35B**, and
+  `k_split=2` is a **0.96x regression** on the 35B. The probe launches `n_kh=16` blocks — the 0.8B's
+  `n_vh`. The 35B launches 32 and was never grid-starved.
+- **§9's priority order was wrong for four sections.** "The recurrence is the biggest prefill item by
+  5x" was measured on the **0.8B**, which is dense and has no MoE. On the 35B it is 11.1%, so item
+  0c.2 — the largest and riskiest change in the document — is capped at **+12.5%** by Amdahl.
+- **A model-aware default fitted through two points was considered and rejected** for `v_block`.
+- Harness: never run two benchmarks at once, and `ps -C python` does not find them (they show as
+  `timeout NNNN python ...`) — a live run was declared dead, three benches shared the GPU, and a
+  table was thrown away.
+
+---
+
+## 2026-07-26a — Two open items closed by measurement, one answered at 2.8x, and the 35B gets a gate with teeth
 
 Session target was the four open items in [workplan-cuda-13.md](workplan-cuda-13.md) §9: **0b** (a
 deterministic 35B state gate), **0c.1** (the parallelism-starved GDN recurrence), **1** (should the
