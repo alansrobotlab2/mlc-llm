@@ -1197,6 +1197,29 @@ def _gdn_k_split() -> int:
     return k_split
 
 
+def _gdn_v_block() -> int:
+    """Read `MLC_QWEN35_GDN_VBLOCK` — value columns per block (workplan item 0d).
+
+    `0` (the default) means one block per head, i.e. `v_block = V`, which is the §16.5 grid.
+    A smaller power of two carves `V` across more, smaller blocks; it is **bit-exact** with the
+    default at fixed `k_split`, since it changes no reduction order. Inert when
+    `MLC_QWEN35_GDN_KSPLIT=1` — the unsplit kernel has no `v_block` parameter.
+
+    **It is opt-in because the two models want opposite values** (§16.6): `32` is worth +15.6%
+    on the 0.8B and −8% on the 35B, which is the primary target. A default keyed on `n_vh` was
+    rejected as a rule fitted through two points — the same extrapolation that made §16.2
+    over-promise. Set `MLC_QWEN35_GDN_VBLOCK=32` when building a 0.8B for iteration.
+    """
+    raw = os.environ.get("MLC_QWEN35_GDN_VBLOCK", "0")
+    try:
+        v_block = int(raw)
+    except ValueError as err:
+        raise ValueError(f"MLC_QWEN35_GDN_VBLOCK must be an integer, got {raw!r}") from err
+    if v_block and (v_block < 8 or v_block & (v_block - 1)):
+        raise ValueError(f"MLC_QWEN35_GDN_VBLOCK must be 0 or a power of two >= 8, got {v_block}")
+    return v_block
+
+
 def create_gated_delta_net_func_with_history_inplace_ksplit(
     num_key_heads: int,
     num_value_heads: int,
@@ -1204,6 +1227,7 @@ def create_gated_delta_net_func_with_history_inplace_ksplit(
     value_head_dim: int,
     dtype: str,
     k_split: int = 4,
+    v_block: int = 0,
 ):
     """The history recurrence with the `K` reduction split across `k_split` lanes.
 
@@ -1280,8 +1304,32 @@ def create_gated_delta_net_func_with_history_inplace_ksplit(
     unaffected by reduction order and stays exact, which is what still catches a ring
     misindex.
 
-    ⚠️ **`k_split` must divide 32** so a reduction group never straddles a warp, and
-    `V * k_split` must fit a block (`V=128` caps it at 8).
+    ⚠️ **`k_split` must divide 32** so a reduction group never straddles a warp.
+
+    **`v_block` — columns per block (0 or `V` means one block per head, the §16.5 default).**
+    The `V` axis is embarrassingly parallel: nothing in the recurrence crosses value columns,
+    so a block can own a *subset* of them with no communication whatsoever. Unlike the `K`
+    split above this needs no shuffle, no barrier and **no change to reduction order — at
+    fixed `k_split` it is bit-exact with `v_block=V`**, which is what `gdn_kernel_check.py`
+    holds it to.
+
+    ⚠️ **The two models want opposite grids, so this stays opt-in with a default of 0.**
+    Measured at seq_len=512 against `v_block=V` at the same `k_split=4`: **0.8B 1.92× → 2.22×
+    (+15.6%)**, **35B 1.21× → 0.92× (−8%, a regression)**. It does *not* work by raising
+    occupancy — warps/SM is set by registers/thread, hence by `K/k_split`, which carving `V`
+    up does not touch; `v_block=32, k_split=4` and `v_block=V, k_split=4` are 16 warps/SM
+    alike. What differs is **block granularity**: 128 threads × 4 blocks/SM instead of 512 ×
+    1, so independent blocks decorrelate the FMA-chain stalls that warps inside one block hit
+    together.
+
+    Why only the 0.8B benefits: carving `V` into chunks makes each head's `k`/`q`/`gate`/`beta`
+    be read by `V/v_block` blocks instead of one. The 0.8B is latency-starved (`k_split=1` runs
+    at 4 warps/SM) and has bandwidth to spend on that trade; the 35B has twice the value heads,
+    was never grid-starved, and the redundant traffic costs more than the decorrelation returns.
+    The preload and flush loops shorten rather than duplicate, since each block moves only its
+    own columns — it is the broadcast reads that are re-done.
+
+    See workplan §16.6. The benefit saturates by `v_block=32` (16 and 32 are within 0.1%).
     """
     heads_per_group = num_value_heads // num_key_heads
     K = key_head_dim
@@ -1293,11 +1341,19 @@ def create_gated_delta_net_func_with_history_inplace_ksplit(
     if K % (2 * k_split):
         # 2 because each lane keeps two accumulators; see the unrolled dot loops below.
         raise ValueError(f"key_head_dim {K} must be divisible by 2 * k_split ({2 * k_split})")
-    threads = V * k_split
+
+    V_BLOCK = V if v_block in (0, V) else v_block
+    if V % V_BLOCK:
+        raise ValueError(f"value_head_dim {V} must be divisible by v_block {V_BLOCK}")
+    threads = V_BLOCK * k_split
     if threads > 1024:
-        raise ValueError(f"value_head_dim {V} x k_split {k_split} = {threads} threads > 1024")
+        raise ValueError(f"v_block {V_BLOCK} x k_split {k_split} = {threads} threads > 1024")
+    if threads % 32:
+        # Each warp must hold a whole number of `k_split`-sized reduction groups.
+        raise ValueError(f"v_block {V_BLOCK} x k_split {k_split} = {threads} is not a warp multiple")
 
     K_LOCAL = K // k_split
+    N_VCHUNK = V // V_BLOCK
 
     @T.prim_func
     def gdn_func_history_inplace_ksplit(
@@ -1337,7 +1393,10 @@ def create_gated_delta_net_func_with_history_inplace_ksplit(
         scale = T.float32(1.0 / math.sqrt(K))
 
         for b_idx in T.thread_binding(batch_size, thread="blockIdx.y"):
-            for h_idx in T.thread_binding(num_value_heads, thread="blockIdx.x"):
+            # One block per (head, column chunk). At N_VCHUNK == 1 this is exactly the
+            # §16.5 grid — `bx == h_idx` and `v_chunk == 0` — which is what makes
+            # `v_block=V` bit-exact with the pre-item-0d kernel rather than merely close.
+            for bx in T.thread_binding(num_value_heads * N_VCHUNK, thread="blockIdx.x"):
                 for tid in T.thread_binding(threads, thread="threadIdx.x"):
                     with T.sblock("gdn_history_inplace_ksplit_thread"):
                         # Two accumulators per dot, mirroring the probe: at K_LOCAL=32 a
@@ -1349,11 +1408,15 @@ def create_gated_delta_net_func_with_history_inplace_ksplit(
                         dot_sk = T.sblock_alloc_buffer((1,), "float32", scope="local")
                         dot_sq = T.sblock_alloc_buffer((1,), "float32", scope="local")
 
+                        h_idx = bx // N_VCHUNK
+                        v_chunk = bx % N_VCHUNK
                         kh = h_idx // heads_per_group
 
-                        # `tid = col * k_split + part`: adjacent lanes share a value column,
-                        # so the butterfly below stays inside one warp.
-                        col = tid // k_split
+                        # `tid = local_col * k_split + part`: adjacent lanes share a value
+                        # column, so the butterfly below stays inside one warp. `threads` is
+                        # a warp multiple and `k_split` divides 32, so each warp holds a whole
+                        # number of reduction groups at any `v_block`.
+                        col = v_chunk * V_BLOCK + tid // k_split
                         part = tid % k_split
                         row0 = part * K_LOCAL
                         lane = tid % 32
@@ -1824,6 +1887,7 @@ class Qwen35GatedDeltaNet(nn.Module):
                     value_head_dim=V,
                     dtype=self.dtype,
                     k_split=k_split,
+                    v_block=_gdn_v_block(),
                 )
             )
             out_recurrent, _ = op.tensor_ir_inplace_op(

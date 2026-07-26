@@ -25,6 +25,13 @@ has to be renormalized against a trace of the actual A/B baseline; `gdn_func_his
 was 95.6 ms of a 95.6 + 19.3 + ... ms pp512 budget (§15.6), so Amdahl applies to the rest.
 Use `--trace-share` to fold in that share and print a bounded whole-prefill number.
 
+⚠️ **Run exactly one of these at a time, and verify that before trusting a number.** A split
+kernel costs ptxas 30-42 s, so a sweep spends most of its wall clock compiling and looks
+idle; it is easy to conclude a run has died and start another on top of it. That happened
+on 2026-07-26b and produced a table that had to be thrown away. `ps -C python` does **not**
+find these -- the process shows as `timeout NNNN python ...`, so the executable-name match
+misses it. Use `pgrep -af gdn_kernel_bench`.
+
 The state buffer is written in place and re-read across timing iterations, so the recurrence
 walks toward its own fixed point over a long run. That is fine here and deliberately not
 reset: the kernel has no data-dependent control flow, so its cost does not depend on the
@@ -52,7 +59,7 @@ HEAD_CONFIGS = [(16, 16, "0.8B"), (16, 32, "35B-A3B")]
 HEAD_DIM = 128
 
 
-def build(n_kh, n_vh, k_split):
+def build(n_kh, n_vh, k_split, v_block=0):
     common = dict(
         num_key_heads=n_kh,
         num_value_heads=n_vh,
@@ -63,9 +70,25 @@ def build(n_kh, n_vh, k_split):
     func = (
         create_gated_delta_net_func_with_history_inplace(**common)
         if k_split == 1
-        else create_gated_delta_net_func_with_history_inplace_ksplit(k_split=k_split, **common)
+        else create_gated_delta_net_func_with_history_inplace_ksplit(
+            k_split=k_split, v_block=v_block, **common
+        )
     )
     return tvm.compile(tvm.IRModule({"main": func}), target="cuda")
+
+
+def parse_configs(k_splits, v_blocks):
+    """(k_split, v_block) pairs to time. v_block is inert at k_split=1 (no such parameter)."""
+    configs = []
+    for ks in k_splits:
+        for vb in ([0] if ks == 1 else v_blocks):
+            if (ks, vb) not in configs:
+                configs.append((ks, vb))
+    return configs
+
+
+def label(ks, vb):
+    return f"ks{ks}" if not vb else f"ks{ks}/v{vb}"
 
 
 def make_args(rng, batch, seq_len, n_kh, n_vh, max_hist, dev):
@@ -90,6 +113,10 @@ def main() -> None:
     ap.add_argument("--max-history", type=int, default=64, help="64 = radix")
     ap.add_argument("--seq-lens", type=str, default="1,128,512,2048")
     ap.add_argument("--k-splits", type=str, default="1,2,4,8")
+    ap.add_argument("--v-blocks", type=str, default="0",
+                    help="comma-separated value columns per block (item 0d); 0 = one block per "
+                         "head. Crossed with --k-splits; block is v_block*k_split threads, so "
+                         "this is what makes k_split=8 reachable below 1024 threads")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--trace-share", type=float, default=0.0,
@@ -100,43 +127,47 @@ def main() -> None:
 
     seq_lens = [int(s) for s in args.seq_lens.split(",")]
     k_splits = [int(s) for s in args.k_splits.split(",")]
+    v_blocks = [int(s) for s in args.v_blocks.split(",")]
+    configs = parse_configs(k_splits, v_blocks)
     if 1 not in k_splits:
         raise SystemExit("--k-splits must include 1; it is the baseline every ratio is against")
     dev = tvm.cuda(0)
 
-    print(f"batch={args.batch} max_history={args.max_history} iters={args.iters} "
-          f"grid = n_vh x batch blocks, threads = 128 x k_split")
-    print("ms per kernel call; 'x' is vs k_split=1 at the same shape.\n")
+    print(f"batch={args.batch} max_history={args.max_history} iters={args.iters}")
+    print("blocks = n_vh x (V / v_block) x batch;  threads/block = v_block x k_split "
+          "(v_block 0 means V=128)")
+    print("ms per kernel call; 'x' is vs ks1 at the same shape.\n")
 
     for n_kh, n_vh, name in HEAD_CONFIGS:
-        mods = {ks: build(n_kh, n_vh, ks) for ks in k_splits}
-        head = "".join(f"{'ks=' + str(ks) + ' ms':>12}" for ks in k_splits)
-        ratio = "".join(f"{'ks=' + str(ks) + ' x':>9}" for ks in k_splits if ks != 1)
-        print(f"{name} (n_kh={n_kh}, n_vh={n_vh}, {n_vh * args.batch} blocks)")
+        mods = {c: build(n_kh, n_vh, *c) for c in configs}
+        head = "".join(f"{label(*c) + ' ms':>13}" for c in configs)
+        ratio = "".join(f"{label(*c) + ' x':>10}" for c in configs if c[0] != 1)
+        print(f"{name} (n_kh={n_kh}, n_vh={n_vh}; blocks = n_vh x V/v_block x batch)")
         print(f"{'seq_len':>8}{head}{ratio}")
         for seq_len in seq_lens:
             times = {}
-            for ks in k_splits:
+            for c in configs:
                 rng = np.random.default_rng(args.seed)
                 tensors = make_args(rng, args.batch, seq_len, n_kh, n_vh, args.max_history, dev)
-                mods[ks]["main"](*tensors)  # warm up: first call pays JIT + module load
+                mods[c]["main"](*tensors)  # warm up: first call pays JIT + module load
                 dev.sync()
-                timer = mods[ks].mod.time_evaluator(
+                timer = mods[c].mod.time_evaluator(
                     "main", dev, number=args.iters, repeat=3, min_repeat_ms=0
                 )
                 # Median over repeats, per `bench_moe_kernel.time_kernel`.
-                times[ks] = timer(*tensors).median * 1e3
-            cells = "".join(f"{times[ks]:12.4f}" for ks in k_splits)
-            ratios = "".join(f"{times[1] / times[ks]:9.2f}" for ks in k_splits if ks != 1)
+                times[c] = timer(*tensors).median * 1e3
+            base = times[(1, 0)]
+            cells = "".join(f"{times[c]:13.4f}" for c in configs)
+            ratios = "".join(f"{base / times[c]:10.2f}" for c in configs if c[0] != 1)
             print(f"{seq_len:8d}{cells}{ratios}")
             if args.trace_share:
                 # Amdahl on the traced share: the rest of prefill is unchanged.
-                s = args.trace_share
+                sh = args.trace_share
                 bounded = "".join(
-                    f"{1.0 / (1.0 - s + s * times[ks] / times[1]):9.3f}"
-                    for ks in k_splits if ks != 1
+                    f"{1.0 / (1.0 - sh + sh * times[c] / base):10.3f}"
+                    for c in configs if c[0] != 1
                 )
-                print(f"{'  ^ e2e':>8}{'':{12 * len(k_splits)}}{bounded}")
+                print(f"{'  ^ e2e':>8}{'':{13 * len(configs)}}{bounded}")
         print()
 
     if args.trace_share:

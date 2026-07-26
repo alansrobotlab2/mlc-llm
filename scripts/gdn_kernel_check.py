@@ -111,7 +111,7 @@ def reference_fp64(q, k, v, gate, beta, state_in, n_kh, n_vh, K, V):
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled(kind, n_kh, n_vh, k_split):
+def _compiled(kind, n_kh, n_vh, k_split, v_block=0):
     """Compile once per (kind, head config, k_split) — NOT per seq_len.
 
     `seq_len` is a runtime dimension, so the emitted code is identical across the sweep and
@@ -129,7 +129,9 @@ def _compiled(kind, n_kh, n_vh, k_split):
     elif k_split == 1:
         func = create_gated_delta_net_func_with_history_inplace(**common)
     else:
-        func = create_gated_delta_net_func_with_history_inplace_ksplit(k_split=k_split, **common)
+        func = create_gated_delta_net_func_with_history_inplace_ksplit(
+            k_split=k_split, v_block=v_block, **common
+        )
     return tvm.compile(tvm.IRModule({"main": func}), target="cuda")
 
 
@@ -168,7 +170,8 @@ def _verdict(got_storage, ref_storage, written, batch, max_hist):
     return state_err, clobber, max(state_scale, 1e-6)
 
 
-def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history, k_split=1):
+def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history, k_split=1,
+              v_block=0):
     K = V = HEAD_DIM
     rng = np.random.default_rng(seed)
     dev = tvm.cuda(0)
@@ -183,7 +186,7 @@ def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history,
     fp64_out = reference_fp64(q, k, v, gate, beta, state_in, n_kh, n_vh, K, V)
 
     # The decode kernel has no split variant; it only ever sees seq_len 1.
-    mod = _compiled("history" if history else "decode", n_kh, n_vh, k_split)
+    mod = _compiled("history" if history else "decode", n_kh, n_vh, k_split, v_block)
     out = np.zeros((batch, seq_len, n_vh, V), np.float32)
     args = [tvm.runtime.tensor(x, dev)
             for x in (q, k, v, gate, beta, storage, seq_slot, hist_slot, out)]
@@ -208,6 +211,24 @@ def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history,
             expected[int(seq_slot[bi]), slot] = ref_hist[bi, seq_len - 1]
             written.add((int(seq_slot[bi]), slot))
 
+    # `--v-block` re-grids without touching reduction order, so it owes an EXACT match
+    # against the one-block-per-head form at the same k_split. That is a strictly stronger
+    # bar than the relative ones below, and it is the whole item-0d claim.
+    vb_exact = 0.0
+    if history and k_split > 1 and v_block:
+        ref_mod = _compiled("history", n_kh, n_vh, k_split, 0)
+        vb_out = np.zeros((batch, seq_len, n_vh, V), np.float32)
+        vb_args = [tvm.runtime.tensor(x, dev)
+                   for x in (q, k, v, gate, beta, storage.copy(), seq_slot, hist_slot, vb_out)]
+        ref_mod["main"](*vb_args)
+        dev.sync()
+        vb_exact = max(
+            float(np.abs(got_out.astype(np.float64)
+                         - vb_args[8].numpy().astype(np.float64)).max()),
+            float(np.abs(got_storage.astype(np.float64)
+                         - vb_args[5].numpy().astype(np.float64)).max()),
+        )
+
     scale = max(float(np.abs(ref_out).max()), 1e-6)
     out_diff = float(np.abs(got_out.astype(np.float64) - ref_out.astype(np.float64)).max())
     fp64_rel = float(np.abs(got_out.astype(np.float64) - fp64_out).max()) / scale
@@ -217,7 +238,7 @@ def run_shape(n_kh, n_vh, seq_len, batch, max_hist, hist_slot_id, seed, history,
         # demanding 0. `clobber` is deliberately left absolute.
         out_diff /= scale
         state_err /= state_scale
-    return out_diff, fp64_rel, state_err, clobber
+    return out_diff, fp64_rel, state_err, clobber, vb_exact
 
 
 def main() -> None:
@@ -231,17 +252,26 @@ def main() -> None:
     ap.add_argument("--k-split", type=int, default=1, choices=(1, 2, 4, 8),
                     help="gate the lane-split history kernel (§16.5); >1 drops the "
                          "bit-exact bar on output and ring, see the module docstring")
+    ap.add_argument("--v-block", type=int, default=0,
+                    help="value columns per block (item 0d); 0 = one block per head. Changes no "
+                         "reduction order, so it does NOT relax any bar — at a fixed --k-split it "
+                         "must stay within the same tolerances, and vs --v-block 0 it is exact")
     args = ap.parse_args()
 
     seq_lens = ([int(s) for s in args.seq_lens.split(",")] if args.seq_lens else SEQ_LENS)
     print(f"batch={args.batch} max_history={args.max_history} hist_slot={args.hist_slot} "
-          f"k_split={args.k_split}")
+          f"k_split={args.k_split} v_block={args.v_block or 'V (one block per head)'}")
     if args.k_split == 1:
         print("out_bit / state_err must be exactly 0; fp64_rel is the only tolerance.\n")
     else:
         print(f"k_split={args.k_split} re-associates the K reduction, so on the history path "
               f"out_bit/state_err\nare RELATIVE (bar {REL_TOL:.0e}) and fp64_rel is the primary "
-              "check. other_slots stays exact.\n")
+              "check. other_slots stays exact.")
+        if args.v_block:
+            print(f"v_block={args.v_block} only re-grids, so `vb_exact` (vs v_block=V at the same "
+                  "k_split) must be\nEXACTLY 0 — that is the item-0d bar and it is stricter than "
+                  "the relative ones.")
+        print()
     bad = 0
     for label, history in (("decode (state_id=0, single ring advance)", False),
                            ("history path (per-position scatter, radix default)", True)):
@@ -252,27 +282,31 @@ def main() -> None:
             for seq_len in seq_lens:
                 if not history and seq_len != 1:
                     continue  # the decode kernel only ever sees seq_len 1
-                be, rel, se, cl = run_shape(n_kh, n_vh, seq_len, args.batch,
-                                            args.max_history,
-                                            args.hist_slot % args.max_history,
-                                            args.seed, history, k_split)
+                be, rel, se, cl, vbx = run_shape(n_kh, n_vh, seq_len, args.batch,
+                                                 args.max_history,
+                                                 args.hist_slot % args.max_history,
+                                                 args.seed, history, k_split, args.v_block)
                 if k_split == 1:
                     fail = be != 0.0 or se != 0.0 or cl != 0.0 or rel > REL_TOL
                 else:
                     fail = cl != 0.0 or rel > REL_TOL or be > REL_TOL or se > REL_TOL
+                fail = fail or vbx != 0.0  # re-gridding owes an exact match; see above
                 bad += fail
                 wrap = " WRAP" if history and seq_len > args.max_history else ""
+                vb = f"  vb_exact={vbx:.1e}" if history and k_split > 1 and args.v_block else ""
                 print(f"  {name:<8} n_vh={n_vh:3d} seq_len={seq_len:4d}  "
                       f"out_bit={be:.1e}  fp64_rel={rel:.2e}  state_err={se:.1e}  "
-                      f"other_slots={cl:.1e}{wrap}{'   <-- FAIL' if fail else ''}")
+                      f"other_slots={cl:.1e}{vb}{wrap}{'   <-- FAIL' if fail else ''}")
         print()
     if bad:
         raise SystemExit(f"{bad} shape(s) FAILED")
     if args.k_split == 1:
         print("ALL SHAPES PASS — output bit-exact vs the copy path, ring bit-exact, slots clean")
     else:
+        vb = (f", and v_block={args.v_block} EXACTLY matches v_block=V"
+              if args.v_block else "")
         print(f"ALL SHAPES PASS — k_split={args.k_split} within {REL_TOL:.0e} of the copy path "
-              "and of fp64, slots byte-clean")
+              f"and of fp64, slots byte-clean{vb}")
 
 
 if __name__ == "__main__":

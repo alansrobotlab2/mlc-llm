@@ -979,9 +979,12 @@ sequence sequentially.
      chunk-state intermediate. Note it does **nothing for decode** — at `seq_len=1` the chunked form
      degenerates, and `gdn_func_inplace` is already only 2.1% of the whole-run budget.
 
-**0d. Split `V` across blocks — not for occupancy, but to decouple `k_split` from block size.**
-⚠️ **Unmeasured; an argument, not a result. And the first version of this item, written 2026-07-26b
-before the arithmetic was checked, got the mechanism wrong — that correction is the useful part.**
+**0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
+Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
+and every gate result above are unchanged. It works by **block granularity at fixed occupancy**, not
+by the occupancy this item first claimed nor by the `k_split=8` unlocking it then claimed — both
+predictions were wrong and §16.6 records why. The text below is the pre-measurement argument, kept
+because two-thirds of it was refuted:
 
 Nothing in the recurrence crosses value columns. Every term is indexed by `col`: the state slice is
 `storage[seq, hist, h, row, col]`, both dots reduce over `row` *within* a column, `coef` depends on
@@ -2635,3 +2638,69 @@ the gate is **51 s at `k_split=1`, ~120 s at 2 or 4**.
 
 `Executable` has no `time_evaluator`; it is on `.mod` (`mod["main"](*args)` once to warm up, then
 `mod.mod.time_evaluator("main", dev, ...)`). `bench_moe_kernel.py` reaches it as `vm.module`.
+
+### 16.6 Item 0d — `v_block`, and the first change in this document with an exact bar again
+
+`create_gated_delta_net_func_with_history_inplace_ksplit` now takes **`v_block`**, the number of
+value columns a block owns, behind `MLC_QWEN35_GDN_VBLOCK` (`0` = one block per head = the §16.5
+grid). The grid becomes `(n_vh × V/v_block, batch)` and the block `v_block × k_split` threads.
+
+**Verdict: +15.6% on the 0.8B, −8% on the 35B. It stays an opt-in knob, default `0`.** Both of this
+item's predictions were wrong, and so was the expectation that it would be refuted outright:
+
+- ❌ The item as first filed claimed **occupancy**. Wrong: warps/SM is set by registers/thread, which
+  is set by the state slice `K/k_split`, and carving `V` up touches neither.
+- ❌ The corrected version claimed the value was **unlocking `k_split=8`** — decoupled, `v_block=16,
+  k_split=8` is 128 threads at 62 registers = 32 warps/SM, which no `v_block=V` form can express.
+  Also wrong: `k_split=8` stays **worse than `k_split=4`** on the 0.8B in every form, so the
+  occupancy it unlocks is not wanted. That half of the doubt recorded when filing the item was right.
+- ✅ What pays *on the 0.8B* is **block granularity at fixed occupancy**. `k_split=4, v_block=32` is
+  128 threads × 4 blocks/SM and `k_split=4, v_block=0` is 512 threads × 1 block/SM — **16 warps/SM
+  either way** — and the small-block form is **15.6% faster**. Likely mechanism: 16 warps inside one
+  block march through the recurrence in near-lockstep and stall on the FMA chain together, while
+  four independent blocks decorrelate, so one can issue while another stalls.
+
+Measured, clean single-process run, `max_history=64`, batch=1, median of 3×20:
+
+| model | seq_len | ks1 | ks4 | ks4/v16 | ks4/v32 | ks8 | ks8/v16 | ks4 × | **ks4/v32 ×** | ks8 × |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **0.8B** | 512 | 2.9289 | 1.5239 | 1.3178 | **1.3193** | 1.6022 | 1.5624 | 1.92 | **2.22** | 1.83 |
+| | 2048 | 10.6473 | 5.1566 | 4.5020 | **4.4711** | 4.6321 | 4.5509 | 2.06 | **2.38** | 2.30 |
+| **35B** | 512 | 3.6681 | **3.0370** | 3.8663 | 4.0052 | 3.1765 | 3.1543 | **1.21** | **0.92** | 1.15 |
+| | 2048 | 12.6698 | 10.3082 | 13.5295 | 14.0491 | **9.2017** | 9.6262 | 1.23 | **0.90** | **1.38** |
+
+**The 35B regresses 8–10%, and it is §16.5's trap again with the sign flipped.** The two models want
+opposite grids: the 0.8B wants small blocks, the 35B wants large ones. The mechanism that fits is
+**redundant broadcast traffic against available slack**. Carving `V` into 4 chunks makes every head's
+`k`/`q`/`gate`/`beta` be read by 4 blocks instead of 1. The 0.8B is latency-starved — `k_split=1` sits
+at 4 warps/SM — so it has bandwidth to spare and buys decorrelation with it. The 35B has twice the
+value heads, twice the blocks, was never grid-starved (2 blocks/SM at `k_split=1`), and has
+correspondingly less slack, so the extra traffic dominates whatever decorrelation it gains.
+
+**So `MLC_QWEN35_GDN_VBLOCK` keeps its default of `0` (inert) and ships as an opt-in.** No lib
+rebuild and no re-gate are required, because nothing about the default configuration changes. A
+model-aware default keyed on `n_vh` was considered and rejected: it would be a rule fitted through
+**two** points, which is precisely the extrapolation that made §16.2 over-promise. The 35B is the
+primary target and `0` is right for it; `MLC_QWEN35_GDN_VBLOCK=32` is worth 15.6% on the 0.8B for
+anyone iterating there.
+
+Two smaller things the sweep settles: the 0.8B's benefit **saturates by `v_block=32`** (`16` and `32`
+are within 0.1%), so there is no reason to go narrower; and on the 35B at `seq_len=2048`,
+`k_split=8` at `v_block=0` remains the best configuration measured (**1.38×**), which §16.5 already
+flagged and this run confirms at a second `v_block`.
+
+**It is bit-exact, and the gate now proves that rather than asserting it.** Re-gridding changes no
+reduction order, so `gdn_kernel_check.py --v-block N` adds a check the §16.5 bars cannot make:
+`vb_exact`, a direct comparison of output *and* ring against `v_block=V` at the same `k_split`,
+required to be **exactly 0**. At `k_split=8, v_block=16` it is `0.0e+00` on every shape, both head
+configs, including the wrapping ones — so this is the first history-path change since §15 held to an
+exact bar rather than a tolerance.
+
+> ⚠️ **Harness failure worth recording, because it cost a discarded table.** A split kernel spends
+> 30–42 s per config in ptxas, so a sweep looks idle for many minutes. A run was wrongly declared
+> dead — **`ps -C python` does not find it**, because the process shows as `timeout NNNN python ...`
+> and the executable-name match misses it — and a second sweep was started on top of the first, plus
+> a third in the foreground. Three benchmark processes shared the GPU and the resulting timings were
+> thrown away. Use `pgrep -af gdn_kernel_bench`, and treat "no output yet" as "still compiling"
+> rather than "died". The correctness results in this section are unaffected: `vb_exact` compares
+> tensor contents, which contention cannot perturb.
