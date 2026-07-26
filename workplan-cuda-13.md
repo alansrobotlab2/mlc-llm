@@ -878,7 +878,7 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `2341bb92` | **§16.1** 35B fp8 high-margin reference + the four gate runs |
 | `0c4af0e5` | **§9** restructured — 0b/1/5 closed, 0c step 1 done, VL blocker pinned down |
 | `cd314bb7` | **§9** handoff block, by-file table, the unpushed-submodule analysis |
-| *(this session)* | **§16.5** the lane-split GDN recurrence in TIR + `gdn_kernel_bench.py`, `--k-split` on the gate, item **0d** filed |
+| `ad56b584` | **§16.5** the lane-split GDN recurrence in TIR + `gdn_kernel_bench.py`, `--k-split` on the gate, two §16.2 corrections, item **0d** filed |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
