@@ -841,103 +841,92 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 ### Start here next session
 
-> **Recommended order, by measured expected value (2026-07-25b).** Items are renumbered relative
-> to the 2026-07-25a list; the old numbering is kept below so the reasoning trail survives. New
-> item **0** did not exist before this session's trace and is now the largest known prefill item
-> in the document.
+> **Item IDs are stable, not sequential.** They are referenced from §12–§15 and from the Done
+> sections above, so closed items keep their number rather than being renumbered away. Ordering
+> below is by measured expected value as of 2026-07-25d.
 
-**0. ~~Fuse the conv state on the *history* path~~ — DONE, see §14.** Landed at **35B pp512
-+10.9% / 0.8B +22.4% under `radix`**, 107% of its traced estimate, decode neutral. The session
-also found that *every* prefill number in this document predates any measurement of the default
-configuration — see §14.1 — and fixed the two harness bugs that made it unmeasurable.
+#### Open
 
-**0a. ~~Fuse the *recurrent* state on the history path~~ — DONE, see §15.** Both compounding wins
-landed as scoped. **35B pp512 395 → 629 (+59.1%), 0.8B 1793 → 3934 (+119.4%)**, decode neutral,
-and the recurrent pair went 365.2 ms → 95.6 ms (3.82×) in an A/B trace. **The radix-vs-`disable`
-prefill gap is now 1.03× on the 35B and 1.04× on the 0.8B** — §14.1's 2.77× default-configuration
-penalty is closed. It is also the first history-path change here that is bit-exact end-to-end.
+**0b. A deterministic 35B state gate — do this first; it is cheap and it unblocks two others.**
+Neither existing 35B gate can adjudicate a state change. §13 quantified that
+`prefix_cache_roundtrip` fails on the *unmodified baseline* in 3 of 4 runs, and §6.2 says the same
+of the fp8 tier-2 gate — 1/15/2/5/50 is 4-bit-vs-8-bit near-tie noise, and it has now scored
+*identically* across four consecutive libs, which is reassuring but carries almost no information.
+Both have one root cause and one fix: **a high-margin prompt set** — arithmetic, exact-continuation
+sequences, closed-form factual lookups — where the top-1 logit gap is wide enough to survive
+quantization. Prompt 5 (`1, 1, 2, 3, 5, 8, 13, 21,`) is 50/50 on every lib ever tested, which is
+the proof the signal exists when the margin does; the rest of the set is open-ended continuation
+inherited from an fp16-vs-fp16 era. `scripts/gdn_kernel_check.py` and
+`scripts/conv1d_kernel_check.py` are the model for what a gate should look like — deterministic,
+no engine, and separating "wrong" from "rounded differently". *(Was item 4; promoted here in
+2026-07-25b.)*
 
-**0c. NEW, and now the biggest prefill item by 5×: the GDN recurrence is parallelism-starved.**
-§15.6 measured it — `gdn_func_history_inplace` is 95.6 ms against 19.3 ms for the next kernel, and
-it runs at **202 GFLOP/s, ~3.8% of sm_87 fp32 peak**, because it launches `batch × n_vh` blocks of
-`V` threads (**2048 threads on the 0.8B**, on 16 SMs) and each walks the sequence sequentially.
-There is no bandwidth left to reclaim; the fix is the **chunked linear-attention formulation** that
-`../flash-linear-attention/fla/layers/gated_deltanet.py` and vLLM's `qwen3_next.py` use. That
-changes the arithmetic, so bit-exactness is off the table and the tier-2 gate decides it, and it
-is a substantially bigger piece of work than §10–§15 — **scope it deliberately.** Check the cheap
-occupancy hypothesis in §15.6 first. Note it does nothing for decode.
-
-**0-old. Fuse the conv state on the *history* path** — the successor to §13, and the biggest
-remaining prefill item. `forward_with_history` still runs the TE conv that §13 measured at
-**3404 µs/call, ~42× off roofline**, and — this is the point — it is the path the **default**
-`prefix_cache_mode="radix"` uses for prefill. §13's +15.3% pp only exists under `disable`, which
-is a benchmark setting, so this item is worth more *to actual users* than the one just landed.
-Harder than §13: `set_with_history` writes one slot **per position** rather than a single ring
-advance, so the flush is a scatter over `(hist + 1 + t) % max_history`, and
-`create_set_with_history_func` in [rnn_state.py](python/mlc_llm/nn/rnn_state.py) is the shape to
-mirror. `gdn_func_history` and `rnn_state_set_with_history_0` are the two other big kernels on
-that path (554 ms and 530 ms in the §13 trace vs the conv's 709 ms), so scope a combined pass.
-Gate with `--prefix-cache-mode radix` — the default is the *only* mode that exercises this.
-
-**0b. A deterministic 35B state gate** — cheap, and it unblocks trusting item 0. §13 quantified
-that the existing rollback gate fails on the *unmodified baseline* in 3 of 4 runs, so it cannot
-adjudicate a state change. Same root cause as §6.2's complaint about the fp8 gate, same fix: a
-high-margin prompt set (old item 4). `scripts/conv1d_kernel_check.py` is the model for what a
-gate should look like — deterministic, no engine, and it separates "wrong" from "rounded
-differently", which no token-diff on the 35B can.
+**0c. The GDN recurrence is parallelism-starved — the biggest prefill item, by 5×.**
+§15.6 measured it: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the next kernel**,
+running at **202 GFLOP/s, ~3.8% of sm_87 fp32 peak**, because it launches `batch × n_vh` blocks of
+`V` threads (**2048 threads on the 0.8B**, on a 16-SM GPU) and each walks the sequence
+sequentially. §15 removed the last of its memory traffic, so there is no bandwidth left to
+reclaim — it is latency-bound on a dependency chain. Two steps, in order:
+  1. **Cheap first:** the kernel holds `K=128` fp32 registers per thread, ~64 KB per 128-thread
+     block, which almost certainly pins occupancy at 1 block/SM. Confirm it, and test whether
+     splitting `K` across two blocks with a cross-thread reduction per `t` raises occupancy
+     without touching the algorithm.
+  2. **Then scope the chunked linear-attention formulation** — matmuls over a chunk of C positions
+     instead of a scalar loop, as in `../flash-linear-attention/fla/layers/gated_deltanet.py` and
+     vLLM's `qwen3_next.py`. Substantially bigger than anything in §10–§15: it **changes the
+     arithmetic**, so bit-exactness is off the table and item 0b is a prerequisite for judging it
+     on the 35B, and it needs its own chunk-state intermediate. Note it does **nothing for
+     decode** — at `seq_len=1` the chunked form degenerates, and `gdn_func_inplace` is already
+     only 2.1% of the whole-run budget.
 
 **1. Decide whether the 35B should be able to decode more than one sequence (§12).**
-   `batch_decode` is pinned to a literal batch of 1 at
-   [qwen3_5_moe_model.py:637](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L637) so the
-   MoE block's `if num_tokens == 1:` folds at compile time — worth ~6× and load-bearing for the
-   58.97 tps in §11. Restoring the dynamic-batch spec would give that back. The options worth
-   costing are (a) a Relax `If` in the MoE block for runtime dispatch, (b) a second decode entry
-   point with a dynamic batch that the engine selects when `max_num_sequence > 1`, (c) leave it
-   interactive-only and say so in the docs. Until this is settled the 35B is single-sequence and
-   the engine fix in §12 does nothing for it.
-2. ~~**Consider fusing the *conv* state too (state 1).**~~ **DONE — see §13.** Landed at
-   **+2.40% decode and +15.3% prefill on the 35B**. The decode estimate was right; the stated
-   rationale was not. The "removes the last 60 `vm.builtin` calls so the decode body becomes one
-   captured region" argument is wrong — see item 3. The real second prize was the TE conv itself,
-   which turned out to be **~42× off roofline** and is unrelated to state copies. **Its successor
-   item is the *history* path**, which still runs that kernel and is what the default
-   `prefix_cache_mode="radix"` uses for prefill.
-3. ~~**Optional: get the fused kernel back into a cudagraph.**~~ **REFUTED — do not build. See
-   §13.** The trace this item asked for was run. Capture prediction correct, everything built on
-   top of it wrong: eager launches went *up* 131 → 183/token, idle did not move (1.016 →
-   1.065 ms/token), and the measured marginal cost of an eager launch is ~0.9 µs, so the whole
-   lane is worth ≤0.38 ms/token rather than "the decode body becomes one region". Original text
-   kept below for the reasoning trail.
+`batch_decode` is pinned to a literal batch of 1 at
+[qwen3_5_moe_model.py:637](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L637) so the MoE
+block's `if num_tokens == 1:` folds at compile time, routing decode through `dequantize_gemv`
+instead of `dequantize_group_gemm`. Until this is settled the 35B is single-sequence and the
+engine fix in §12 does nothing for it. **Blocked on a measurement, not a decision:** the "~6× at
+b=1 top-8" justification is a source comment, not a number in this document, and it predates both
+the Phase 9 CTA_COUNT=1024 restoration (§4.2) and nvcc 13.2. `bench_moe_kernel.py` settles it —
+and since `moe_dequantize_gemv` already runs at 88% of the 156 GB/s wall (§4.6), the honest
+question is how far the dynamic-batch path falls short of *that*, at b=1, today. Then choose:
+(a) a Relax `If` in the MoE block for runtime dispatch, (b) a second decode entry point with a
+dynamic batch that the engine selects when `max_num_sequence > 1`, or (c) leave it
+interactive-only and document that.
 
-   ⚠️ **This item is reasoned from the
-   pass source, not from a trace — re-run §4.7's `--cuda-graph-trace=node` profile against
-   `lib_inplace.so` before acting on it.** Reading
-   [rewrite_cuda_graph.cc:377-387](3rdparty/tvm/src/relax/transform/rewrite_cuda_graph.cc#L377),
-   the fused call should *not* be captured: its storage argument is produced by a `vm.builtin`
-   call, which the pass never marks static, so every consumer is non-static too. The predicted net
-   effect is still favourable — per GDN layer, 2 eager builtin launches plus 1 captured kernel
-   becomes 1 eager kernel, so both traffic and region count fall — which would explain why +6.04%
-   landed regardless. Making it capturable means allowlisting the three `rnn_state_*` handle
-   builtins as static in that pass; that is **sound**, since the runtime audit for §11 confirmed
-   `storages_` and both slot-id views are allocated once in the constructor and `CreateView` uses
-   byte offset 0, so the pointers are stable across steps. Do 2 and 3 together or not at all.
-4. **Consider a high-margin prompt set (§6.2).** — **promoted to item 0b above.** The cheapest way
-   to turn the fp8 tier-2 gate from a comparative signal into a real pass/fail bar. Prompt 5 is
-   50/50 on both libs; the rest are open-ended near-ties. §13 showed the rollback gate has the
-   same problem, so this now unblocks two gates rather than one.
-5. **Then §5 option 3** (tier-2 GEMV retune), discounted per the estimation lesson in §5.
-   **Re-scoped by the corrected §4.6 numbers** — the fused `in_proj` is at **91%** of wall, not the
-   60% the stale analyzer table reported, so it is *not* a candidate. What remains, all confirmed
-   against launch geometry in the 2026-07-25b trace: shared-expert down **44%** (0.331 ms/tok),
-   shared-expert gate_up **60%** (0.486), MoE router fp16 **61%** (0.443), `out_proj`/`o_proj`
-   **74%** (1.579 — the largest), routed-expert down **76%** (1.533). `out_proj`/`o_proj` is the
-   only one big enough to be worth a session on its own.
+**5. Tier-2 GEMV retune on the decode path**, discounted per the estimation lesson in §5 and
+re-scoped by the corrected §4.6 numbers — the fused `in_proj` is at **91%** of wall, not the 60%
+the stale analyzer reported, so it is *not* a candidate. What remains, all confirmed against
+launch geometry in the 2026-07-25b trace:
 
-**Not re-gated: the VL path.** `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward`, so it inherits
-the in-place update **and the §13 conv fusion**, but there is **no compiled VL model on this box**,
-so the 176/180 multimodal gate from f667b07e was not re-run. Rebuild and re-gate it before trusting
-the VL build. Note both loaders were already updated for the 4-way `in_proj` concat, so a VL
-rebuild should just work.
+| kernel | % of wall | ms/tok |
+|---|---:|---:|
+| `out_proj`/`o_proj` (shared) | 74% | **1.579** |
+| routed-expert down | 76% | 1.533 |
+| shared-expert gate_up | 60% | 0.486 |
+| MoE router (fp16) | 61% | 0.443 |
+| shared-expert down | 44% | 0.331 |
+
+`out_proj`/`o_proj` is the only one big enough to be worth a session on its own. Treat 88% as
+optimistic — both big ones differ from the tier-1 kernels in `K` (4096 and 512 vs 2048), so some
+of the gap is shape rather than schedule. That is §9's first open question, below.
+
+**The VL path has not been re-gated.** `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward` and
+`forward_with_history`, so it inherits §11's in-place state, §13's conv fusion, §14's history conv
+and §15's history recurrence — but there is **no compiled VL model on this box**, so the 176/180
+multimodal gate from `f667b07e` has not been re-run since. Rebuild and re-gate before trusting a
+VL build. All three loaders were already updated for the 4-way `in_proj` concat, so the rebuild
+should just work.
+
+#### Closed — IDs kept because §12–§15 reference them
+
+| id | outcome |
+|---|---|
+| **0** | ✅ **Landed, §14** — history-path conv fusion. 35B pp512 +10.9%, 0.8B +22.4% under radix; 107% of its traced estimate. The session also found that every prefill number in this document predated any measurement of the default configuration (§14.1) and fixed the two harness bugs that made it unmeasurable |
+| **0a** | ✅ **Landed, §15** — history-path *recurrent* fusion, both compounding wins as scoped. 35B pp512 395 → 629 (+59.1%), 0.8B 1793 → 3934 (+119.4%), decode neutral; the recurrent pair 365.2 → 95.6 ms (3.82×). Closes §14.1's 2.77× default-configuration penalty and is the first bit-exact history-path change |
+| **0-old** | 🗑 **Deleted** — was a verbatim duplicate of item 0's pre-completion text |
+| **2** | ✅ **Landed, §13** — in-place GDN *conv* state, 35B +2.40% tg / +15.3% pp. The decode estimate was right and the stated rationale was not: the real prize was the TE conv itself at ~42× off roofline, not the state copies |
+| **3** | ❌ **Refuted by measurement, §13 — do not build.** Allowlisting the `rnn_state_*` handle builtins as static in `rewrite_cuda_graph.cc` to make the fused kernel capturable. The capture prediction was correct and everything built on it was wrong: eager launches went *up* 131 → 183/token, idle did not move (1.016 → 1.065 ms/token), and an eager launch costs ~0.9 µs at the margin, so the whole lane is worth ≤0.38 ms/token. §13 has the trace |
+| **4** | ➡ **Promoted to 0b** (2026-07-25b) — a high-margin prompt set now unblocks two gates rather than one |
 
 ### What changed, by file (all committed — see "Committed state" above)
 
@@ -1142,7 +1131,16 @@ Wiring: handles are hoisted **above** the layer loop (`_GDNStateIO` / `_hoist_gd
 placement is load-bearing — TVM's cudagraph pass calls `EndRegion()` on every `vm.builtin.*` call
 ([rewrite_cuda_graph.cc:383](3rdparty/tvm/src/relax/transform/rewrite_cuda_graph.cc#L383)), so
 emitting 30 storage handles inside the loop would cut the capture region 30 extra times. The
-`forward_with_history` (spec-verify) path keeps the copy path unchanged.
+`forward_with_history` path kept the copy path unchanged until §15 fused it too.
+
+**Hoisting the handles out of the loop is only safe because the pointers are stable across steps,
+and that was audited rather than assumed:** in [rnn_state.cc](3rdparty/tvm/src/runtime/vm/rnn_state.cc)
+`storages_` and both slot-id views are allocated once in the constructor, and `CreateView` uses
+byte offset 0 — so a handle fetched once before the layer loop stays valid for every subsequent
+step, at any `max_history`. (What *does* move every step is `history_slot_id`, which is why the
+kernels take the device-side index arrays and do the addressing themselves; see §5.) This audit
+was originally recorded under the now-refuted §9 item 3 and is kept here because it is the reason
+the §11/§13/§14/§15 wiring is correct, independently of that item.
 
 ### Correctness
 
