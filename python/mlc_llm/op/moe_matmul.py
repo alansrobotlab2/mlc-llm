@@ -594,12 +594,32 @@ def _dequantize_group_gemm_v2(
     Ne, N, K = num_local_experts, out_features, in_features
     # BLK_M must be a multiple of the wmma m16n8k16 tile's M=16; the schedule splits
     # it by MICRO=16 and the remainder becomes a serial loop over accumulators.
-    # §16.8 measured cost = CTAs x c(K) with c independent of how many rows a CTA
-    # holds, so widening BLK_M amortizes the same BLK_N x K weight dequant over more
-    # rows and cuts the CTA count. MLC_MOE_GEMM_V2_BLKM exists to A/B that.
+    #
+    # Leave it at 16. Widening it looks like it should amortize the BLK_N x K weight
+    # dequant over more rows, and §17.1 measured that it does not, at either shape this
+    # model runs: at pp512, 4096 rows over 256 experts is *exactly* 16 rows/expert, so
+    # ceildiv(count_e, BLK_M) is 1 at 16, 32 and 64 alike and there is no CTA count to
+    # save (0.51x-0.63x at 32). At the 2048-token chunk, B=16384, the count does halve
+    # and the win is 1.00x-1.01x on balanced routing and a loss on ragged — the halving
+    # is exactly cancelled, because i_o sits outside the k-loop so every extra
+    # row-fragment re-runs the whole dequant. Hoisting the shared loads above i_o would
+    # buy the right to break even. MLC_MOE_GEMM_V2_BLKM stays as a diagnostic; it is
+    # bit-exact at every value, since it does not touch the split over K.
     BLK_M = int(os.environ.get("MLC_MOE_GEMM_V2_BLKM", "16"))
     assert BLK_M % 16 == 0, "BLK_M must be a multiple of the wmma M=16"
-    BLK_N, BLK_K = 128, 32
+    BLK_N = 128
+    # BLK_K sets the k-step of the cooperative fetch, and therefore how many bytes of
+    # each W row are fetched per step: BLK_K int4 values = BLK_K/2 bytes. At the
+    # original 32 that is 16 bytes — *half* a 32-byte sector — so every row-chunk read
+    # pulled a sector it only half-used, and the k-loop paid a __syncthreads() pair per
+    # 16 bytes/row. 64 makes a row-chunk exactly one sector and halves the barrier
+    # count; measured bit-exact and 1.27x-1.39x on both 35B shapes. 128 regresses
+    # (0.80x-0.93x) — shared memory grows linearly and occupancy falls off.
+    BLK_K = int(os.environ.get("MLC_MOE_GEMM_V2_BLKK", "64"))
+    assert BLK_K % 16 == 0, "BLK_K must be a multiple of the wmma K=16"
+    while K % BLK_K:  # the schedule splits k by BLK_K // MICRO, so it has to divide K
+        BLK_K //= 2
+    assert BLK_K >= 16, f"K={K} is not a multiple of the wmma K=16"
     MICRO = 16
     tiles_per_n = (N + BLK_N - 1) // BLK_N
     assert N % BLK_N == 0, "v2 requires N % BLK_N == 0 (no col padding)"
@@ -693,45 +713,50 @@ def _dequantize_group_gemm_v2(
                 row_end = T.if_then_else(e_v >= 0, indptr_buf[e_v + 1], 0)
                 e_safe = T.if_then_else(e_v >= 0, e_v, 0)
 
-                for a0, a1 in T.grid(BLK_M, K):
-                    with T.sblock("X_shared"):
-                        i, j = T.axis.remap("SS", [a0, a1])
-                        X_tile[i, j] = T.if_then_else(
-                            m_offset + i < row_end,
-                            X[m_offset + i, j],
-                            zero_f16,
-                        )
+                # Unit loop wrapping the whole CTA body. Inert as written; item 0f's
+                # rewrite turns its extent into `Select(e_v >= 0, 1, 0)` so a padding
+                # CTA skips *everything*, not just the reduction. See
+                # `_guard_padding_ctas` for why this is a loop extent and not an `if`.
+                for _guard in T.serial(1, annotations={"moe_pad_guard": 1}):
+                    for a0, a1 in T.grid(BLK_M, K):
+                        with T.sblock("X_shared"):
+                            i, j = T.axis.remap("SS", [a0, a1])
+                            X_tile[i, j] = T.if_then_else(
+                                m_offset + i < row_end,
+                                X[m_offset + i, j],
+                                zero_f16,
+                            )
 
-                for a0, a1 in T.grid(BLK_N, K):
-                    with T.sblock("W_shared"):
-                        i, j = T.axis.remap("SS", [a0, a1])
-                        shift = T.Cast(storage_dtype, (j % num_elem_per_storage) * quantize_dtype_bits)
-                        w_int = T.Cast(
-                            model_dtype,
-                            T.bitwise_and(
-                                T.shift_right(
-                                    W_q[e_safe, n_offset + i, j // num_elem_per_storage],
-                                    shift,
+                    for a0, a1 in T.grid(BLK_N, K):
+                        with T.sblock("W_shared"):
+                            i, j = T.axis.remap("SS", [a0, a1])
+                            shift = T.Cast(storage_dtype, (j % num_elem_per_storage) * quantize_dtype_bits)
+                            w_int = T.Cast(
+                                model_dtype,
+                                T.bitwise_and(
+                                    T.shift_right(
+                                        W_q[e_safe, n_offset + i, j // num_elem_per_storage],
+                                        shift,
+                                    ),
+                                    T.Cast(storage_dtype, (1 << quantize_dtype_bits) - 1),
                                 ),
-                                T.Cast(storage_dtype, (1 << quantize_dtype_bits) - 1),
-                            ),
-                        )
-                        W_tile[i, j] = (w_int - T.Cast(model_dtype, (1 << (quantize_dtype_bits - 1)) - 1)) * Scale[
-                            e_safe, n_offset + i, j // group_size
-                        ]
+                            )
+                            W_tile[i, j] = (w_int - T.Cast(model_dtype, (1 << (quantize_dtype_bits - 1)) - 1)) * Scale[
+                                e_safe, n_offset + i, j // group_size
+                            ]
 
-                for a0, a1, a2 in T.grid(BLK_M, BLK_N, K):
-                    with T.sblock("compute"):
-                        i, j, k = T.axis.remap("SSR", [a0, a1, a2])
-                        with T.init():
-                            O_tile[i, j] = zero_f16
-                        O_tile[i, j] = O_tile[i, j] + X_tile[i, k] * W_tile[j, k]
+                    for a0, a1, a2 in T.grid(BLK_M, BLK_N, K):
+                        with T.sblock("compute"):
+                            i, j, k = T.axis.remap("SSR", [a0, a1, a2])
+                            with T.init():
+                                O_tile[i, j] = zero_f16
+                            O_tile[i, j] = O_tile[i, j] + X_tile[i, k] * W_tile[j, k]
 
-                for a0, a1 in T.grid(BLK_M, BLK_N):
-                    with T.sblock("store"):
-                        i, j = T.axis.remap("SS", [a0, a1])
-                        if m_offset + i < row_end:
-                            out[m_offset + i, n_offset + j] = O_tile[i, j]
+                    for a0, a1 in T.grid(BLK_M, BLK_N):
+                        with T.sblock("store"):
+                            i, j = T.axis.remap("SS", [a0, a1])
+                            if m_offset + i < row_end:
+                                out[m_offset + i, n_offset + j] = O_tile[i, j]
 
     # ---------- schedule: hand-tensorize wmma m16n8k16 ----------
     def _schedule_v2():
@@ -744,7 +769,8 @@ def _dequantize_group_gemm_v2(
         VEC = 4
 
         main_block = sch.get_sblock("compute")
-        i, j, k = sch.get_loops(main_block)
+        # The leading loop is the `moe_pad_guard` unit loop, not a compute axis.
+        _guard, i, j, k = sch.get_loops(main_block)
         i_o, i_i = sch.split(i, factors=[None, MICRO])
         j_o, j_i = sch.split(j, factors=[None, MICRO])
         k_o, k_i = sch.split(k, factors=[None, MICRO])
@@ -756,6 +782,10 @@ def _dequantize_group_gemm_v2(
         k_o_o, k_o_i = sch.split(k_o, factors=[None, BLK_K // MICRO])
         sch.reorder(i_o, j_o, k_o_o, k_o_i)
         sch.bind(j_o, "threadIdx.y")
+        # Tag k_o_o so item 0f can find it by name. It used to be located by matching
+        # `extent == K // BLK_K`, which is not unique — at K=512, BLK_K=64 that extent
+        # is 8 and so is another loop, and the rewrite refused to run at all.
+        sch.annotate(k_o_o, "moe_koo_guard", 1)
 
         x_shared = sch.get_sblock("X_shared")
         w_shared = sch.get_sblock("W_shared")
@@ -771,6 +801,11 @@ def _dequantize_group_gemm_v2(
             sch.storage_align(blk, 0, axis=-2, factor=16, offset=8)
 
         _coop(x_shared)
+        # NB: VEC is capped at 4 here and cannot be widened to cover a whole uint32.
+        # At VEC=4 a thread unpacks 4 of the 8 nibbles in a word, so thread pairs fetch
+        # the same word; VEC=8 would fix that but the dequant's intermediate is a uint32
+        # vector, and `Ramp of more than 4 lanes is not allowed` (128-bit ceiling).
+        # The duplicate fetches share an address, so they cost L1 requests, not DRAM.
         _coop(w_shared)
 
         A_mat = sch.cache_read(block_outer, 0, "wmma.matrix_a")
@@ -828,8 +863,8 @@ def _dequantize_group_gemm_v2(
         return sch.mod["main"]
 
     # ---------- item 0f: skip the dispatch table's padding CTAs ----------
-    def _guard_padding_ctas(func):
-        """Give the reduction loop a zero trip count on the sentinel tiles.
+    def _guard_padding_ctas(func, whole_body: bool = True):
+        """Give the sentinel tiles' loops a zero trip count.
 
         v2's grid is `(ceildiv(B, BLK_M) + Ne) * tiles_per_n`; the `+ Ne` slack gives
         each expert a private index range without a prefix scan, and those slack CTAs
@@ -858,8 +893,16 @@ def _dequantize_group_gemm_v2(
         zeros and still stores it to `O_tile`, and the global store is predicated on
         `row_end`, which is 0 exactly when `e_v < 0` — so nothing it writes was ever
         observable.
+
+        `whole_body` extends the same trick to the `moe_pad_guard` unit loop that
+        wraps the entire CTA body, which the k_o_o guard alone cannot reach: §16.10
+        measured a k_o_o-skipped CTA at 20% of a full one, the residue being the
+        accumulator fill, the accumulator -> O_tile store and the predicated-off
+        global store loop. Zeroing the outer extent drops all three. The uniformity
+        argument is unchanged — `e_v` is CTA-uniform either way — and so is
+        bit-exactness, since none of the skipped writes leave shared memory.
+        Set `MLC_MOE_GEMM_V2_SKIPPAD=koo` to A/B against the §16.10 mechanism.
         """
-        k_outer = K // BLK_K
         # Locate `e_v`, bound by the first Bind in the CTA block, which is an
         # ancestor of every loop below and so is in scope at the extent.
         found = []
@@ -873,41 +916,49 @@ def _dequantize_group_gemm_v2(
             raise RuntimeError(f"expected exactly one CTA sblock, found {len(found)}")
         e_v_var = found[0]
 
-        hits = []
+        hits, guards = [], []
 
-        def _rewrite(node):
-            if (
-                not isinstance(node, tirx.For)
-                or node.thread_binding is not None
-                or node.kind != tirx.ForKind.SERIAL
-                or not isinstance(node.extent, tirx.IntImm)
-                or int(node.extent) != k_outer
-            ):
-                return None
-            hits.append(node)
+        def _zero_extent(node):
             return tirx.For(
                 node.loop_var, node.min,
                 tirx.Select(e_v_var >= 0, node.extent, tirx.IntImm(node.extent.dtype, 0)),
                 node.kind, node.body, node.thread_binding, node.annotations,
             )
 
+        def _rewrite(node):
+            if not isinstance(node, tirx.For) or node.thread_binding is not None:
+                return None
+            ann = node.annotations or {}
+            if "moe_pad_guard" in ann:
+                guards.append(node)
+                return _zero_extent(node) if whole_body else None
+            if "moe_koo_guard" in ann:
+                hits.append(node)
+                return _zero_extent(node)
+            return None
+
         body = tirx.stmt_functor.ir_transform(func.body, None, _rewrite, ["tirx.For"])
-        # The k_o_o loop is the only serial loop at K/BLK_K trips. If the schedule
-        # ever grows a second one this silently halves the win, so fail instead.
-        if len(hits) != 1:
-            raise RuntimeError(
-                f"expected exactly one serial loop of extent {k_outer} (k_o_o), "
-                f"found {len(hits)}; the 0f rewrite needs updating"
-            )
+        # Both markers must survive the schedule. Silently losing either one costs a
+        # measured chunk of the win rather than producing a wrong answer, which is
+        # exactly the kind of regression that hides — so fail instead.
+        for tag, got in (("moe_pad_guard", guards), ("moe_koo_guard", hits)):
+            if len(got) != 1:
+                raise RuntimeError(
+                    f"expected exactly one `{tag}` loop, found {len(got)}; "
+                    "the schedule dropped or duplicated it"
+                )
         return func.with_body(body)
 
     scheduled = _schedule_v2()
     # Default ON since §16.11: bit-exact on all 8 gate cases, +19.4% pp512 on the 35B
     # (644.26 -> 769.18 tps), decode neutral, and the state gate is *identical* to the
-    # pre-change lib in both prefix-cache modes. `MLC_MOE_GEMM_V2_SKIPPAD=0` restores
-    # the un-skipped kernel for an A/B.
-    if os.environ.get("MLC_MOE_GEMM_V2_SKIPPAD", "1") == "1":
-        scheduled = _guard_padding_ctas(scheduled)
+    # pre-change lib in both prefix-cache modes.
+    #   `MLC_MOE_GEMM_V2_SKIPPAD=0`   restores the un-skipped kernel
+    #   `MLC_MOE_GEMM_V2_SKIPPAD=koo` restores §16.10's k_o_o-only guard, which leaves
+    #                                 a skipped CTA at 20% of a full one
+    _skippad = os.environ.get("MLC_MOE_GEMM_V2_SKIPPAD", "1")
+    if _skippad != "0":
+        scheduled = _guard_padding_ctas(scheduled, whole_body=_skippad != "koo")
 
     return op.tensor_ir_op(
         scheduled,
