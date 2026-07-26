@@ -888,6 +888,10 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `0dd23758` | commit-table backfill for `5294dae4` and `8562fade` |
 | `6daef3e2` | **§16.9** item 0f's two obvious routes refuted; `MLC_MOE_GEMM_V2_BLKM` A/B knob (inert at 16); §16.8's dequant attribution corrected |
 | `88fce949` | commit-table backfill for `6daef3e2` |
+| `1aa29196` | commit-table order + two missing rows; §16.8 heading no longer quotes the top of its own range |
+| `31283474` | **§16.9** node classes located (`tvm.tirx`), 0f's blocker narrowed |
+| `ec051589` | **§16.10** item 0f built — padding-CTA skip via a zero loop extent, bit-exact, 1.28–1.73×; `scripts/moe_gemm_check.py` |
+| `4b7d1be6` | item 0f marked built; handoff repointed at the end-to-end measurement |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
