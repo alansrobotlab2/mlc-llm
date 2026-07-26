@@ -1895,3 +1895,193 @@ Cheaper things to check first, in case they move it without the restructure: the
 almost certainly caps occupancy at 1 block/SM — worth confirming, since a smaller register
 footprint (splitting `K` across two blocks with a cross-thread reduction per `t`) might raise
 occupancy without changing the algorithm.
+
+---
+
+## 16. Session 2026-07-26 — the gates get teeth, and three diagnoses (in progress)
+
+Four §9 items were open at the start of this session: **0b** (a deterministic 35B state gate),
+**0c** (the parallelism-starved GDN recurrence), **1** (should the 35B decode more than one
+sequence), and **5** (the tier-2 GEMV retune). This section covers all four. Measurements that
+were still running when it was written are marked **[pending]**.
+
+### 16.1 Item 0b — LANDED. The 35B finally has a gate that can adjudicate a state change
+
+§6.2 left this with a diagnosis and a one-line prescription ("build a high-margin prompt set").
+Carrying it out surfaced a second defect that the prescription alone would not have fixed.
+
+**Defect 1 — the prompt set.** As diagnosed. The old five are open-ended continuations where the
+next token is a near-tie, so 4-bit-vs-8-bit noise decides them.
+
+**Defect 2 — cascade, which is the larger one and was not in the diagnosis.** Both sides
+free-run. One near-tie flip and the two sequences are in *different contexts* for every later
+position, so the score is dominated by where the first flip happened rather than by how often the
+model disagrees. That is why §6.2 read 1/50, 15/50, 2/50, 5/50, 50/50: those are five samples of
+"when did it first diverge", not five measurements of agreement.
+
+[scripts/high_margin_gate.py](scripts/high_margin_gate.py) fixes both:
+
+1. **Teacher forcing.** At position `i`, MLC is asked for exactly one token given the reference's
+   own prefix `prompt + ref_tokens[:i]`. Every position is scored in the context the reference
+   saw, so a flip at position 3 cannot contaminate position 4. Implemented over the public engine
+   API — `_generate` accepts a token-id list, so no new plumbing.
+2. **Margin-gated scoring.** The capture step records `logprob(top1) - logprob(top2)` at every
+   position; the check step asserts agreement only where that margin clears `--tau`. A wide-margin
+   flip is a bug; a near-tie flip is quantization. The pass bar stops being an inherited constant.
+
+Under `radix`, teacher forcing is also a harder exercise of the history path than anything else in
+the tree: each of the 400 requests extends the previous by exactly one token, which is the
+fork-and-extend case the recurrent ring exists to serve.
+
+**τ = 2.0 is calibrated, not asserted.** The 0.8B is the control, because it has both an fp16
+reference *and* a 4-bit build — the same relationship the 35B has to its fp8 reference:
+
+| lib vs `Qwen3.5-0.8B` fp16 reference | τ=0 | τ=0.5 | τ=1.0 | τ=2.0 | τ=4.0 | τ=8.0 |
+|---|---:|---:|---:|---:|---:|---:|
+| `q0f16` (fp16, radix) | 400/400 | 385/385 | 376/376 | 361/361 | 267/267 | 64/64 |
+| `q0f16` (fp16, disable) | 400/400 | 385/385 | 376/376 | 361/361 | 267/267 | 64/64 |
+| `q4f16_g16e` (4-bit, radix) | 389/400 | 381/385 | 375/376 | **361/361** | 267/267 | 64/64 |
+
+Two things fall out. The fp16 build agrees with HuggingFace at **every one of 400 positions**,
+including all 39 near-ties — a stronger statement than the old 5×50/50. And 4-bit quantization
+flips 11 positions, **every one of them at margin ≤ 1.031**, so τ=2.0 clears the highest observed
+quantization flip by ~2×. The same 4-bit lib scores 1/5 prompts under the old free-running gate.
+
+**A negative control, because a gate that cannot fail is not a gate.** `--negative-control stale1`
+feeds a prefix one token short while still scoring against the reference — the outward signature
+of an off-by-one in history-state indexing. On the same fp16 lib that scores 361/361:
+
+| run | agreement at τ=2.0 |
+|---|---|
+| normal | **361/361 (100%)** |
+| `stale1` | **19/361 (5.3%)** |
+
+Genuine 4-bit noise and a one-step-stale state are separated by ~19× at the pass bar. The
+distribution is flat across τ (4.7% at τ=0, 6.3% at τ=8), which is the signature of a *mechanism*
+break rather than a rounding difference — margin does not protect you from computing on the wrong
+state, and that asymmetry is what makes the gate diagnostic rather than merely sensitive.
+
+**The second gate it unblocks.** §9 item 0b claimed a high-margin set would fix two gates, and
+[scripts/prefix_cache_roundtrip.py](scripts/prefix_cache_roundtrip.py) was the other: §13 measured
+it failing on the *unmodified 35B baseline* in 3 runs out of 4, always on the primary-colours
+prompt, always the same near-tie ("red, yellow, and blue" vs "red, blue, and yellow"). Its five
+prompt families were the same fp16-era set. They are now the high-margin families, each extension
+being the model's own measured continuation (checked against
+`tuning/high_margin_ref_0.8b_fp16.json`), with `--legacy-prompts` retained so §13's numbers stay
+reproducible. **[pending]** — 4 runs on the 35B baseline, plus 2 legacy-set control runs.
+
+**35B fp8 reference and checks: [pending].** Capture runs ~12 min/prompt through the software
+W8A16 shim.
+
+### 16.2 Item 0c.1 — the "cheap first" step, answered. Two corrections to the hypothesis
+
+§15's closing paragraph guessed that `K=128` fp32 registers per thread "almost certainly caps
+occupancy at 1 block/SM" and proposed splitting `K` across two *blocks* with a cross-thread
+reduction. Confirmed by `ptxas -v` and `nvdisasm` on the kernel TVM actually emits — with two
+corrections, one of which invalidates the proposed mechanism.
+
+**Correction 1 — registers do not cap it at 1 block/SM; the *grid* does.** ptxas lands on **255
+registers/thread**, the hardware ceiling, which permits **2** blocks/SM at 128 threads. But the
+kernel launches `(n_kh, batch)` = **16 blocks at batch=1 on a 16-SM GPU**, so only **1.00 blocks/SM
+is available to schedule**. Occupancy is 4 warps of the 48 an SM holds — **8.3%** — and it is
+grid-bound, not register-bound. A change that only reduced register pressure would buy nothing.
+
+**Correction 2 — the state does not fit in registers, and §15's "no bandwidth left" is DRAM-only.**
+`float state_local[128]` is 512 bytes/thread; ptxas keeps ~81 rows in registers and **spills 47** —
+`192 bytes stack frame, 188 bytes spill stores, 188 bytes spill loads`, and exactly **47 LDL + 47
+STL** in the SASS. Both inner loops touch all 128 rows every timestep, so those 47 rows are
+reloaded and restored *per position*. It is L1/L2 traffic rather than DRAM, which is why §15's
+bandwidth analysis did not see it, but it is memory traffic in the inner loop.
+
+**And the finding neither the hypothesis nor §15 had — the dot products are one serial FMA chain.**
+Disassembling the emitted kernel: 256 FFMAs per timestep (2 dots × 128 rows, fully unrolled), of
+which **115 consecutive FFMAs accumulate into a single register, R124**:
+
+```
+FFMA R124, R125, R158, R124 ;
+FFMA R124, R125, R157, R124 ;
+FFMA R124, R125, R156, R124 ;      <- 115 of these in a row, one accumulator
+```
+
+At ~4-cycle FFMA latency that is a ~1000-cycle dependency chain per position, and with 4 warps/SM
+(one per scheduler) there is nothing to interleave against it: each scheduler issues one FFMA every
+4 cycles, ~25% of issue capacity. That is the mechanism behind §15.6's "202 GFLOP/s, 3.8% of peak"
+— **not** bandwidth, and only partly occupancy.
+
+**Why the proposed fix cannot be built as proposed.** `K` is reduced *inside* a thread: `threadIdx.x`
+indexes `V`, each thread owns one value column and loops over all 128 key rows. Splitting `K` across
+two **blocks** would need a cross-**block** reduction *every timestep* — a global barrier per
+position, fatal for a sequential recurrence. Splitting `K` across **lanes** of the same block is the
+viable form, and if the split is laid out `tid = v*2 + half` the two halves land on adjacent lanes,
+so the reduction is a single `__shfl_xor_sync` with no `__syncthreads` at all.
+
+[scripts/gdn_recurrence_probe.cu](scripts/gdn_recurrence_probe.cu) builds four variants to separate
+the three causes. Static resource usage, before timing:
+
+| variant | threads | floats/thread | registers | spill | warps/SM |
+|---|---:|---:|---:|---:|---:|
+| `base` (as shipped) | 128 | 128 | 255 | 240 B | 4 |
+| `acc4` (4 accumulators) | 128 | 128 | 255 | **424 B** | 4 |
+| `ksplit2` (K/2 across lanes) | 256 | 64 | 168 | **0** | 8 |
+| `ksplit4` (K/4 across lanes) | 512 | 32 | **97** | **0** | 16 |
+
+`acc4` isolates the chain: it shortens the dependency 4× but spills *more*, so if it still wins,
+latency dominates spill. `ksplit4` vs `ksplit2` discriminates occupancy from spill — both are
+spill-free, only occupancy differs. **Timings [pending].**
+
+### 16.3 Item 5 — the sm_87 GEMV tile is K-blind, and the gap tracks N, not K
+
+§9's open question asks why `out_proj`/`o_proj` (75%) and routed-expert down (76%) fall short of
+the 88% the same schedule reaches at K=2048, and whether that is shape-driven or schedule-driven.
+Reading the rule first ([gemv.py](3rdparty/tvm/python/tvm/s_tir/dlight/gpu/gemv.py)) changes what
+the measurement needs to be:
+
+**There is no K term in the tile choice at all.** The sm_87 branch sets `TS, TR = 32, 16` with
+`TILE_S = 2` unconditionally, so one tile is applied to K=512 and K=4096 alike. K and the schedule
+are therefore confounded in every number in §4.6 — nothing measured so far can separate them.
+
+`TS × TILE_S = 64` output elements per block, so **block count is `N/64`**, and re-reading §4.6
+against that makes the pattern look like N rather than K:
+
+| kernel | N | blocks | blocks/SM | % of wall |
+|---|---:|---:|---:|---:|
+| `lm_head` | 248320 | 3880 | 242 | **100%** |
+| attn `c_attn` | 9216 | 144 | 9.0 | **91%** |
+| GDN `in_proj_qkv` | 8192 | 128 | 8.0 | **88%** |
+| `out_proj`/`o_proj` | 2048 | 32 | 2.0 | 75% |
+| shared expert gate_up | 1024 | 16 | 1.0 | 61% |
+| MoE router (fp16) | 256 | 4 | 0.25 | 60% |
+
+That is monotone in block count and *not* monotone in K — `in_proj_qkv` (K=2048) and `c_attn`
+(K=2048) sit at 88–91% while `out_proj` (K=4096) sits at 75% with a quarter of the blocks. The
+routed-expert MoE GEMVs fit too once the expert dimension is counted: gate_up gets 8×16 = 128
+effective blocks and reaches 88%.
+
+If that holds, the sm_87 override — which was tuned on the MoE GEMVs, where the top-8 expert
+dimension multiplies block count by 8 — is **over-tiling the dense small-N kernels**, and
+`out_proj`/`o_proj` at 8.1% of the decode budget is its largest victim.
+
+Two instruments were added to settle it, both **[pending]**:
+- `bench_moe_kernel.py` gained a K-sweep at fixed N=2048 and an N-sweep at fixed K=2048 — the
+  first varies reduction depth alone, the second varies block count alone — plus achieved-bandwidth
+  reporting against the 156 GB/s wall so the numbers are directly comparable to §4.6.
+- `MLC_GEMV_TSTR="TS,TR,TILE_S"` in `gemv.py` overrides the sm_87 tile, so several schedules can be
+  timed at one fixed shape. Inert when unset. `"16,32,1"` reproduces the generic CUDA schedule
+  exactly, which is the A/B that matters; `"32,16,2"` reproduces production and doubles as a check
+  that the hook is live.
+
+### 16.4 Item 1 — the option list was missing an option
+
+The decision needs `bench_moe_kernel.py` (**[pending]**), but reading the block first turns up
+something the §9 write-up does not mention: **a per-token gemv dispatch for small batches already
+exists and ships**, at [qwen3_5_moe_model.py:141-153](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L141-L153).
+For `1 < num_tokens <= 5` the MoE block splits the batch and routes each token through the b=1
+`dequantize_gemv` path, added for spec-decode verify. Its comment carries a measurement §9 does not
+cite: *"Bench at B=24 group_gemm showed 0.058 ms/row flat at small batch vs gemv 0.008 ms/row →
+~7× speedup per-token."*
+
+So the choice is not only (a) Relax `If`, (b) a second decode entry point, (c) interactive-only.
+There is (d): **widen the existing literal-batch split**, which needs no new kernel and no runtime
+dispatch — only a literal `num_tokens`, which a fixed `max_batch_size` lib already has. What decides
+between (b)/(d) and (c) is how per-token gemv cost scales against `group_gemm` at
+B = batch × top_k, which is what the queued sweep at B = 8/16/32/64 measures.

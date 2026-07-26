@@ -53,7 +53,29 @@ import tempfile
 
 # Shared-prefix families: each base is a strict prefix of its extension, which is what
 # forces a fork-with-rollback rather than a clean exact-match reuse.
+#
+# High-margin set (workplan §9 item 0b, adopted 2026-07-26). Every family is an exact
+# continuation — Fibonacci, powers of two, a times table, the alphabet, verbatim copy —
+# so the top-1 logit gap is wide at nearly every position and 4-bit rounding cannot flip
+# it. Each extension is the model's *own* measured continuation, checked against
+# `tuning/high_margin_ref_0.8b_fp16.json`, so the fork lands back in the high-margin
+# regime instead of at a near-tie.
+#
+# The previous set was inherited from an fp16-vs-fp16 era and made this gate unusable on
+# the 35B: §13 measured it failing on the *unmodified baseline* in 3 runs out of 4, and
+# the divergence was always the same near-tie ("red, yellow, and blue" vs "red, blue, and
+# yellow" on the primary-colours prompt). That is the instrument, not the model. Pass
+# `--legacy-prompts` to reproduce pre-2026-07-26 numbers.
 PROMPT_FAMILIES = [
+    ("1, 1, 2, 3, 5, 8, 13, 21,", " 34, 55, 89, 144,"),
+    ("2, 4, 8, 16, 32, 64, 128, 256,", " 512, 1024, 2048,"),
+    ("3 x 1 = 3\n3 x 2 = 6\n3 x 3 = 9\n3 x 4 = 12\n3 x 5 =", " 15\n3 x 6 = 18\n3 x 7 ="),
+    ("a, b, c, d, e, f, g, h, i,", " j, k, l, m, n,"),
+    ("Repeat the list exactly.\nList: alpha bravo charlie delta echo foxtrot golf hotel\n"
+     "List: alpha", " bravo charlie delta echo"),
+]
+
+LEGACY_PROMPT_FAMILIES = [
     ("The capital of France is", " Paris, a city on the river Seine which"),
     ("def fibonacci(n):\n    ", "if n <= 1:\n        return n\n    "),
     ("1, 1, 2, 3, 5, 8, 13, 21,", " 34, 55, 89, 144,"),
@@ -95,6 +117,11 @@ def main() -> int:
         help="Default 'radix' is the point of this test; 'disable' is only for a control run.",
     )
     p.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
+    p.add_argument(
+        "--legacy-prompts", action="store_true",
+        help="Use the pre-2026-07-26 near-tie prompt set. Only for reproducing the "
+             "historical numbers in workplan §13 — it cannot adjudicate a 4-bit model.",
+    )
     # Internal: the driver re-invokes this script once per phase so each engine gets its
     # own process (see the comment in main). Not meant to be passed by hand.
     p.add_argument("--phase", choices=["cold", "warm"], default=None, help=argparse.SUPPRESS)
@@ -107,8 +134,9 @@ def main() -> int:
     model_name = json.loads(
         (pathlib.Path(args.model_dir) / "mlc-chat-config.json").read_text()
     )["model_type"]
-    bases = [b for b, _ in PROMPT_FAMILIES]
-    extended = [b + e for b, e in PROMPT_FAMILIES]
+    families = LEGACY_PROMPT_FAMILIES if args.legacy_prompts else PROMPT_FAMILIES
+    bases = [b for b, _ in families]
+    extended = [b + e for b, e in families]
 
     def new_engine():
         return MLCEngine(
@@ -162,6 +190,10 @@ def main() -> int:
         "--device", args.device, "--prefix-cache-mode", args.prefix_cache_mode,
         "--max-tokens", str(args.max_tokens),
     ]
+    # Must propagate: the two phases run as separate processes and comparing a cold run
+    # on one prompt set against a warm run on the other would fail everything.
+    if args.legacy_prompts:
+        common.append("--legacy-prompts")
     for phase, out_path in (("cold", cold_json), ("warm", warm_json)):
         print(f"[prefix-cache] running {phase} phase...", flush=True)
         rc = subprocess.call(common + ["--phase", phase, "--emit-json", out_path])

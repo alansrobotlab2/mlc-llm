@@ -111,6 +111,25 @@ SHAPES = {
     "ft_attn_o_proj":           dict(Ne=0, N=2048,   K=4096, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
     "ft_gdn_in_proj_z":         dict(Ne=0, N=4096,   K=2048, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
     "ft_lm_head":               dict(Ne=0, N=248064, K=2048, group_size=64, top_k=0, B=1, spread=False, kind="ft_dense_gemv"),
+    # ===== §9 item 5: is the o_proj/down gap shape-driven or schedule-driven? =====
+    # §4.6 has o_proj (N=2048, K=4096) at 74% of the 156 GB/s wall and routed-expert
+    # down (N=2048, K=512) at 76%, against 88% for the same schedule at K=2048. The
+    # sm_87 branch of dlight's GEMV rule pins TS,TR = 32,16 with no K term at all, so
+    # K and the schedule are confounded in every number measured so far. These sweep
+    # K at FIXED N=2048 — same output width, same block count, only the reduction
+    # depth moves — which separates the two. Pair with MLC_GEMV_TSTR to vary the
+    # schedule at a fixed shape.
+    "ksweep_n2048_k512":   dict(Ne=0, N=2048, K=512,   group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "ksweep_n2048_k1024":  dict(Ne=0, N=2048, K=1024,  group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "ksweep_n2048_k2048":  dict(Ne=0, N=2048, K=2048,  group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "ksweep_n2048_k4096":  dict(Ne=0, N=2048, K=4096,  group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "ksweep_n2048_k8192":  dict(Ne=0, N=2048, K=8192,  group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    # N-sweep at fixed K=2048 — the control. If bandwidth tracks N (block count) and
+    # not K, the o_proj gap is not about reduction depth at all.
+    "nsweep_k2048_n512":   dict(Ne=0, N=512,   K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "nsweep_k2048_n1024":  dict(Ne=0, N=1024,  K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "nsweep_k2048_n2048":  dict(Ne=0, N=2048,  K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
+    "nsweep_k2048_n4096":  dict(Ne=0, N=4096,  K=2048, group_size=32, top_k=0, B=1, spread=False, kind="dense_gemv"),
 }
 
 
@@ -330,6 +349,32 @@ def make_inputs(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
     return [_upload(a, dev) for a in (x_np, w_np, scale_np, indptr_np)]
 
 
+# Measured achievable bandwidth on this box (§4.3) — NOT the 204.8 GB/s spec number.
+# Every "% of wall" in the workplan is against this.
+BW_WALL_GBS = 156.0
+
+
+def bandwidth(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
+              kind: str, median_ms: float) -> dict:
+    """Bytes the kernel is obliged to move, and what fraction of the wall that reaches.
+
+    Weight traffic dominates at b=1 and is the only term that differs between the
+    shapes under test: int4 weights at K*N/2 bytes plus fp16 group scales. Activations
+    are counted too but are noise at these sizes. For the MoE kinds only the *active*
+    experts are touched, so the weight term carries top_k, not Ne.
+    """
+    if kind == "topk_softmax" or median_ms <= 0:
+        return {}
+    experts = top_k if kind in ("gemv", "group_gemm") else 1
+    w_bytes = experts * (N * K // 2)                      # int4
+    if group_size:
+        w_bytes += experts * (N * (K // group_size) * 2)  # fp16 scales
+    act_bytes = B * K * 2 + B * N * 2
+    total = w_bytes + act_bytes
+    gbs = total / (median_ms * 1e-3) / 1e9
+    return {"bytes": total, "gb_s": gbs, "pct_wall": 100.0 * gbs / BW_WALL_GBS}
+
+
 def time_kernel(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
                 spread: bool, kind: str, target, dev, repeats: int, number: int):
     vm = build_vm(Ne, N, K, group_size, top_k, B, spread, kind, target, dev)
@@ -342,12 +387,14 @@ def time_kernel(Ne: int, N: int, K: int, group_size: int, top_k: int, B: int,
 
     timer = vm.module.time_evaluator("forward", dev, number=number, repeat=repeats)
     r = timer(*inputs)
-    return {
+    out = {
         "shape": [Ne, N, K, group_size, top_k, B],
         "median_ms": r.median * 1000.0,
         "min_ms":    r.min * 1000.0,
         "std_ms":    r.std * 1000.0,
     }
+    out.update(bandwidth(Ne, N, K, group_size, top_k, B, kind, out["median_ms"]))
+    return out
 
 
 def main() -> None:
@@ -378,8 +425,10 @@ def main() -> None:
         r = time_kernel(**cfg, target=target, dev=dev,
                         repeats=args.repeats, number=args.number)
         results[name] = r
+        bw = (f"  {r['gb_s']:6.1f} GB/s = {r['pct_wall']:5.1f}% of the {BW_WALL_GBS:.0f} wall"
+              if "gb_s" in r else "")
         print(f"        median={r['median_ms']:.3f} ms  "
-              f"min={r['min_ms']:.3f} ms  std={r['std_ms']:.3f} ms")
+              f"min={r['min_ms']:.3f} ms  std={r['std_ms']:.3f} ms{bw}")
 
     if args.baseline:
         print()
