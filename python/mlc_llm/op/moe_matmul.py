@@ -592,7 +592,14 @@ def _dequantize_group_gemm_v2(
     num_storage = group_size // num_elem_per_storage * num_group
 
     Ne, N, K = num_local_experts, out_features, in_features
-    BLK_M, BLK_N, BLK_K = 16, 128, 32  # BLK_M=16 required for wmma m16n8k16
+    # BLK_M must be a multiple of the wmma m16n8k16 tile's M=16; the schedule splits
+    # it by MICRO=16 and the remainder becomes a serial loop over accumulators.
+    # §16.8 measured cost = CTAs x c(K) with c independent of how many rows a CTA
+    # holds, so widening BLK_M amortizes the same BLK_N x K weight dequant over more
+    # rows and cuts the CTA count. MLC_MOE_GEMM_V2_BLKM exists to A/B that.
+    BLK_M = int(os.environ.get("MLC_MOE_GEMM_V2_BLKM", "16"))
+    assert BLK_M % 16 == 0, "BLK_M must be a multiple of the wmma M=16"
+    BLK_N, BLK_K = 128, 32
     MICRO = 16
     tiles_per_n = (N + BLK_N - 1) // BLK_N
     assert N % BLK_N == 0, "v2 requires N % BLK_N == 0 (no col padding)"

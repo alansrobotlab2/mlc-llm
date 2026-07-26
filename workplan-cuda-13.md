@@ -957,10 +957,16 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > And **27–50% of its CTAs are dispatch-table padding that runs the full dequant + wmma and discards
 > the result**, because the sentinel path guards only the `X` read and the store.
 >
-> **Item 0f is that early exit** — predicate the `W_shared` load and the compute block on
-> `e_v >= 0`. Bit-exact by construction, worth **+16% to +34% pp512** (the range is router balance;
-> a balanced router means *more* padding and a bigger win). Read 0f's two cautions before starting:
-> the guard has to survive `blockize`/`cache_read`/`tensorize`, and the +34% end is the best case.
+> **Item 0f is that early exit** — skip the `W_shared` load and the compute block when `e_v < 0`.
+> Bit-exact by construction, worth **+16% to +34% pp512** (the range is router balance; a balanced
+> router means *more* padding and a bigger win).
+>
+> **§16.9 already burned the two obvious routes, so start from there, not from scratch.** A
+> source-level `if e_v >= 0:` dies inside `sch.compute_at` — the guard must be applied *after*
+> `_schedule_v2()`, as a stmt mutator, and this fork renames `tvm.tir` to `tvm.s_tir` with the node
+> classes moved. Widening `BLK_M` instead is a **0.64×/0.39× regression**, because `i_o` sits outside
+> the k-loop so every extra row-fragment re-runs the whole dequant. That last one also corrected
+> §16.8: the per-CTA constant is the whole k-loop body, not the dequant specifically.
 >
 > ### Two non-code loose ends
 >
@@ -1059,12 +1065,20 @@ The change is to predicate the `W_shared` load and the compute block on `e_v >= 
 bit-exact by construction** — those results are already discarded by the store predicate — which
 makes `high_margin_gate.py` a regression check rather than a judgement call, unlike 0c.2.
 
-Two cautions. (a) The guard sits around blocks that `_schedule_v2()` later `blockize`s, `cache_read`s
-and `tensorize`s; if the schedule primitives will not survive an enclosing `if`, the fallback is to
-compact the dispatch table with an exclusive scan over `ceildiv(count_e, BLK_M)` and shrink the grid
-— but the grid extent is a compile-time shape expression, so that route needs a dynamic launch and is
-much larger. Try the guard first. (b) The **+34% end is the balanced-router case**; quote the range,
-not the top of it, until a real prefill's indptr histogram is dumped (§16.8's second open item).
+⚠️ **§16.9 tried the obvious form and it does not work.** A source-level `if e_v >= 0:` around the
+loop nests dies at `sch.compute_at(w_shared, k_o_o)` with `InternalError: unordered_map::at` — an
+`IfThenElse` between an sblock and its target loop breaks the scope bookkeeping. **The guard has to
+be applied after `_schedule_v2()` returns**, as a stmt mutator over the scheduled body; budget time
+for finding this fork's node classes (`tvm.tir` is `tvm.s_tir` here and the stmt/expr classes moved)
+and for `thread_extent` hoisting, since the bindings land inside the conditional. The no-conditional
+fallback is to stop *launching* those CTAs — compact the dispatch table with an exclusive scan over
+`ceildiv(count_e, BLK_M)` — but the grid extent is a compile-time shape expression, so that needs a
+host round-trip per call and should be costed first.
+
+Also: the **+34% end is the balanced-router case**; quote the range, not the top of it, until a real
+prefill's indptr histogram is dumped (§16.8's second open item). And do **not** reach for widening
+`BLK_M` as a shortcut — §16.9 measured it at 0.64× and 0.39×, because `i_o` sits outside the k-loop
+and every extra row-fragment re-runs the whole dequant.
 
 **0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
 Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
@@ -2893,8 +2907,11 @@ random-routing points below) predicts every one of them to **≤1.6%, median 0.3
 Two things fall out. **A padding CTA costs 92–94% of a real one** — which is what the source says it
 should: the sentinel path guards only the `X` reads (`m_offset + i < row_end`) and the final store,
 while the `W_shared` dequant loop and the whole wmma reduction run unconditionally on `e_safe = 0`.
-And **c_real scales with K, not with rows**: 4.52× for a 4× K ratio, so the per-CTA constant is the
-`BLK_N × K` weight dequant, not the matmul and not the row work.
+And **c_real scales with K, not with rows**: 4.52× for a 4× K ratio, while a CTA holding 2 live rows
+costs what one holding 16 does. The per-CTA constant is the `K` loop; **which part of that loop it
+is — the `BLK_N × K` dequant, the wmma reduction, or the shared traffic between them — is not
+separated by these measurements**, and the `BLK_M` sweep below shows why the obvious reading is
+wrong.
 
 This also corrects §16.4's *reason*, while leaving its decision intact. v2's cost is flat from B=8 to
 B=64 not because "the full 302 MB expert set is read every call" — at B=8 only 8 experts are touched
@@ -2952,3 +2969,71 @@ the store predicate, so a correct early exit is bit-exact by construction.
 reads 6.9 ms — 6% apart, the usual gap between an isolated microbench and the same kernel inside a
 CUDA graph. Every conclusion above is a **ratio** measured within one harness, which is why the gap
 does not matter here; do not quote the bench's milliseconds as production numbers.
+
+### 16.9 Item 0f, two attempts that failed, and what they rule out
+
+Both cautions in item 0f's entry turned out to be load-bearing, and a third route that looked free
+from §16.8's cost model is a 1.6–2.6× **regression**. Nothing here changes §16.8's measurements; it
+narrows the fix that can act on them. Neither attempt is committed — `moe_matmul.py` carries only the
+`MLC_MOE_GEMM_V2_BLKM` A/B knob, default `16`, which is the shipping value and therefore inert.
+
+#### (a) The guard cannot go around the blocks — `compute_at` fails
+
+Wrapping the four loop nests of `_gemm_v2_func` in `if e_v >= 0:` — the direct reading of item 0f —
+parses and blockizes fine, and `_coop(x_shared)` survives it. The next primitive does not:
+
+```
+sch.compute_at(w_shared, k_o_o, preserve_unit_loops=True)
+  -> tvm.error.InternalError: unordered_map::at
+```
+
+An `IfThenElse` between the sblock and its target loop breaks the scope bookkeeping `compute_at`
+relies on. So the guard has to be applied to the *scheduled* function, not the source one — wrap the
+CTA body after `_schedule_v2()` returns. That route was scoped and not attempted: the thread bindings
+end up inside the conditional, which is legal CUDA (the sentinel is CTA-uniform) but is exactly what
+TVM's `thread_extent` hoisting is unhappy about, and this TVM fork renames `tvm.tir` to `tvm.s_tir`
+with the stmt/expr node classes moved, so a stmt mutator is not the ten-line job it is upstream.
+**Anyone picking this up: find the node classes first, then wrap post-schedule.**
+
+#### (b) Widening `BLK_M` is a regression, and the reason is a loop order
+
+§16.8 measured `cost = CTAs × c(K)` with `c` flat in how many rows a CTA holds. Read naively that
+says: hold more rows per CTA, launch fewer, pay the same each. `MLC_MOE_GEMM_V2_BLKM`, at
+`gate_up` B=4096 under uniform-random routing:
+
+| BLK_M | CTAs (real + pad) | median ms | µs/CTA | vs BLK_M=16 |
+|---:|---|---:|---:|---:|
+| **16** | 4096 (2992 + 1104) | **7.393** | 1.805 | — |
+| 32 | 3072 (2048 + 1024) | 11.588 | 3.772 | **0.64×** |
+| 64 | 2560 (2048 + 512) | 19.191 | 7.497 | **0.39×** |
+
+**µs/CTA is proportional to BLK_M** (2.09×, 1.99×), so the CTA count falls and the per-CTA cost rises
+by more. The cause is in `_schedule_v2()`: `sch.reorder(i_o, j_o, k_o_o, k_o_i)` puts `i_o` — the
+`BLK_M / MICRO` loop — **outermost**, and both cooperative loads are `compute_at(k_o_o)`, i.e. inside
+it. So the entire K loop, dequant included, re-runs once per `i_o`. Widening `BLK_M` multiplies the
+weight dequant instead of amortizing it.
+
+This is also the measurement §16.8 could not make. `c` scaling with `BLK_M` means the per-CTA
+constant is **not** the `BLK_N × K` dequant alone — that term is independent of `BLK_M` and would
+have stayed flat. It is the whole k-loop body, repeated `i_o` times. §16.8's attribution of the
+constant to the dequant has been corrected there.
+
+**So BLK_M widening is not dead — it is blocked on the loop order.** Hoisting the shared loads above
+`i_o` (or sinking `i_o` inside `k_o_o`) makes one dequant serve `BLK_M / 16` accumulator fragments,
+which is both the fix for this regression and the standard register-blocking that would lift the
+5.5%-of-tensor-ceiling number. It is a larger change than 0f's early exit and should follow it.
+
+#### What is still true, and what to do next
+
+The early exit remains the best-understood lever: **bit-exact, 27–50% of CTAs, +16% to +34% pp512**.
+It now needs the post-schedule wrap in (a) rather than the source-level guard. If that proves
+expensive, the fallback with the same payoff and no conditional is to stop *launching* the padding
+CTAs — compact the dispatch table with an exclusive scan over `ceildiv(count_e, BLK_M)` — which needs
+a data-dependent grid extent and so a host round-trip per call, and should be costed before it is
+built.
+
+⚠️ **One instrument fix went in with this.** `v2_grid()` in `bench_moe_kernel.py` mirrored `BLK_M` as
+a literal `16`, so the moment the A/B knob existed it reported CTA counts for a grid the kernel was
+not launching (4096 CTAs at every BLK_M). It now reads the same env var the kernel does. The first
+BLK_M table produced this way was wrong in its CTA and µs/CTA columns and was re-measured; the
+medians were unaffected.

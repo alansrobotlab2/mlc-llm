@@ -420,8 +420,11 @@ def make_indptr(Ne: int, top_k: int, B: int, spread: bool, kind: str, rng):
 
 
 # Tile geometry mirrored from `_dequantize_group_gemm_v2` in
-# python/mlc_llm/op/moe_matmul.py — keep in sync if BLK_M/BLK_N move there.
-V2_BLK_M, V2_BLK_N = 16, 128
+# python/mlc_llm/op/moe_matmul.py — keep in sync if BLK_N moves there. BLK_M reads
+# the same env var the kernel does, because a mirrored literal reported CTA counts
+# for a grid the kernel was not launching as soon as the A/B knob existed.
+V2_BLK_M = int(os.environ.get("MLC_MOE_GEMM_V2_BLKM", "16"))
+V2_BLK_N = 128
 
 
 def v2_grid(Ne: int, N: int, B: int, indptr_np) -> dict:
