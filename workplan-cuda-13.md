@@ -29,8 +29,8 @@ the 0.8B does not have at all — so the two models' prefill numbers have diverg
 since §16.11, and a 0.8B A/B is blind to all of it.
 
 **Everything through §16.11 is committed.** **Next session: start at §9's open list** — it is down to
-item **0c.2** (chunked recurrence, de-prioritised at a +12.5% ceiling) plus the blocked VL
-precondition. §17 refuted both of the candidates §16.11 queued.
+item **0c.2** (chunked recurrence, de-prioritised at a +12.5% ceiling) plus the VL re-gate, which
+is **not** blocked — the checkpoint is already local (§9's item entry corrects the old claim). §17 refuted both of the candidates §16.11 queued.
 **Primary target:** Qwen3.6-35B-A3B · **Fast-iteration vehicle:** Qwen3.5-0.8B
 
 > **Two traps that cost most of session 2026-07-25b. Read before benching or gating anything.**
@@ -1103,7 +1103,8 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 #### Open
 
-> As of the **end of 2026-07-26d** the open list is **item 0c.2 plus one blocked precondition**, and
+> As of the **end of 2026-07-26d** the open list is **item 0c.2 plus the VL re-gate** (which is not
+> blocked — see its entry; the "multi-GB download" was a misreading), and
 > there is no queued item. §17 closed the MoE lane for now: **item 0g (`BLK_K`) landed at +14.1%
 > pp512**, and both of §16.11's ranked candidates were **refuted by measurement** — see 0h and 0f.
 > Items 0b, 1 and 5 closed 2026-07-26a; **0c.1 landed in §16.5**, **0d landed opt-in in §16.6**,
@@ -1260,9 +1261,20 @@ the per-block preload/flush loops shorten rather than duplicate. Gate it with `g
 at the **full exact bar** — a pure grid refactor at fixed `k_split` changes no reduction order, so it
 should be bit-exact, unlike §16.5.
 
-**The VL path has not been re-gated — and it is blocked on an artifact, not on work.** Checked
-2026-07-26: there is **no VL checkpoint in the HF cache and no VL build in `dist/`**, so this needs
-a multi-GB download before any of it can start. The package is registered
+**The VL path has not been re-gated. It is NOT blocked — an earlier version of this entry said it
+needed "a multi-GB download before any of it can start", and that is wrong.** Re-checked 2026-07-26d:
+`Qwen/Qwen3.5-0.8B` **is** the VL checkpoint. Its architecture is `Qwen3_5ForConditionalGeneration`,
+its `config.json` carries a `vision_config`, and **153 of its 488 tensors are the vision tower**
+(`model.visual.*`) — inside the single 1.7 GB shard that has been in `~/.cache/huggingface/hub` since
+the first session. `qwen3_5_vl_loader.HF_VISUAL_PREFIX` is `"model.visual"`, so the names line up.
+
+What is actually missing is only that **all three `dist/qwen3_5-0.8B-*` builds were compiled as
+`model_type: qwen3_5`**, the text-only path, which drops the vision tower. A VL build is a local
+`convert_weight` + `gen_config` + `compile --model-type qwen3_5_vl` against a checkpoint already on
+disk — **no download at all**. The mistake was inferring "no VL checkpoint" from "no directory named
+VL"; the text and VL models share one repo.
+
+The package is registered
 (`python/mlc_llm/model/qwen3_5_vl`, `model.py:487`) and all three loaders already carry the 4-way
 `in_proj` concat, so the rebuild itself should be uneventful. `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward` and
 `forward_with_history`, so it inherits §11's in-place state, §13's conv fusion, §14's history conv

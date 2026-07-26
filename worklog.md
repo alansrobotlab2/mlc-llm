@@ -90,7 +90,10 @@ The previous handoff left three uncosted candidates and no queued item. All thre
 
 **Next**
 - The open list is **0c.2** (chunked recurrence, de-prioritised at a +12.5% Amdahl ceiling), **0h**
-  (now shape-split), plus the blocked VL precondition.
+  (now shape-split), plus the VL re-gate — which is **not** blocked: `Qwen/Qwen3.5-0.8B` is itself
+  the VL checkpoint (153 of 488 tensors are `model.visual.*`) and has been cached since day one. All
+  three `dist/` builds were just compiled `--model-type qwen3_5`, dropping the vision tower. A VL
+  build is a local compile, not a download. Earlier entries claiming otherwise are corrected.
 - **0h is the live question**, and it is a scoping decision before it is a build: `BLK_M` is a
   compile-time constant, so taking the predicted 1.37x-1.51x at B=16384 means regressing pp512
   unless the kernel is specialised per chunk size. Cost that first. Note pp512 is the benchmark but
@@ -251,8 +254,9 @@ deterministic 35B state gate), **0c.1** (the parallelism-starved GDN recurrence)
   than the chunked reformulation it partly substitutes for. Re-gate via `gdn_kernel_check.py`;
   bit-exactness is off the table, the fp64 check becomes the bar.
 - §9 item 0c step 2 (chunked linear attention) is now *less* urgent, not more.
-- The VL path still has not been re-gated: there is no VL checkpoint in the HF cache and no build
-  in `dist/`, so it needs a multi-GB download first.
+- The VL path still has not been re-gated: no build in `dist/`. (~~needs a multi-GB download~~ —
+  **wrong, corrected 2026-07-26d**: `Qwen/Qwen3.5-0.8B` *is* the VL checkpoint and was already
+  cached. Only the compile is missing.)
 
 ---
 
