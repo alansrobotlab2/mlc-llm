@@ -6,6 +6,72 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-07-26d — Both queued candidates refuted; the win was a parameter nobody had swept (769 -> 875)
+
+The previous handoff left three uncosted candidates and no queued item. All three are settled, and
+**the two ranked highest both lost**. 35B pp512 `radix` **767.20 -> 875.37 tps (+14.1%)**, ttft
+-12.4%, decode unchanged (59.92 -> 59.97). New 35B lib is `lib_blkk64.so`. Details in §17.
+
+**Done**
+- **Candidate 1 refuted (item 0h, §17.1).** Register-blocking `BLK_M` — billed as "the largest
+  remaining prize in the MoE" — cannot help at any shape this model runs. pp512 is 4096 rows over
+  256 experts = **exactly 16 rows/expert**, and `BLK_M` is already 16, so `ceildiv` gives 1 tile at
+  16, 32 *and* 64: there is no CTA count to save. At the 2048-token chunk (B=16384) where the count
+  does halve, measured **1.00x/1.01x** on balanced routing and a loss on ragged — the halving is
+  exactly cancelled by the doubled per-CTA dequant. §16.9's diagnosis was right; the conclusion
+  drawn from it was not.
+- **Candidate 2 built, bit-exact, and much smaller than billed (§17.2).** Wrapped the CTA body in a
+  unit loop annotated `moe_pad_guard` and applied §16.10's same `Select`-on-extent rewrite to it, so
+  a padding CTA skips **everything** rather than 80% of it — one annotation match instead of the
+  "targeted match" on non-unique extents 1 and 2 that §16.10 left as an exercise. Worth **3-7% on
+  the kernel**, not the projected ~7% on the pair.
+- **What paid: `BLK_K` 32 -> 64 (item 0g, §17.3), never swept before.** `BLK_K` also sets how many
+  bytes of each `W` row are fetched per k-step (`BLK_K/2`); at 32 that was **16 bytes — half a
+  32-byte sector** — plus a `__syncthreads()` pair per 16 bytes/row. 64 makes a row-chunk one sector
+  and halves the barrier count: **1.27x-1.39x** on the kernel, bit-exact. 128 regresses
+  (0.80x-0.93x) on shared memory. Default flipped; `MLC_MOE_GEMM_V2_BLKK=32` restores the old kernel.
+- **Fragility fixed (§17.4).** `BLK_K=64` first failed to build the `down` shape: item 0f located
+  `k_o_o` by matching `extent == K // BLK_K`, and at K=512 that extent is 8 — and so is another loop.
+  Both guards are now found by **loop annotation** applied in the schedule. §16.10's assertion caught
+  it and refused to guess, which is the only reason this was a two-minute fix.
+- New: [scripts/moe_blkm_check.py](scripts/moe_blkm_check.py),
+  [scripts/moe_skippad_ab.py](scripts/moe_skippad_ab.py).
+- Gates: `moe_gemm_check` 8/8 exact at the new `BLK_K`; `BLK_M`/`BLK_K` exact at every value across
+  2 shapes x 2 routings x B=4096/16384; 35B `high_margin_gate` **139/139 at tau=2.0 in both
+  prefix-cache modes, every column identical to `lib_skippad`**.
+
+**Learned**
+- **"Largest remaining prize" survived three sections without anyone checking the shape it would run
+  at.** One line of arithmetic — 4096 rows / 256 experts = 16 = `BLK_M` — refuted it before any code
+  was written. This is the *fourth* consecutive session where the correction was an extrapolation
+  from a measurement made under different conditions. The habit that catches it is cheap: before
+  building, write down the production shape and evaluate the mechanism at it.
+- **A residue attributed to a mechanism, without measuring it, was attributed to the wrong one.**
+  §16.10 read a skipped CTA's 20% as accumulator fill + stores. Inverting the three-way A/B says
+  `c_skip/c_real` is **4.8-7.4% on gate_up and 16.7-16.8% on down** — not uniform, and scaling
+  inversely with CTA size, i.e. **launch overhead**. Removing the store tail recovers about a sixth
+  of it. The padding lane is closed; the rest needs not launching the CTAs at all.
+- **Identify a loop by a tag you attached, never by a property that happens to be unique at today's
+  constants** (§17.4). Extent matching worked for exactly one value of `BLK_K`.
+- **A blocked route worth recording (§17.5):** each thread issues four identical `W_q[...]` loads and
+  unpacks 4 of 8 nibbles, so thread pairs fetch the same word. Widening the fetch to a whole `uint32`
+  hits TVM's `Ramp of more than 4 lanes is not allowed` (128-bit ceiling). The duplicates share an
+  address, so they cost L1 requests, not DRAM — consistent with the sector-granularity fix paying
+  and this being unreachable.
+- **Trap #1 caught us again in a new disguise.** `pgrep -f "mlc_llm compile"` **matches the polling
+  shell itself**, so a compile that finished at 13:21 looked alive for ~20 min. Check for the output
+  artifact, not the absence of a process. Also: `nohup ... &` in a background tool call reports
+  "completed" when the wrapper exits, not when the compile does. The 35B compile takes ~14 min.
+
+**Next**
+- No queued item. The open list is **0c.2** (chunked recurrence, de-prioritised at a +12.5% Amdahl
+  ceiling) plus the blocked VL precondition.
+- The cheap next measurement: **roofline the real (non-padding) CTAs.** They are essentially all of
+  the kernel's cost now, and nothing has measured them since §16.8 did so *before* the padding was
+  skipped. That should decide whether the MoE lane reopens at all.
+
+---
+
 ## 2026-07-26c — The MoE GEMM was bound by neither wall: 35B prefill 644 -> 769 tps
 
 Picked up the one queued item from the previous handoff: **0e**, and it was a measurement, not a

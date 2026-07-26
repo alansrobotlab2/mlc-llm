@@ -4,7 +4,9 @@
 landed, concurrent serving fixed), 2026-07-25b (conv-state fusion, §9 item 3 refuted, everything
 committed), 2026-07-25c (history-path conv fusion — §14), 2026-07-25d (history-path *recurrent*
 fusion — §15), 2026-07-26a (the 35B state gate, items 1 and 5 refuted by measurement — §16.1–§16.4),
-2026-07-26b (the lane-split recurrence built, measured and gated — §16.5)
+2026-07-26b (the lane-split recurrence built, measured and gated — §16.5), 2026-07-26c (the MoE
+GEMM measured and its padding CTAs skipped — §16.7–§16.11), 2026-07-26d (both queued MoE candidates
+refuted, `BLK_K` 32→64 lands +14.1% pp512 — §17)
 **Status:** **35B-A3B tg512 54.13 → 60.00 (+10.8%)** from four landed changes: the GDN
 input-projection merge (§10), the in-place recurrent state (§11), concurrent serving on hybrid
 models (§12), and the in-place conv state (§13). Everything since — §14, §15 and §16.5 — is on the
@@ -12,19 +14,23 @@ models (§12), and the in-place conv state (§13). Everything since — §14, §
 was never measured until 2026-07-25c, and it was getting barely half the headline number** — §14,
 §15 and §16.5 close that gap and then some:
 
-| pp512, `radix` (the default) | start of 2026-07-25c | after §15 | **now (§16.5)** |
-|---|---:|---:|---:|
-| 35B-A3B | 355 | 628 | **642 (+81% overall, +2.3% from §16.5)** |
-| 0.8B | 1469 | 3912 | **4888 (+233% overall, +25.0% from §16.5)** |
+| pp512, `radix` (the default) | start of 2026-07-25c | after §15 | after §16.5 | after §16.11 | **now (§17)** |
+|---|---:|---:|---:|---:|---:|
+| 35B-A3B | 355 | 628 | 642 | 769 | **875 (+147% overall, +14.1% from §17)** |
+| 0.8B | 1469 | 3912 | **4888 (+233% overall)** | — | — (no MoE; §17 cannot reach it) |
 
 §16.5 is the lane-split GDN recurrence; decode is neutral on both models (≤0.1%). The two models
 differ by 10× on it because the kernel's grid is `(num_value_heads, batch)` — 16 blocks on the 0.8B,
 32 on the 35B — so only the 0.8B was ever grid-starved. **This is the standing trap for anything
 that tunes this kernel: a ratio measured on one model does not transfer to the other.**
 
-**Everything through §16.4 is committed.** **Next session: start at §9** — the open list is item
-**0c step 2** (chunked reformulation) and the new item **0d** (split `V` across blocks, which should
-be bit-exact and should help the 35B most).
+Everything from §16.7 on is the MoE expert GEMM, which is the 35B's dominant prefill cost and which
+the 0.8B does not have at all — so the two models' prefill numbers have diverged by construction
+since §16.11, and a 0.8B A/B is blind to all of it.
+
+**Everything through §16.11 is committed.** **Next session: start at §9's open list** — it is down to
+item **0c.2** (chunked recurrence, de-prioritised at a +12.5% ceiling) plus the blocked VL
+precondition. §17 refuted both of the candidates §16.11 queued.
 **Primary target:** Qwen3.6-35B-A3B · **Fast-iteration vehicle:** Qwen3.5-0.8B
 
 > **Two traps that cost most of session 2026-07-25b. Read before benching or gating anything.**
@@ -476,6 +482,8 @@ regardless, because §4.6 shows 30% of the budget is kernels that do not stream 
 | 0.8B `q0f16` bit-exactness + long-prompt prefill after the conv fusion | ✅ **byte-identical**, incl. ~3.5 k-token prompt on the fused path (§13) |
 | fused conv1d kernel vs fp64, 12 shapes × both conv widths | ✅ **within fp16 rounding; state bit-exact; ring slots clean** (§13) |
 | 35B-A3B fp8 tier-2 gate after the conv fusion | ✅ **identical to `lib_inplace`, 1/15/2/5/50** (§13) |
+| 35B-A3B high-margin gate after **`BLK_K=64`** (§17), radix **and** disable | ✅ **139/139 at τ=2.0 in both modes, every column identical to `lib_skippad`** — same τ=1.0 counts, same near-tie counts |
+| v2 MoE GEMM bit-exactness across **`BLK_K` 32/64/128** and **`BLK_M` 16/32/64**, 2 shapes × 2 routings × B=4096/16384 (§17) | ✅ **exact at every value** — neither parameter touches the split over `K` |
 | **35B-A3B `q4f16_1` high-margin gate** vs HF fp8, **both libs × both modes** (§16.1) | ✅ **139/139 wide-margin positions (τ=2.0), all four runs identical** — the first 35B gate with a pass/fail bar |
 | 0.8B `q0f16` high-margin gate vs HF fp16, radix **and** disable (§16.1) | ✅ **400/400 positions, every margin** — including all 39 near-ties |
 | 0.8B `q4f16_g16e` high-margin gate vs HF fp16 (calibration, §16.1) | ✅ 361/361 at τ=2.0; 11 flips total, **all at margin ≤ 1.031** |
@@ -640,9 +648,10 @@ footgun, and §3's note that `profile_decode.py` still trips it). Always pass `-
 
 | lib | what it is |
 |---|---|
-| `lib_skippad.so` | **§16.11 — the current 35B build.** `lib_ksplit4` plus item 0f's padding-CTA skip. pp512 **769**, decode 60.09, state gate identical to `lib_ksplit4` in both modes |
+| `lib_blkk64.so` | **§17 — the current 35B build.** `lib_skippad` plus `BLK_K=64` (item 0g) and the whole-body padding guard. pp512 **875.37**, decode 59.97, state gate identical to `lib_skippad` in both modes. Bench and gate against this |
+| `lib_skippad.so` | §16.11 — `lib_ksplit4` plus item 0f's k_o_o padding-CTA skip. **The §17 A/B baseline**; re-measured 2026-07-26d at pp512 **767.20**, decode 59.92 |
 | `lib_ksplit4.so` | §16.5's lane-split build — the §16.11 A/B baseline. pp512 644 |
-| `lib_gdnhist.so` | **the current build** — everything in `lib_histconv` plus the §15 history-path recurrent fusion. Bench and gate against this |
+| `lib_gdnhist.so` | §15 — everything in `lib_histconv` plus the history-path recurrent fusion. Was "the current build" until §16.5 superseded it |
 | `lib_histconv.so` | §14 history-path conv fusion — the §15 A/B baseline |
 | `lib_convfused.so` | §10 in_proj merge + §11 in-place recurrent state + §13 in-place conv state — the §14 A/B baseline |
 | `lib_inplace.so` | the §11 build — the §13 A/B baseline |
@@ -673,6 +682,8 @@ top of them.
 | [scripts/long_prompt_gate.py](scripts/long_prompt_gate.py) | **new (§15)** — bit-exactness across a prompt long enough to span several prefill chunks, which is the only way `history_slot_id` advances *mid-prompt*. A single-chunk gate cannot reach that. Promoted from the ad-hoc check §14 ran |
 | [scripts/gdn_kernel_check.py](scripts/gdn_kernel_check.py) | **new (§15)** — the recurrent analogue of `conv1d_kernel_check`. Gates both GDN in-place kernels against the *copy-path kernel* (so the bar is bit-exactness, not a tolerance) plus an fp64 reference of the recurrence, across 9 seq_lens × 2 head configs including 5 that wrap the ring. Separates "ring misindexed" from "output wrong" — the off-by-one control leaves `out_bit` at 0 while `state_err` hits 130. No model, no weights, no engine. **§16.6:** `--v-block N` adds `vb_exact` — output *and* ring compared against `v_block=V` at the same `k_split`, required to be **exactly 0**, since re-gridding changes no reduction order. Stricter than the §16.5 bars and the item-0d claim rests on it. **§16.5:** `--k-split N` gates the lane-split kernel, where output and ring necessarily drop to relative tolerances (the reduction is re-associated by design) while **"every other ring slot byte-clean" stays exact** and the fp64 check becomes the primary bar. Also memoizes the compile on `(kind, n_kh, n_vh, k_split)` — it was recompiling per `seq_len`, which is a *runtime* dimension, and ptxas costs 30–42 s on a split kernel |
 | [scripts/conv1d_kernel_check.py](scripts/conv1d_kernel_check.py) | **new (§13), extended (§14)** — now gates the history variant too, including ring-wrap shapes. Numerical unit gate for the fused conv1d: kernel vs fp64 across 12 shapes and both conv widths. Separates "wrong" from "rounded differently", which no token-diff can do on the 35B. Needs no model, no weights, no engine; runs in seconds |
+| [scripts/moe_blkm_check.py](scripts/moe_blkm_check.py) | **new (§17.1)** — sweeps the v2 GEMM's row-blocking factor. `BLK_M` regroups output rows into CTAs and does **not** touch the split over `K`, so the bar is exact equality against `BLK_M=16`, not a tolerance. Takes `--batches` because the refutation only holds once B=16384 (the real 2048-token prefill chunk) is measured as well as B=4096 |
+| [scripts/moe_skippad_ab.py](scripts/moe_skippad_ab.py) | **new (§17.2)** — three-way A/B of item 0f: no guard / §16.10's k_o_o guard / §17's whole-body guard, all required byte-identical. Inverting its three timings is what showed §16.10's "20% residue" to be CTA launch overhead rather than the store tail |
 | [fp8_software_dequant.py](fp8_software_dequant.py) | **new** — software W8A16 fp8 path so the 37.5 GB fp8 checkpoint can be an HF reference on sm_87 (§6.1) |
 
 Build/run:
@@ -935,7 +946,37 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 ### Start here next session
 
-> **Handoff, end of 2026-07-26b.** Branch `qwen3_5`, six commits this session (`ad56b584`,
+> **Handoff, end of 2026-07-26d.** Branch `qwen3_5`. **35B pp512 `radix` is 875.37 tps**, up from
+> 767.20 at the start of the session (+14.1%) and from 355 at the start of 2026-07-25c (**2.46×**).
+> Decode unchanged at 59.97 tg512. Current 35B lib is **`lib_blkk64.so`**.
+>
+> **§17 settled all three of the candidates §16.11 left, and the two that were ranked highest both
+> lost.** Register-blocking `BLK_M` — billed as "the largest remaining prize in the MoE" — is
+> refuted at *every* shape this model runs: at pp512 each expert gets exactly 16 rows and `BLK_M` is
+> already 16, so there is no CTA count to save, and at the 2048-token chunk (B=16384) where the count
+> does halve, the halving is exactly cancelled (1.00×/1.01×). The skipped-CTA tail was built and is
+> bit-exact but worth 3–7% on the kernel, not the projected ~7% on the pair — §16.10's "20% residue"
+> is mostly **CTA launch overhead**, not the accumulator/store tail it was attributed to. The padding
+> lane is closed.
+>
+> **What paid was `BLK_K`, which nobody had swept.** At 32 each `W` row contributed 16 bytes per
+> k-step — half a 32-byte sector. 64 makes it exactly one sector and halves the barrier count:
+> 1.27×–1.39× on the kernel, bit-exact, **+14.1% pp512**. 128 regresses on shared memory. Default is
+> now 64 (`MLC_MOE_GEMM_V2_BLKK`).
+>
+> **Where to look next, in the absence of a queued item.** The real CTAs are the whole cost now and
+> §17 did not roofline them; that is the first thing to measure. §17.5 records one blocked route
+> (widening the W fetch to a whole `uint32` per thread hits TVM's 4-lane `Ramp` ceiling). Item 0c.2
+> remains open and de-prioritised at a +12.5% Amdahl ceiling. Do **not** re-open `BLK_M` without a
+> shape where `count_e >> BLK_M`.
+>
+> **Two non-code loose ends carried forward unchanged from 2026-07-26b:** `3rdparty/tvm` commit
+> `dff702c` is still unpushed (needs an interactive shell or an SSH remote), so `M 3rdparty/tvm` in
+> `git status` is deliberate; and `COLCON_IGNORE` is an untracked ROS artifact that predates this work.
+>
+> <details><summary>Handoff, end of 2026-07-26b (superseded)</summary>
+>
+> Branch `qwen3_5`, six commits this session (`ad56b584`,
 > `dfd7fec9`, `3c6edc2b`, `7865c5de`, `6c0ef467`, and this one). **No uncommitted work** — nothing is
 > half-finished, every change is gated, measured and committed. `git status` shows exactly two
 > entries, `M 3rdparty/tvm` and `?? COLCON_IGNORE`, both deliberate and both explained below.
@@ -1030,6 +1071,17 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > model, item 0d's occupancy arithmetic, §9's priority order. Each was checkable cheaply and none
 > was checked until it had already been written down as fact. When a number is quoted from another
 > section, re-read what configuration it was measured on before building on it.
+>
+> </details>
+>
+> **A sixth trap, added 2026-07-26d — it is the same one as #1 and it caught us again.**
+> `pgrep -f "mlc_llm compile"` **matches the polling shell itself**, because that string is in the
+> poll loop's own command line. A finished 35B compile therefore looked like it was still running for
+> ~20 minutes. Trap #1's lesson was "`ps -C python` does not find it"; the general form is
+> **`pgrep -f` over a pattern you just typed into the same shell is self-matching** — check for the
+> output artifact (`ls -la <lib>.so`) rather than for the absence of a process. Relatedly, a
+> `nohup ... &` inside a background tool call reports "completed" the instant the wrapper exits,
+> which is not the same thing as the compile finishing. **The 35B compile takes ~14 min** on this box.
 
 > **Item IDs are stable, not sequential.** They are referenced from §12–§16 and from the Done
 > sections above, so closed items keep their number rather than being renumbered away. Ordering
@@ -1037,13 +1089,17 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 #### Open
 
-> As of the **end of 2026-07-26c** the open list is **two items plus one blocked precondition**, and
-> **item 0f is first**. §16.7's trace found the MoE GEMM at 52.5% of 35B prefill against the
-> recurrence's 11.1%; **§16.8 then measured that GEMM (item 0e, now closed) and found it CTA-bound
-> with 27–50% of its CTAs doing discarded work** — so 0f, the early exit, is a small bit-exact change
-> worth +16% to +34% pp512. Items 0b, 1 and 5 closed 2026-07-26a; **0c.1 landed in §16.5**,
-> **0d landed opt-in in §16.6**, and **0c.2 is de-prioritised** — read its entry before starting it,
+> As of the **end of 2026-07-26d** the open list is **item 0c.2 plus one blocked precondition**, and
+> there is no queued item. §17 closed the MoE lane for now: **item 0g (`BLK_K`) landed at +14.1%
+> pp512**, and both of §16.11's ranked candidates were **refuted by measurement** — see 0h and 0f.
+> Items 0b, 1 and 5 closed 2026-07-26a; **0c.1 landed in §16.5**, **0d landed opt-in in §16.6**,
+> **0e/0f closed 2026-07-26c**, and **0c.2 is de-prioritised** — read its entry before starting it,
 > the +15× kernel ceiling is capped at +12.5% end-to-end on the 35B.
+>
+> **The one unmeasured thing left in this kernel:** the real (non-padding) CTAs are now essentially
+> all of its cost, and nothing has roofline'd them since §16.8 did so *before* the padding was
+> skipped. That is the cheap next measurement, and it is what should decide whether the MoE lane
+> reopens at all.
 
 **0c. The GDN recurrence is parallelism-starved — still the biggest prefill item after §16.5.**
 §15.6 measured it on the **0.8B**: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the
@@ -1125,6 +1181,24 @@ prefill's indptr histogram is dumped (§16.8's second open item). And do **not**
 and every extra row-fragment re-runs the whole dequant.
 
 </details>
+
+**0g. ✅ LANDED, §17.3 — `BLK_K` 32 → 64, +14.1% pp512 on the 35B (767.20 → 875.37 tps).**
+The v2 GEMM's k-step also sets how many bytes of each `W` row are fetched per step (`BLK_K/2`); at 32
+that was 16 bytes, **half a 32-byte sector**, plus a `__syncthreads()` pair per 16 bytes/row. 64
+makes a row-chunk one sector and halves the barriers — 1.27×–1.39× on the kernel, bit-exact, decode
+neutral, and the 35B state gate is *identical* to `lib_skippad` in both prefix-cache modes. 128
+regresses (0.80×–0.93×) on shared memory. `MLC_MOE_GEMM_V2_BLKK=32` restores the old kernel. This
+parameter had never been swept.
+
+**0h. ❌ Refuted by measurement, §17.1 — do not build.** Register-blocking `BLK_M` by hoisting the
+cooperative loads above `i_o`, which §16.11 called "the largest remaining prize in the MoE".
+§16.9's *diagnosis* is right — `i_o` outside the k-loop makes every extra row-fragment re-run the
+dequant — but the conclusion does not follow, because **at pp512 there is no CTA count to save**:
+4096 rows over 256 experts is exactly 16 rows/expert and `BLK_M` is already 16, so `ceildiv` gives 1
+tile at 16, 32 *and* 64. At the 2048-token chunk (B=16384) the count does halve and the win is still
+**1.00×/1.01×** on balanced routing and a loss on ragged — the halving is exactly cancelled. The
+hoist would buy the right to break even. Bit-exact at every value, which is what made the sweep
+cheap. Do not revisit without a shape where `count_e >> BLK_M`.
 
 **0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
 Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
@@ -3235,3 +3309,150 @@ Prefill is now **2.17×** what it was at the start of 2026-07-25c (355). The rem
 in this kernel is the ~20% of a full CTA that a skipped one still costs (§16.10) — worth ~7% more on
 the pair, ~3% end-to-end — and then the register-blocking that §16.9's `BLK_M` regression pointed at,
 which is the larger prize and still unquantified.
+
+---
+
+## 17. Session 2026-07-26d — both queued candidates refuted, and the win was in the k-step
+
+§16.11 left three uncosted candidates and no queued item. All three are now settled, and **neither of
+the two that were ranked highest was worth building**. The +14.1% this session came from a parameter
+nobody had swept.
+
+| | `lib_skippad` (§16.11) | **`lib_blkk64`** | |
+|---|---:|---:|---:|
+| **pp512** (`radix`) | 767.20 tps | **875.37 tps** | **+14.1%** |
+| ttft | 667.6 ms | **584.9 ms** | −12.4% |
+| tg512 | 59.92 tps | 59.97 tps | +0.1% (noise) |
+
+Run-to-run spread on the new lib was 0.13% (874.50 / 875.63 / 875.37), so the gain is not sampling.
+Decode is untouched, as expected — at b=1 the MoE goes through the gemv path (§16.4), not this kernel.
+
+### 17.1 Candidate 1 (register-blocking `BLK_M`) — refuted, and not for the reason §16.9 gave
+
+§16.9 diagnosed the `BLK_M` regression as `i_o` sitting outside the k-loop, so every extra
+row-fragment re-runs the whole `BLK_N x K` dequant, and §16.11 promoted "hoist the shared loads above
+`i_o`" to **"the largest remaining prize in the MoE"**. That diagnosis is correct and the conclusion
+drawn from it is not, because **at the target shape there is no CTA count to save.**
+
+pp512 is 512 tokens x top-8 = **4096 rows over 256 experts = exactly 16 rows per expert**, and
+`BLK_M` is already 16. So `ceildiv(count_e, BLK_M)` is 1 at `BLK_M` = 16, 32 *and* 64: widening it
+cuts the real CTA count from 256 to 256 to 256, while multiplying each CTA's dequant by 2x and 4x.
+The hoist cannot help because there is nothing for it to amortize.
+
+The obvious rejoinder is that the real prefill chunk is 2048 tokens (`prefill_chunk_size=2048`), i.e.
+B=16384, where the count *does* halve. Measured there too — it still never wins:
+
+| shape | routing | B | BLK_M=16 | BLK_M=32 | BLK_M=64 |
+|---|---|---:|---:|---:|---:|
+| gate_up | even | 4096 | 3.214 ms | 6.258 (0.51x) | 12.219 (0.26x) |
+| gate_up | random | 4096 | 3.960 ms | 6.236 (0.63x) | 12.229 (0.32x) |
+| gate_up | even | 16384 | 10.397 ms | 10.443 (**1.00x**) | 12.823 (0.81x) |
+| gate_up | random | 16384 | 11.280 ms | 12.645 (0.89x) | 15.815 (0.71x) |
+| down | even | 16384 | 5.248 ms | 5.208 (**1.01x**) | 5.272 (1.00x) |
+| down | random | 16384 | 5.817 ms | 6.357 (0.92x) | 7.412 (0.78x) |
+
+At B=16384 the halved CTA count is **exactly cancelled** by the doubled per-CTA cost — 1.00x and
+1.01x on balanced routing, and a loss on ragged routing. So the hoist would buy the right to break
+even, at every shape this model actually runs. `BLK_M` is bit-exact across all values (the reduction
+over K is split identically), which is what made the sweep cheap; it stays at 16 and
+`MLC_MOE_GEMM_V2_BLKM` stays a diagnostic. **Do not revisit this without a shape where
+`count_e >> BLK_M`.**
+
+### 17.2 Candidate 2 (the last 20% of a skipped CTA) — built, bit-exact, and much smaller than billed
+
+§16.10 measured a k_o_o-skipped CTA at 20% of a full one and attributed the residue to the
+accumulator fill, the accumulator -> `O_tile` store and the predicated-off global store, projecting
+~7% more on the pair and ~3% end-to-end. It is built — and the attribution was wrong.
+
+The mechanism generalises §16.10's rather than extending it. Instead of hunting the trailing store
+loops by extent (they are extents 1 and 2, not unique, which is why §16.10 called it "a targeted
+match"), the CTA body is wrapped in a unit loop annotated `moe_pad_guard`, and the *same*
+`Select`-on-extent rewrite zeroes that. One match, and it skips **everything** rather than 80% of it.
+The uniformity and bit-exactness arguments are unchanged — `e_v` is CTA-uniform, and nothing a
+skipped CTA writes leaves shared memory.
+
+It is worth 3–7% on the kernel, not the projected 7% on the pair:
+
+| shape | routing | no guard | `koo` (§16.10) | **whole body** |
+|---|---|---:|---:|---:|
+| gate_up | even | 5.145 ms | 3.240 (1.59x) | **3.084 (1.67x)** |
+| gate_up | random | 5.162 ms | 4.212 (1.23x) | **3.933 (1.31x)** |
+| down | even | 2.691 ms | 1.533 (1.76x) | **1.481 (1.82x)** |
+| down | random | 2.698 ms | 2.021 (1.33x) | **1.963 (1.37x)** |
+
+Inverting the three-way for the per-CTA cost (using §16.10's `c_pad/c_real = 0.933`) says where the
+20% actually went. After the k_o_o guard alone, `c_skip/c_real` is **4.8–7.4% on gate_up and
+16.7–16.8% on down** — not a uniform 20% — and the whole-body guard moves it to 3.9–6.9% and
+13.2–13.8%. It removes about **one sixth** of the residue. The rest is not the store tail at all: it
+is CTA launch and dispatch-table read, which scales with nothing the kernel does, hence its being a
+4% share of a big `gate_up` CTA and a 17% share of a small `down` one.
+
+**The padding lane is now closed.** At the ~40% production padding §16.11 inferred, what remains of it
+is ~4% of `gate_up` and ~9% of `down`, essentially all launch overhead, and the only way to remove
+that is to stop launching those CTAs — which needs a host round-trip per call (§16.10). Not worth it.
+
+### 17.3 What actually paid: `BLK_K` 32 -> 64, and it was never swept
+
+`BLK_K` sets the k-step of the cooperative fetch, so it also sets **how many bytes of each `W` row
+are pulled per step: `BLK_K` int4 values = `BLK_K/2` bytes.** At the original 32 that is **16 bytes —
+half a 32-byte sector.** Every row-chunk read pulled a sector it half-used (the other half being
+consumed on the *next* k iteration), and the k-loop paid a `__syncthreads()` pair per 16 bytes/row.
+64 makes a row-chunk exactly one sector and halves the barrier count.
+
+Bit-exact at every value, and 64 is the optimum on both shapes:
+
+| shape | routing | BLK_K=32 | **BLK_K=64** | BLK_K=128 |
+|---|---|---:|---:|---:|
+| gate_up | even | 4.060 ms | **3.082 (1.32x)** | 4.461 (0.91x) |
+| gate_up | random | 5.480 ms | **3.935 (1.39x)** | 5.917 (0.93x) |
+| down | even | 1.917 ms | **1.501 (1.28x)** | 2.387 (0.80x) |
+| down | random | 2.501 ms | **1.967 (1.27x)** | 3.084 (0.81x) |
+
+128 regresses (0.80x–0.93x): shared memory grows linearly with `BLK_K` and occupancy falls off. The
+default is now 64, with `MLC_MOE_GEMM_V2_BLKK` to A/B and an automatic halving fallback if `BLK_K`
+does not divide `K` (the schedule splits `k` by `BLK_K // MICRO`).
+
+**The prediction, made the way §5's estimation lesson prescribes.** Kernel pair at the target shape
+(B=4096, both routings bracketing production): `lib_skippad`'s config 6.016/8.037 ms -> `lib_blkk64`'s
+4.565/5.896 ms = **1.32x–1.36x**. Renormalising §16.7's 52.5% pair share through §16.11's +19.4%
+puts the pair at **43.3%** of prefill now, so Amdahl predicts **+12.3%**. Measured **+14.1%** — two
+points high, which back-solves to the pair being ~48% of prefill rather than 43.3%. Sixth consecutive
+estimate to land using "measure at the target shape, renormalise against the actual A/B baseline".
+
+Attribution between the two changes, from the same microbench: **`BLK_K` ~1.27x, whole-body guard
+~1.05x**, compounding to ~1.34x.
+
+### 17.4 A fragility fixed on the way
+
+`BLK_K=64` initially failed to build the `down` shape: item 0f located the `k_o_o` loop by matching
+`extent == K // BLK_K`, and at K=512 that extent is 8 — and so is another loop in the schedule. The
+assertion §16.10 added caught it and refused to run rather than guessing, which is the only reason
+this was a two-minute fix instead of a silent halving of the win.
+
+Both guards are now located by **loop annotation** (`moe_koo_guard`, `moe_pad_guard`) applied in the
+schedule, not by extent. The assertions remain, one per marker. Generalisable: *identify a loop by a
+tag you attached, never by a property that happens to be unique at today's constants.*
+
+### 17.5 One negative result worth not repeating
+
+The generated CUDA shows each thread issuing **four identical `W_q[...]` loads** and unpacking only 4
+of the 8 nibbles in a `uint32`, so thread pairs fetch the same word. Widening the W fetch to VEC=8
+(one whole word per thread) is the obvious fix and **cannot be expressed**: the dequant's intermediate
+is a `uint32` vector, and TVM stops at `Ramp of more than 4 lanes is not allowed` — a 128-bit ceiling.
+The duplicate fetches share an address, so they cost L1 requests rather than DRAM traffic, which is
+consistent with `BLK_K` (a sector-granularity fix) paying and this not being reachable.
+
+### 17.6 Gates
+
+| gate | result |
+|---|---|
+| `scripts/moe_gemm_check.py`, 8 cases, `np.array_equal` at BLK_K=64 | ✅ **8/8 bit-exact** |
+| `scripts/moe_blkm_check.py`, BLK_M 16/32/64 x 2 shapes x 2 routings x B=4096/16384 | ✅ **exact at every value** |
+| `scripts/moe_skippad_ab.py`, three-way 0/koo/1 | ✅ **all bit-exact vs no-guard** |
+| 35B `high_margin_gate.py` vs fp8 ref, **radix** | ✅ 1.0 → 142/**0** (100%), 2.0 → **139/139**, near-ties 3/5 — **identical to `lib_skippad`** |
+| 35B `high_margin_gate.py` vs fp8 ref, **disable** | ✅ 1.0 → 142/**1** (99.30%), 2.0 → **139/139**, near-ties 2/5 — **identical to `lib_skippad`** |
+
+Both modes reproduce §16.11's columns exactly, including the pre-existing τ=1.0 `disable` mismatch
+and both near-tie counts. As in §16.11, *identical* is the claim, not *passing* — a bit-exact kernel
+that changed a mismatch count would have contradicted its own premise. The 0.8B is not rebuilt: it
+has no MoE and never reaches this kernel.
