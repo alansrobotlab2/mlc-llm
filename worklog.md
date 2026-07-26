@@ -6,6 +6,74 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-07-26 — Two open items closed by measurement, one answered at 2.8x, and the 35B gets a gate with teeth
+
+Session target was the four open items in [workplan-cuda-13.md](workplan-cuda-13.md) §9: **0b** (a
+deterministic 35B state gate), **0c.1** (the parallelism-starved GDN recurrence), **1** (should the
+35B decode more than one sequence) and **5** (the tier-2 GEMV retune). Details in §16.
+
+**Done**
+- **Item 1 — settled, keep the b=1 MoE specialization.** The "~6x" justification was a source
+  comment nobody had measured; it is **51x**. gate_up+down at b=1: gemv **0.100 ms** vs
+  `dequantize_group_gemm` v2 **5.112 ms** (v1 1.957 ms). Comment corrected in
+  [qwen3_5_moe_model.py](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py).
+- **Item 5 — refuted, do not build.** At fixed N=2048 efficiency *rises* with K
+  (48% -> 68% -> 84% -> **90% at K=4096**), and across six tile configurations the shipped sm_87
+  tile is within 0.5% of the best at every shape. No retune can recover `o_proj`'s traced 75%.
+- **Item 0c.1 — answered, and the proposed fix was on the wrong axis.** Splitting `K` across
+  *lanes* measures **2.24-2.44x** (2.79x 4-way) on the recurrence. Not built in TIR.
+- **Item 0b — the 35B has a hard pass/fail bar for the first time.**
+  [scripts/high_margin_gate.py](scripts/high_margin_gate.py): teacher-forced, margin-gated.
+  35B `q4f16_1` vs the fp8 reference scores **139/139 wide-margin positions (tau=2.0)**, and all
+  four runs — `lib.so` and `lib_gdnhist.so` x `radix`/`disable` — produced an identical table down
+  to which three sub-threshold positions flipped. §6.2 scored 1/15/2/5/50 on this same model.
+  `prefix_cache_roundtrip` moved to the same prompt set: **4/4 pass** where the legacy set is
+  **0/2** on the identical lib.
+- New instruments: `scripts/gdn_recurrence_probe.cu`, `bench_moe_kernel.py` K/N sweeps +
+  achieved-bandwidth reporting, `MLC_GEMV_TSTR` in dlight's GEMV rule.
+- **Full gate sweep green after all changes**: `gdn_kernel_check` and `conv1d_kernel_check` ALL
+  SHAPES PASS; `batch_decode_parity` 6/6 both modes; 0.8B `prefix_cache_roundtrip` PASS; 0.8B
+  high-margin 400/400.
+
+**Learned**
+- **Cascade, not near-ties, was the bigger half of why the 35B gate was useless.** §6.2 blamed the
+  prompt set and prescribed high-margin prompts. That was half the story: both sides free-run, so
+  one flip puts them in different contexts forever and 1/50 measures *when* they diverged, not how
+  often they disagree. Teacher forcing removes it entirely and costs nothing — `_generate` already
+  accepts token ids. **A gate that lets its two sides drift apart is measuring its own first
+  disagreement.**
+- **A pass bar should be derived from the reference, not inherited.** Scoring only where the
+  reference had margin turns ">=48/50" into something defensible. On the 0.8B, 4-bit flips 11 of
+  400 positions and *every one* is at margin <= 1.031, so tau=2.0 has ~2x headroom — measured, not
+  asserted. The same 4-bit lib scores 1/5 prompts free-running.
+- **Two of four items ended as "do not build".** Item 5 joins item 3. Both times the write-up had a
+  plausible mechanism and the measurement said the premise was wrong — item 5's question assumed
+  K=2048 was the good case when K=4096 is the best case. **Cost of checking: one afternoon. Cost of
+  not checking: a session spent on a kernel with no headroom.**
+- **The instrument was wrong before the answer was.** `bench_moe_kernel` reuses one weight tensor,
+  so L2 inflates small kernels up to 20% — and it is *shape-dependent*, which is exactly the axis
+  under test. Caught by a control rather than by suspicion: lm_head at 70x L2 agrees with the trace
+  to 3.3%, o_proj at 1.2x L2 is 20.6% high. Schedule A/Bs at a fixed shape survive it; absolute
+  percentages do not.
+- **§8's `MLC_MOE_GEMM_V2=1` warning applies to the bench, not just the compile.** Measured the v1
+  fallback first and got 19.6x; the real kernel gives 51x. The two answers differ by 2.6x and the
+  flag is silent either way.
+- **"Confirm it" was worth doing.** §15 guessed registers pinned occupancy at 1 block/SM. Registers
+  hit the 255 ceiling but allow 2; the *grid* pins it at 1 — and the state spills 192 B/thread,
+  which §15's DRAM-only bandwidth argument could not see. The proposed cross-block K split is not
+  buildable at all (the reduction is inside a thread, so it needs a global barrier per position);
+  the cross-*lane* form is, and it works.
+
+**Next**
+- Build the lane-split recurrence in TIR (§16.2) — ~2.8x on the biggest prefill kernel, and cheaper
+  than the chunked reformulation it partly substitutes for. Re-gate via `gdn_kernel_check.py`;
+  bit-exactness is off the table, the fp64 check becomes the bar.
+- §9 item 0c step 2 (chunked linear attention) is now *less* urgent, not more.
+- The VL path still has not been re-gated: there is no VL checkpoint in the HF cache and no build
+  in `dist/`, so it needs a multi-GB download first.
+
+---
+
 ## 2026-07-25d — History-path recurrent state fused; the default config stops being the slow one (35B pp +59%, 0.8B +119%)
 
 Continuation of the CUDA-13 perf sessions. Target was [workplan-cuda-13.md](workplan-cuda-13.md)

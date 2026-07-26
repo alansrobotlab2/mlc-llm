@@ -467,6 +467,10 @@ regardless, because §4.6 shows 30% of the budget is kernels that do not stream 
 | 0.8B `q0f16` bit-exactness + long-prompt prefill after the conv fusion | ✅ **byte-identical**, incl. ~3.5 k-token prompt on the fused path (§13) |
 | fused conv1d kernel vs fp64, 12 shapes × both conv widths | ✅ **within fp16 rounding; state bit-exact; ring slots clean** (§13) |
 | 35B-A3B fp8 tier-2 gate after the conv fusion | ✅ **identical to `lib_inplace`, 1/15/2/5/50** (§13) |
+| **35B-A3B `q4f16_1` high-margin gate** vs HF fp8, **both libs × both modes** (§16.1) | ✅ **139/139 wide-margin positions (τ=2.0), all four runs identical** — the first 35B gate with a pass/fail bar |
+| 0.8B `q0f16` high-margin gate vs HF fp16, radix **and** disable (§16.1) | ✅ **400/400 positions, every margin** — including all 39 near-ties |
+| 0.8B `q4f16_g16e` high-margin gate vs HF fp16 (calibration, §16.1) | ✅ 361/361 at τ=2.0; 11 flips total, **all at margin ≤ 1.031** |
+| high-margin gate **negative control** (`stale1`, state one step stale) (§16.1) | ✅ **fails 342/361** on a lib that otherwise scores 361/361 — the gate is not vacuous |
 | 0.8B `q4f16_g16e` vs HF fp16 | 1/5 — **quantization divergence, not a bug** |
 | 35B-A3B greedy parity | ❌ **not reproducible on this box — see §6.1, neither leg fits** |
 | 35B-A3B concurrent decode | ⛔ **blocked by design, not by a bug** — `batch_decode` is compiled with batch pinned to 1 (§12) |
@@ -592,6 +596,12 @@ high-margin prompt set — arithmetic, exact-continuation sequences, closed-form
 kind of prompt where the top-1 logit gap is wide — and require e.g. 48/50 on those. Prompt 5 shows the
 signal is there when the margin is; the current set is simply the wrong instrument, inherited from an
 fp16-vs-fp16 era.
+
+> ✅ **Done — §16.1**, and the diagnosis above was only half of it. A high-margin prompt set alone
+> would not have fixed this gate, because the dominant defect is **cascade**: both sides free-run,
+> so the counts above measure *when the two first diverged*, not how often they disagree. Teacher
+> forcing removes it. The 35B now scores **139/139 wide-margin positions**, identically across both
+> libs and both prefix-cache modes.
 
 
 ---
@@ -1968,10 +1978,50 @@ prompt, always the same near-tie ("red, yellow, and blue" vs "red, blue, and yel
 prompt families were the same fp16-era set. They are now the high-margin families, each extension
 being the model's own measured continuation (checked against
 `tuning/high_margin_ref_0.8b_fp16.json`), with `--legacy-prompts` retained so §13's numbers stay
-reproducible. **[pending]** — 4 runs on the 35B baseline, plus 2 legacy-set control runs.
+reproducible.
 
-**35B fp8 reference and checks: [pending].** Capture runs ~12 min/prompt through the software
-W8A16 shim.
+**Measured, and it is the cleanest A/B in this document** — same unmodified 35B `q4f16_1` baseline
+lib, same engine config, same `radix` mode, *only the prompt set differs*:
+
+| prompt set | runs | result |
+|---|---|---|
+| **high-margin (new default)** | 4 | ✅ **4/4 ALL CHECKS PASS** |
+| legacy (`--legacy-prompts`) | 2 | ❌ **0/2** — 3 and 2 divergences |
+
+The legacy failures also reproduce §13's *character*, not just its rate: they land on different
+prompts and different checks each run (run 1 on prompts 4, 4, 3; run 2 on prompts 3, 3), always on
+`Once upon a time…` or `The three primary colors are`, and `pass3 base vs cold` — the PopN rollback
+check, the one the gate exists for — passes in both. **A wandering failure set is the signature of
+a near-tie instrument, and §13 already said as much; the fix is to stop asking the model questions
+it does not have an opinion about.**
+
+**The 35B now has a hard pass/fail bar.** `tuning/high_margin_ref_35b_fp8.json` — 6 prompts × 24
+positions against `Qwen/Qwen3.6-35B-A3B-FP8` through the §6.1 software W8A16 shim, 578 s once
+loaded. The prompt set carries over: **139/144 positions (96.5%) clear margin 2.0** on the 35B, and
+all six continuations are exactly right (Fibonacci, powers of two, squares, arithmetic progression,
+the 3× table, weekdays).
+
+Both 35B libs, both prefix-cache modes, `q4f16_1` vs the fp8 reference:
+
+| τ | scored | mismatch | agreement |
+|---:|---:|---:|---:|
+| 0.0 | 144 | 3 | 97.92% |
+| 1.0 | 142 | 1 | 99.30% |
+| **2.0** | **139** | **0** | **100.00%** |
+| 4.0 | 99 | 0 | 100.00% |
+| 8.0 | 17 | 0 | 100.00% |
+
+**All four runs — `lib.so` and `lib_gdnhist.so`, under `radix` and `disable` — produced this table
+identically**, down to which three positions mismatched. Set against §6.2's 1/15/2/5/50 on the same
+model, that is the difference between a number nobody could act on and a bar a change can be held
+to. And the 4-bit-vs-fp8 flips land exactly where the 0.8B calibration predicted: all three below
+τ=2.0, the highest between 1.0 and 2.0 (0.8B: 11 flips, highest 1.031).
+
+Two cautions on reading it. Identical scores across four libs would *also* be what a gate that
+cannot see the difference produces — the `stale1` control is what rules that out, and §15 already
+established these libs are bit-exact to each other, so agreement is the correct expected result.
+And 24 positions × 6 prompts is a smaller sample than the 0.8B's 400; the τ=8.0 row rests on 17
+positions and should not be quoted on its own.
 
 ### 16.2 Item 0c.1 — the "cheap first" step, answered. Two corrections to the hypothesis
 
@@ -2175,7 +2225,7 @@ weight buffers before its absolute numbers are quoted against a trace again.
 
 ### 16.4 Item 1 — the option list was missing an option
 
-The decision needs `bench_moe_kernel.py` (**[pending]**), but reading the block first turns up
+The decision needs `bench_moe_kernel.py`, but reading the block first turns up
 something the §9 write-up does not mention: **a per-token gemv dispatch for small batches already
 exists and ships**, at [qwen3_5_moe_model.py:141-153](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L141-L153).
 For `1 < num_tokens <= 5` the MoE block splits the batch and routes each token through the b=1
