@@ -907,6 +907,9 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `4b7d1be6` | item 0f marked built; handoff repointed at the end-to-end measurement |
 | `3f53eb24` | commit-table backfill |
 | `dbe3a51f` | **§16.11** item 0f measured end-to-end — pp512 644 → 769 (+19.4%), gate identical to baseline, default flipped to `1` |
+| `5cdcb68c`, `463f95b4` | commit-table backfill; worklog gains the two missing sessions |
+| `76bceaec` | **§17** item **0g** — `BLK_K` 32 → 64, pp512 767 → 875 (+14.1%); whole-body padding guard; both guards found by annotation, not extent; `moe_blkm_check.py` + `moe_skippad_ab.py` |
+| `723af51e` | **§17** session record — items **0g** landed, **0h** refuted, §16.10's 20% residue re-attributed to launch overhead |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
