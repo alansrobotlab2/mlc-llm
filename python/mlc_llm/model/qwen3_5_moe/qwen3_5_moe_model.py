@@ -643,11 +643,21 @@ class Qwen35MoEForCausalLM(nn.Module):
             },
             # batch_size pinned to 1 (literal int, not SizeVar) so the MoE block's
             # `if num_tokens == 1:` resolves statically at compile time and routes
-            # through `dequantize_gemv` (~6× faster than `dequantize_group_gemm` at
-            # b=1 top-8 on Orin). Trade-off: this lib only supports max_batch_size=1
-            # at decode (interactive mode); server mode with batched decode would
-            # need either the dynamic-batch spec restored or a Relax If for runtime
-            # dispatch. batch_prefill / batch_verify keep dynamic seq_len.
+            # through `dequantize_gemv`. Measured 2026-07-26 on Orin sm_87 at the
+            # 35B-A3B shapes (bench_moe_kernel.py, MLC_MOE_GEMM_V2=1), gate_up+down
+            # per call at b=1: gemv 0.100 ms vs dequantize_group_gemm v2 5.112 ms —
+            # **51×**, not the ~6× this comment claimed before anyone measured it.
+            # v2 is a dispatch-table kernel sized for all 256 experts, so its cost is
+            # flat in batch (5.11 ms at B=8 -> 5.25 ms at B=64) and at b=1 it moves
+            # 32× the weight traffic top-8 needs. v1 is 1.957 ms at B=8 and scales
+            # with B instead.
+            # Trade-off: this lib only supports max_batch_size=1 at decode
+            # (interactive mode). Because the dynamic path never wins — crossover is
+            # ~50 sequences — a Relax If for runtime dispatch would be pointless. If
+            # batched decode is wanted, widen the `1 < num_tokens <= 5` per-token
+            # gemv split below instead; it costs exactly b× and needs no new kernel.
+            # See workplan-cuda-13.md §16.4. batch_prefill / batch_verify keep
+            # dynamic seq_len.
             "batch_decode": {
                 "input_embeds": nn.spec.Tensor([1, 1, self.hidden_size], self.dtype),
                 "paged_kv_cache": nn.spec.Object(object_type=PagedKVCache),

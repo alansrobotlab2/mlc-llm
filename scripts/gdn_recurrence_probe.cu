@@ -257,7 +257,12 @@ static Bufs alloc(int batch, int n_kh, int64_t seq_len) {
   CHECK(cudaMemcpy(b.v, h, nqkv * sizeof(half), cudaMemcpyHostToDevice));
   free(h);
 
-  float* f = (float*)malloc(nqkv * sizeof(float));
+  // Sized for the LARGEST of the three float arrays, not for nqkv: at seq_len=1 the
+  // state (batch*n_kh*K*V) is two orders of magnitude bigger than q/k/v.
+  size_t nf = nqkv;
+  if (nh > nf) nf = nh;
+  if (nst > nf) nf = nst;
+  float* f = (float*)malloc(nf * sizeof(float));
   // gate = exp(-u*0.1) in (0,1] and beta = sigmoid(): the ranges the model produces,
   // so the recurrence decays instead of blowing up and the comparison stays meaningful.
   for (size_t i = 0; i < nh; ++i) f[i] = expf(-fabsf(frand()) * 0.1f);

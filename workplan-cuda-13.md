@@ -709,6 +709,29 @@ python validate.py --greedy-parity --model Qwen/Qwen3.5-0.8B --device cuda:0 \
 python scripts/gdn_kernel_check.py                     # §15, recurrent; add --seq-lens to narrow
 python scripts/conv1d_kernel_check.py                  # §13/§14, conv
 
+# high-margin state gate (§16.1) — the only 35B gate that can adjudicate a state change.
+# Capture once per reference model, then check any lib against it. Run BOTH modes.
+python scripts/high_margin_gate.py --capture --model Qwen/Qwen3.6-35B-A3B-FP8 \
+    --out tuning/high_margin_ref_35b_fp8.json --num-prompts 6 --num-tokens 24
+for m in radix disable; do
+  python scripts/high_margin_gate.py --check tuning/high_margin_ref_35b_fp8.json \
+      --model-dir dist/qwen3_6-35B-A3B-q4f16_1 \
+      --model-lib dist/qwen3_6-35B-A3B-q4f16_1/lib.so --prefix-cache-mode $m --num-tokens 0
+done
+# prove the gate is not vacuous before trusting a pass (expect a loud FAIL):
+python scripts/high_margin_gate.py --check tuning/high_margin_ref_0.8b_fp16.json \
+    --model-dir dist/qwen3_5-0.8B-q0f16_fused \
+    --model-lib dist/qwen3_5-0.8B-q0f16_fused/lib_gdnhist.so --negative-control stale1
+
+# GDN recurrence design probe (§16.2) — no model, no TVM; ~30 s
+nvcc -arch=sm_87 -O3 -o /tmp/gdn_probe scripts/gdn_recurrence_probe.cu && /tmp/gdn_probe 1 20
+
+# MoE dispatch + GEMV shape/schedule (§16.3, §16.4).
+# MLC_MOE_GEMM_V2=1 matters here exactly as it does at compile time — without it the
+# bench measures the v1 fallback and the b=1 ratio changes by 2.6x.
+MLC_MOE_GEMM_V2=1 python bench_moe_kernel.py --shapes gate_up_gemv,down_gemv,gate_up,down
+MLC_GEMV_TSTR="16,32,1" python bench_moe_kernel.py --shapes ksweep_n2048_k4096
+
 # recurrent-state gates — run BOTH modes; `disable` alone is blind to a whole bug class (§6)
 python scripts/prefix_cache_roundtrip.py \
     --model-dir dist/qwen3_5-0.8B-q0f16_fused \
@@ -865,12 +888,18 @@ no engine, and separating "wrong" from "rounded differently". *(Was item 4; prom
 §15.6 measured it: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the next kernel**,
 running at **202 GFLOP/s, ~3.8% of sm_87 fp32 peak**, because it launches `batch × n_vh` blocks of
 `V` threads (**2048 threads on the 0.8B**, on a 16-SM GPU) and each walks the sequence
-sequentially. §15 removed the last of its memory traffic, so there is no bandwidth left to
-reclaim — it is latency-bound on a dependency chain. Two steps, in order:
-  1. **Cheap first:** the kernel holds `K=128` fp32 registers per thread, ~64 KB per 128-thread
-     block, which almost certainly pins occupancy at 1 block/SM. Confirm it, and test whether
-     splitting `K` across two blocks with a cross-thread reduction per `t` raises occupancy
-     without touching the algorithm.
+sequentially. §15 said there was no bandwidth left to reclaim; §16.2 shows that was DRAM-only —
+the kernel spills 47 of its 128 state rows to local memory and re-reads them every position. Two
+steps, in order:
+  1. ✅ **Done, §16.2 — and it is worth ~2.8×, so do it before considering step 2.** The
+     hypothesis was half right. Registers hit the 255 ceiling but permit 2 blocks/SM; the *grid*
+     (16 blocks on 16 SMs) is what pins occupancy at 1. Splitting `K` across two **blocks** is not
+     buildable — the reduction is inside a thread, so it would need a global barrier per position
+     — but splitting it across **lanes** (`tid = v*2 + half`, one `__shfl_xor_sync`, no
+     `__syncthreads`) is, and it measures **2.24–2.44×**; a 4-way split reaches **2.79×**. Most of
+     that is getting `state_local` off the register ceiling, not occupancy: 4 accumulators alone
+     buy only 1.27×. Measured with [gdn_recurrence_probe.cu](scripts/gdn_recurrence_probe.cu);
+     **not yet built in TIR**.
   2. **Then scope the chunked linear-attention formulation** — matmuls over a chunk of C positions
      instead of a scalar loop, as in `../flash-linear-attention/fla/layers/gated_deltanet.py` and
      vLLM's `qwen3_next.py`. Substantially bigger than anything in §10–§15: it **changes the
@@ -878,37 +907,6 @@ reclaim — it is latency-bound on a dependency chain. Two steps, in order:
      on the 35B, and it needs its own chunk-state intermediate. Note it does **nothing for
      decode** — at `seq_len=1` the chunked form degenerates, and `gdn_func_inplace` is already
      only 2.1% of the whole-run budget.
-
-**1. Decide whether the 35B should be able to decode more than one sequence (§12).**
-`batch_decode` is pinned to a literal batch of 1 at
-[qwen3_5_moe_model.py:637](python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py#L637) so the MoE
-block's `if num_tokens == 1:` folds at compile time, routing decode through `dequantize_gemv`
-instead of `dequantize_group_gemm`. Until this is settled the 35B is single-sequence and the
-engine fix in §12 does nothing for it. **Blocked on a measurement, not a decision:** the "~6× at
-b=1 top-8" justification is a source comment, not a number in this document, and it predates both
-the Phase 9 CTA_COUNT=1024 restoration (§4.2) and nvcc 13.2. `bench_moe_kernel.py` settles it —
-and since `moe_dequantize_gemv` already runs at 88% of the 156 GB/s wall (§4.6), the honest
-question is how far the dynamic-batch path falls short of *that*, at b=1, today. Then choose:
-(a) a Relax `If` in the MoE block for runtime dispatch, (b) a second decode entry point with a
-dynamic batch that the engine selects when `max_num_sequence > 1`, or (c) leave it
-interactive-only and document that.
-
-**5. Tier-2 GEMV retune on the decode path**, discounted per the estimation lesson in §5 and
-re-scoped by the corrected §4.6 numbers — the fused `in_proj` is at **91%** of wall, not the 60%
-the stale analyzer reported, so it is *not* a candidate. What remains, all confirmed against
-launch geometry in the 2026-07-25b trace:
-
-| kernel | % of wall | ms/tok |
-|---|---:|---:|
-| `out_proj`/`o_proj` (shared) | 74% | **1.579** |
-| routed-expert down | 76% | 1.533 |
-| shared-expert gate_up | 60% | 0.486 |
-| MoE router (fp16) | 61% | 0.443 |
-| shared-expert down | 44% | 0.331 |
-
-`out_proj`/`o_proj` is the only one big enough to be worth a session on its own. Treat 88% as
-optimistic — both big ones differ from the tier-1 kernels in `K` (4096 and 512 vs 2048), so some
-of the gap is shape rather than schedule. That is §9's first open question, below.
 
 **The VL path has not been re-gated.** `Qwen35VLLMHeadModel` reuses `Qwen35Model.forward` and
 `forward_with_history`, so it inherits §11's in-place state, §13's conv fusion, §14's history conv
@@ -927,6 +925,8 @@ should just work.
 | **2** | ✅ **Landed, §13** — in-place GDN *conv* state, 35B +2.40% tg / +15.3% pp. The decode estimate was right and the stated rationale was not: the real prize was the TE conv itself at ~42× off roofline, not the state copies |
 | **3** | ❌ **Refuted by measurement, §13 — do not build.** Allowlisting the `rnn_state_*` handle builtins as static in `rewrite_cuda_graph.cc` to make the fused kernel capturable. The capture prediction was correct and everything built on it was wrong: eager launches went *up* 131 → 183/token, idle did not move (1.016 → 1.065 ms/token), and an eager launch costs ~0.9 µs at the margin, so the whole lane is worth ≤0.38 ms/token. §13 has the trace |
 | **4** | ➡ **Promoted to 0b** (2026-07-25b) — a high-margin prompt set now unblocks two gates rather than one |
+| **1** | ✅ **Settled by measurement, §16.4 — keep the b=1 specialization.** The "~6×" source comment understates it by 8×: at b=1 the top-8 gemv pair is **0.100 ms vs 5.112 ms** for `dequantize_group_gemm` v2 (**51×**; v1 is 1.957 ms, 20×). v2 is a dispatch-table kernel sized for all 256 experts, so its cost is flat in batch and crossover is ~50 sequences. Option (a) (a Relax `If`) is therefore pointless — the dynamic path never wins. If batched decode is ever wanted, widen the per-token gemv split that already ships for spec-decode verify (option **(d)**, which the original option list missed). Comment corrected in source |
+| **5** | ❌ **Refuted by measurement, §16.3 — do not build.** The premise was wrong twice over. At fixed N=2048 efficiency *rises* with K (48% → 68% → 84% → **90%** at K=4096), so K=4096 is the best case rather than the shortfall; and across six tile configurations the shipped sm_87 tile is within 0.5% of the best at every shape, with nothing improving K=4096 at all. `o_proj`'s traced 75% is a memory-system effect — it streams 40 distinct weight tensors per token with no reuse — not a schedule defect, so a GEMV retune cannot recover it. The sweep also exposed an instrument bug worth remembering: `bench_moe_kernel.py` reuses one weight tensor, which inflates small-footprint kernels by up to 20% via L2 (`lm_head` at 70× L2 agrees with the trace to 3.3%; `o_proj` at 1.2× L2 is 20.6% high) |
 
 ### What changed, by file (all committed — see "Committed state" above)
 
@@ -2027,7 +2027,53 @@ the three causes. Static resource usage, before timing:
 
 `acc4` isolates the chain: it shortens the dependency 4× but spills *more*, so if it still wins,
 latency dominates spill. `ksplit4` vs `ksplit2` discriminates occupancy from spill — both are
-spill-free, only occupancy differs. **Timings [pending].**
+spill-free, only occupancy differs.
+
+**Measured** (Orin, clocks pinned, 20 iters, batch=1, n_kh=16 — so 16 blocks, the shipped
+geometry). ms per kernel call:
+
+| seq_len | base | acc4 | ksplit2 | ksplit4 | acc4 × | ks2 × | **ks4 ×** |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.0777 | 0.0778 | 0.0376 | 0.0206 | 1.00 | 2.07 | **3.78** |
+| 128 | 0.7295 | 0.7268 | 0.2986 | 0.2627 | 1.00 | 2.44 | **2.78** |
+| 512 | 3.4900 | 2.7491 | 1.5546 | 1.2494 | 1.27 | 2.24 | **2.79** |
+| 2048 | 13.5119 | 10.5220 | 5.9638 | 4.8470 | 1.28 | 2.27 | **2.79** |
+
+Max relative deviation from `base` is 5.7e-7 across every variant and length — fp32 reduction
+order, not a different answer.
+
+Reading it:
+
+- **The single accumulator is real but not the main cost.** `acc4` breaks a 115-deep chain into
+  four and buys only **1.27×**, and nothing at all below 512 positions. It spills *more* (424 B vs
+  240 B), and that gives back most of the ILP it gains — which is the answer to "is it latency or
+  spill": at fixed register pressure the two are entangled, and you cannot fix one alone.
+- **Getting the state into registers is what matters.** `ksplit2` halves `state_local` to 64
+  floats, drops from 255 registers to 168 with **zero spill**, and is worth **2.24–2.44×** — nearly
+  double `acc4` for the same 2× reduction in chain length. The difference between them is exactly
+  the 47 LDL + 47 STL per timestep.
+- **Occupancy adds, with diminishing returns.** `ksplit4` doubles warps/SM again (8 → 16) and adds
+  only **1.23×** on top of `ksplit2` (2.79 vs 2.27). Both are spill-free, so that increment is
+  occupancy and shorter chains alone — and it is already flattening, so a 8-way split is unlikely
+  to be worth its reduction cost.
+
+**So the "cheap first" step is worth ~2.8× on the recurrence, and the answer to §15's proposal is
+"right instinct, wrong axis".** Splitting `K` was correct; splitting it across *blocks* was not,
+and the reason it helps is primarily that it takes the state off the 255-register ceiling rather
+than that it raises occupancy.
+
+**Bounding the claim honestly.** The probe measures the recurrence only — no ring flush (see the
+header comment), one head config, and a synthetic input distribution matched to the model's ranges.
+`gdn_func_history_inplace` is 95.6 ms of the 35B pp512 budget (§15.6); at 2.79× that lane would
+fall to ~34 ms, but the flush is excluded and Amdahl applies to the rest of prefill, so treat ~2.8×
+as an upper bound on the kernel and *not* as a prefill prediction. Per §15.2's rule, the estimate
+to publish should be renormalized against a trace of the actual A/B baseline before any lib is
+built.
+
+**Status: not built in TIR.** This is a measured design decision, not a landed change — the TIR
+kernel would need the lane-split layout, the `__shfl_xor_sync` reduction, and a re-gate through
+`gdn_kernel_check.py` (bit-exactness against the copy path is **off the table**, since the
+reduction order changes; the fp64 check becomes the bar).
 
 ### 16.3 Item 5 — the sm_87 GEMV tile is K-blind, and the gap tracks N, not K
 
@@ -2061,14 +2107,71 @@ If that holds, the sm_87 override — which was tuned on the MoE GEMVs, where th
 dimension multiplies block count by 8 — is **over-tiling the dense small-N kernels**, and
 `out_proj`/`o_proj` at 8.1% of the decode budget is its largest victim.
 
-Two instruments were added to settle it, both **[pending]**:
+Two instruments were added to settle it:
 - `bench_moe_kernel.py` gained a K-sweep at fixed N=2048 and an N-sweep at fixed K=2048 — the
   first varies reduction depth alone, the second varies block count alone — plus achieved-bandwidth
-  reporting against the 156 GB/s wall so the numbers are directly comparable to §4.6.
+  reporting against the 156 GB/s wall.
 - `MLC_GEMV_TSTR="TS,TR,TILE_S"` in `gemv.py` overrides the sm_87 tile, so several schedules can be
   timed at one fixed shape. Inert when unset. `"16,32,1"` reproduces the generic CUDA schedule
   exactly, which is the A/B that matters; `"32,16,2"` reproduces production and doubles as a check
   that the hook is live.
+
+#### The premise is wrong: K=4096 is the *best* K, not a deficit
+
+| K (N=2048 fixed) | ms | GB/s | | N (K=2048 fixed) | ms | GB/s |
+|---:|---:|---:|---|---:|---:|---:|
+| 512 | 0.008 | 75.5 | | 512 | 0.011 | 54.5 |
+| 1024 | 0.011 | 106.6 | | 1024 | 0.011 | 106.4 |
+| 2048 | 0.018 | 131.9 | | 2048 | 0.018 | 131.8 |
+| **4096** | 0.033 | **141.2** | | 4096 | 0.034 | 139.1 |
+| 8192 | 0.077 | 123.6 | | | | |
+
+Efficiency rises with work per launch along **both** axes. §9's question assumed K=2048 was the
+good case and K=4096 the shortfall; at fixed N the opposite is true. `attn_o_proj` at its exact
+production shape (N=2048, K=4096) measures **141.5 GB/s in isolation against 117.4 GB/s in the
+§4.6 trace**.
+
+#### No schedule beats the shipped one — item 5 should not be built
+
+Same shapes, tile varied (% of the 156 GB/s wall):
+
+| `TS,TR,TILE_S` | K=4096 | K=2048 | K=512 |
+|---|---:|---:|---:|
+| **`32,16,2` (production)** | **90.5%** | 84.9% | 43.5% |
+| `16,32,1` (generic CUDA) | 90.3% | 83.0% | 39.6% |
+| `32,16,1` | 90.4% | **85.4%** | 43.5% |
+| `16,16,2` | 84.3% | 83.6% | 38.5% |
+| `32,32,2` | 81.6% | 75.5% | 39.6% |
+| `64,8,2` | 48.8% | 84.4% | **46.9%** |
+
+The sm_87 tile is at or within 0.5% of the best tested schedule at every shape. Nothing improves
+K=4096; the only tile that helps K=512 (`64,8,2`, +3.4 pts) costs 42 points at K=4096. **There is
+no schedule win available, so §5 option 3 / §9 item 5 joins item 3 as refuted by measurement — do
+not build it.** This comparison is the robust part of the section: every schedule sees the same
+weights and the same cache behaviour, so the caveat below does not touch it.
+
+#### Why the absolute numbers here run above §4.6, and why that is not a contradiction
+
+The microbench times one weight tensor repeatedly, so anything near the 4 MB L2 gets reuse
+production never sees — production streams 40 *different* `o_proj` tensors per token. The
+inflation should then scale inversely with footprint, and it does exactly:
+
+| kernel | weights | isolated | §4.6 traced | gap |
+|---|---:|---:|---:|---:|
+| `lm_head` | 286 MB (70× L2) | 167.4 GB/s | 156.1 | +3.3% (≈ the nsys overhead §4.6 notes) |
+| `in_proj_qkv` | 8.4 MB (2× L2) | 148.4 | 137.8 | +7.7% |
+| `out_proj`/`o_proj` | 4.7 MB (1.2× L2) | 141.5 | 117.4 | **+20.6%** |
+
+A kernel 70× over L2 agrees with the trace to within nsys' own overhead; the one sitting just above
+L2 is inflated most. **Trust §4.6 for production percentages and this bench only for A/B at a fixed
+shape.** It also supplies the missing explanation: `o_proj` runs at 75% in production not because
+of its K and not because of its tile, but because it streams from DRAM with no reuse while the
+kernels it is being compared against are either far larger (and equally starved) or amortised
+across 8 experts. Fixing that would mean changing *when* the weights are read, not how the GEMV is
+scheduled.
+
+**Instrument caveat worth carrying forward:** `bench_moe_kernel.py` should rotate over several
+weight buffers before its absolute numbers are quoted against a trace again.
 
 ### 16.4 Item 1 — the option list was missing an option
 
@@ -2082,6 +2185,56 @@ cite: *"Bench at B=24 group_gemm showed 0.058 ms/row flat at small batch vs gemv
 
 So the choice is not only (a) Relax `If`, (b) a second decode entry point, (c) interactive-only.
 There is (d): **widen the existing literal-batch split**, which needs no new kernel and no runtime
-dispatch — only a literal `num_tokens`, which a fixed `max_batch_size` lib already has. What decides
-between (b)/(d) and (c) is how per-token gemv cost scales against `group_gemm` at
-B = batch × top_k, which is what the queued sweep at B = 8/16/32/64 measures.
+dispatch — only a literal `num_tokens`, which a fixed `max_batch_size` lib already has.
+
+#### Measured — and the "~6×" understates it by 8×
+
+ms per call, 35B-A3B MoE shapes (Ne=256, top_k=8), B = tokens × top_k. **`MLC_MOE_GEMM_V2=1` set**
+— without it the bench silently measures the v1 fallback, which is the §8 trap in bench form, and
+the two kernels differ by 3.5× at B=8, so the flag changes the conclusion:
+
+| path | gate_up | down | **total** | vs gemv |
+|---|---:|---:|---:|---:|
+| **`dequantize_gemv` (b=1, ships today)** | 0.064 | 0.036 | **0.100** | — |
+| `group_gemm` **v1** @ B=8 | 1.006 | 0.951 | 1.957 | 19.6× |
+| `group_gemm` **v2** @ B=8 | 3.572 | 1.540 | **5.112** | **51×** |
+| `group_gemm` v2 @ B=16 | 3.583 | 1.549 | 5.132 | 51× |
+| `group_gemm` v2 @ B=32 | 3.602 | 1.563 | 5.165 | 52× |
+| `group_gemm` v2 @ B=64 | 3.657 | 1.592 | 5.249 | 52× |
+
+The gemv leg is validated against production: 0.064 ms/call here vs §4.6's 2.650 ms over 40 calls
+= 0.066 ms/call.
+
+**v2's cost is flat in B** (+2.6% from B=8 to B=64) because it is a dispatch-table kernel sized for
+the full expert set: 256 experts × (1024×2048/2 + scales) ≈ 302 MB, which at 156 GB/s is 1.94 ms —
+so 3.57 ms is ~54% of wall *for reading every expert*. At b=1 that is 32× the weight traffic the
+top-8 actually needs. v1's persistent loop skips empty experts and so scales with B instead
+(1.006 → 3.906 across B=8→64) — better at tiny B, worse asymptotically.
+
+#### Decision: keep the specialization; if multi-sequence decode is wanted, take option (d)
+
+Per-token gemv split costs `b × 0.100 ms`; v2 costs a flat ~5.15 ms:
+
+| sequences b | per-token gemv split | `group_gemm` v2 | winner |
+|---:|---:|---:|---|
+| 1 | 0.100 | 5.112 | gemv **51×** |
+| 2 | 0.200 | 5.132 | gemv 26× |
+| 4 | 0.400 | 5.165 | gemv 13× |
+| 8 | 0.800 | 5.249 | gemv **6.6×** |
+
+Crossover is around **b ≈ 50 sequences**, which a 64 GB Orin running a 35B will not reach. So:
+
+1. **§9 item 1's underlying question is settled: the b=1 MoE specialization is worth keeping**, and
+   by a much wider margin than the source comment claims. The comment should be corrected from
+   "~6×" to ~51× against v2 (~20× against v1) and dated.
+2. **Option (a) — a Relax `If` for runtime dispatch — is the wrong shape of fix**, because there is
+   no batch at which the dynamic path wins.
+3. **If the 35B is to decode more than one sequence, option (d) is the cheap route**: widen the
+   existing `1 < num_tokens <= 5` per-token split, which already ships for spec-decode verify. It
+   duplicates weight traffic when two sequences share an expert, but gemv is already at 94.7% of
+   wall, so the cost is exactly b× and nothing is lost to inefficiency.
+4. The 35B stays single-sequence until someone wants (d); that is now a documented trade-off with
+   numbers behind it rather than a pinned literal with a stale comment.
+
+**Caveat:** the same L2-reuse limitation as §16.3 applies to absolute numbers, but the gemv leg
+agrees with the trace to 3%, and a 51× ratio is not an L2 artifact.
