@@ -884,7 +884,7 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `7865c5de` | **§16.6** item 0d — `v_block` + `MLC_QWEN35_GDN_VBLOCK` + the `vb_exact` gate bar; opt-in at default `0` |
 | `6c0ef467` | **§16.7** the 35B prefill trace; item 0c.2 de-prioritised, item **0e** filed |
 | `8562fade` | **§9** handoff rewritten as a cold-start block; traps list gains the concurrency failure |
-| `7f8787fa` | **§16.8** item 0e measured — v2 is CTA-bound, 27–50% padding CTAs; item **0f** filed; `bench_moe_kernel.py` large-B mode + two instrument fixes |
+| `5294dae4` | **§16.8** item 0e measured — v2 is CTA-bound, 27–50% padding CTAs; item **0f** filed; `bench_moe_kernel.py` large-B mode + two instrument fixes |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
