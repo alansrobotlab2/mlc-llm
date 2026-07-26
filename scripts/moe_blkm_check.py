@@ -40,11 +40,18 @@ def main() -> None:
     p.add_argument("--blkm", default="16,32,64", help="comma-separated BLK_M values")
     p.add_argument("--quick", action="store_true", help="skip the timing pass")
     p.add_argument("--batches", default="4096", help="comma-separated batch sizes to time")
+    p.add_argument("--hoist", default="0", help="comma-separated MLC_MOE_GEMM_V2_HOIST values "
+                                                "(item 0h). Every combination is swept")
     cli = p.parse_args()
 
     blkms = [int(v) for v in cli.blkm.split(",")]
     assert blkms[0] == 16, "BLK_M=16 is the exactness reference; keep it first"
     batches = [int(v) for v in cli.batches.split(",")]
+    hoists = cli.hoist.split(",")
+    # The reference must be the shipped config: BLK_M=16 with the hoist off. At BLK_M=16
+    # i_o has extent 1, so hoist on/off are the same kernel there — which is itself worth
+    # asserting, and the sweep does by including (16, 1) when --hoist includes it.
+    assert hoists[0] == "0", "HOIST=0 is the reference; keep it first"
 
     dev = tvm.cuda(0)
     target = tvm.target.Target.from_device(dev)
@@ -56,20 +63,28 @@ def main() -> None:
         N, K = SHAPES[name]
         args, indptr = make_inputs(N, K, B, routing, dev)
         ref_o, ref_ms, row = None, None, []
-        for blkm in blkms:
-            os.environ["MLC_MOE_GEMM_V2_BLKM"] = str(blkm)
-            out, ms = run(build(N, K, B, target, dev), args, dev, not cli.quick)
-            if ref_o is None:
-                ref_o, ref_ms = out, ms
-                row.append(f"BLK_M={blkm}: " + ("(ref)" if cli.quick else f"{ms:7.3f} ms (ref)"))
-                continue
-            exact = np.array_equal(ref_o, out)
-            failures += 0 if exact else 1
-            tag = "exact" if exact else f"DIFF({int((ref_o != out).sum())})"
-            timing = "" if cli.quick else f"{ms:7.3f} ms {ref_ms / ms:5.2f}x "
-            row.append(f"BLK_M={blkm}: {timing}{tag}")
-        print(f"{name:8} B={B:<5} {routing:7} experts={int(np.count_nonzero(np.diff(indptr))):3d}  "
-              + " | ".join(row))
+        for hoist in hoists:
+            for blkm in blkms:
+                os.environ["MLC_MOE_GEMM_V2_BLKM"] = str(blkm)
+                os.environ["MLC_MOE_GEMM_V2_HOIST"] = hoist
+                label = f"M={blkm}/H={hoist}"
+                try:
+                    out, ms = run(build(N, K, B, target, dev), args, dev, not cli.quick)
+                except Exception as exc:  # a config that will not schedule is a result
+                    row.append(f"{label}: FAIL {type(exc).__name__}")
+                    failures += 1
+                    continue
+                if ref_o is None:
+                    ref_o, ref_ms = out, ms
+                    row.append(f"{label}: " + ("(ref)" if cli.quick else f"{ms:7.3f} ms (ref)"))
+                    continue
+                exact = np.array_equal(ref_o, out)
+                failures += 0 if exact else 1
+                tag = "exact" if exact else f"DIFF({int((ref_o != out).sum())})"
+                timing = "" if cli.quick else f"{ms:7.3f} ms {ref_ms / ms:5.2f}x "
+                row.append(f"{label}: {timing}{tag}")
+        print(f"{name:8} B={B:<5} {routing:7} experts={int(np.count_nonzero(np.diff(indptr))):3d}\n    "
+              + "\n    ".join(row))
 
     print(f"\n{'PASS' if failures == 0 else f'FAIL ({failures} case(s) not bit-exact)'}")
     sys.exit(1 if failures else 0)

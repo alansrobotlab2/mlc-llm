@@ -10,12 +10,21 @@ import json
 import statistics
 import sys
 import time
+import zlib
 from pathlib import Path
 
 PROMPT_FILLER = "The quick brown fox jumps over the lazy dog. " * 200
 
-
-def build_prompt(tokenizer, target_len: int, salt: str = "") -> tuple[str, int]:
+# ⚠️ PROMPT_FILLER is ONE sentence repeated: a 512-token prompt built from it has just
+# **11 distinct tokens (2.1%)**, against 188 (36.7%) for real prose. That is fine for a
+# dense model, where prefill cost does not depend on *which* tokens arrive — and wrong
+# for this MoE, where the router keys on hidden states, so a low-diversity prompt
+# concentrates routing onto far fewer experts than real text does. Expert concentration
+# is exactly what sets the MoE GEMM's tile count (workplan §17.9), so the filler prompt
+# does not merely mis-scale the pp number: it can flip which kernel configuration wins.
+# Use --prompt-file for any measurement whose conclusion depends on routing.
+def build_prompt(tokenizer, target_len: int, salt: str = "",
+                 source: str | None = None) -> tuple[str, int]:
     """Build a `target_len`-token prompt, optionally prefixed by a unique `salt`.
 
     `salt` exists for prefix-cache benching. With `prefix_cache_mode != "disable"` an
@@ -24,10 +33,25 @@ def build_prompt(tokenizer, target_len: int, salt: str = "") -> tuple[str, int]:
     reads as a huge win that no first-time request ever sees. A per-run salt keeps the
     shared prefix at ~0 tokens so each run really does prefill.
 
+    `source` is natural-language text to draw the prompt from instead of the repeated
+    filler; see the warning above for why that matters on a MoE. A different window of
+    it is used per salt, so runs stay distinct without falling back to repetition.
+
     The returned length is the *re-encoded* length, not the requested one: the
     truncate-then-decode round trip is not guaranteed to be token-count stable, and
     pp_tps divides by this number.
     """
+    if source is not None:
+        ids = tokenizer.encode(source, add_special_tokens=False)
+        if len(ids) < target_len * 2:
+            raise SystemExit(f"--prompt-file has {len(ids)} tokens; need >= {target_len * 2} "
+                             f"so each run can take a distinct window")
+        # Distinct window per salt. crc32, not hash(): str hashing is salted per process
+        # (PYTHONHASHSEED), which would silently pick different windows on every run and
+        # make two libs incomparable — the exact class of harness bug §14.1 warns about.
+        off = (zlib.crc32(salt.encode()) % max(len(ids) - target_len, 1)) if salt else 0
+        text = tokenizer.decode(ids[off:off + target_len])
+        return text, len(tokenizer.encode(text, add_special_tokens=False))
     filler = (salt + " " if salt else "") + PROMPT_FILLER
     ids = tokenizer.encode(filler, add_special_tokens=False)
     if len(ids) < target_len:
@@ -69,6 +93,11 @@ def main():
                          "hybrid (RNNState) model this decides which forward path prefill "
                          "takes, so 'disable' does NOT measure what a default-configured "
                          "user gets. See workplan-cuda-13.md §13.")
+    ap.add_argument("--prompt-file", default=None,
+                    help="Draw the prompt from this natural-language file instead of the "
+                         "repeated filler. REQUIRED for any MoE conclusion that depends on "
+                         "expert routing: the filler has 11 distinct tokens per 512 and "
+                         "concentrates the router (see build_prompt's warning, workplan 17.9).")
     ap.add_argument("--unique-prompts", default=None, action="store_true",
                     help="Salt every run's prompt so radix cannot hit. Defaults to on "
                          "whenever --prefix-cache-mode is not 'disable'.")
@@ -117,9 +146,12 @@ def main():
     print(f"[mlc] prefix_cache_mode={args.prefix_cache_mode} "
           f"unique_prompts={args.unique_prompts}", flush=True)
 
+    src_text = Path(args.prompt_file).read_text() if args.prompt_file else None
+
     def prompt_for(tag: str) -> tuple[str, int]:
         return build_prompt(tokenizer, args.pp,
-                            salt=f"Archive record {tag}." if args.unique_prompts else "")
+                            salt=f"Archive record {tag}." if args.unique_prompts else "",
+                            source=src_text)
 
     prompt, prompt_len = prompt_for("base")
     print(f"[mlc] Prompt length: {prompt_len} tokens", flush=True)

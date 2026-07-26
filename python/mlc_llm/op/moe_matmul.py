@@ -610,6 +610,10 @@ def _dequantize_group_gemm_v2(
     # MLC_MOE_GEMM_V2_BLKM stays as a diagnostic; bit-exact at every value, since it
     # does not touch the split over K.
     BLK_M = int(os.environ.get("MLC_MOE_GEMM_V2_BLKM", "16"))
+    # Item 0h: put the row-fragment loop *inside* the k-loop the shared loads hang off,
+    # so widening BLK_M amortizes one weight dequant over more rows instead of repeating
+    # it. Inert at BLK_M=16 (i_o has extent 1). See _schedule_v2 and §17.8.
+    HOIST = os.environ.get("MLC_MOE_GEMM_V2_HOIST", "0") == "1"
     assert BLK_M % 16 == 0, "BLK_M must be a multiple of the wmma M=16"
     BLK_N = 128
     # BLK_K sets the k-step of the cooperative fetch, and therefore how many bytes of
@@ -784,7 +788,16 @@ def _dequantize_group_gemm_v2(
         block_outer = sch.blockize(i_i)
 
         k_o_o, k_o_i = sch.split(k_o, factors=[None, BLK_K // MICRO])
-        sch.reorder(i_o, j_o, k_o_o, k_o_i)
+        # Item 0h (§17.8). `_coop` attaches the cooperative shared loads to k_o_o, so
+        # whichever of i_o / k_o_o is outer decides how many times a CTA re-runs the
+        # BLK_N x K weight dequant: i_o outer => BLK_M/MICRO times, k_o_o outer => once.
+        # At the default BLK_M=16 i_o has extent 1 and the two are identical; the choice
+        # only bites once BLK_M is widened, which is exactly what §17.1 measured without
+        # it and §17.8 predicts with it.
+        if HOIST:
+            sch.reorder(j_o, k_o_o, k_o_i, i_o)
+        else:
+            sch.reorder(i_o, j_o, k_o_o, k_o_i)
         sch.bind(j_o, "threadIdx.y")
         # Tag k_o_o so item 0f can find it by name. It used to be located by matching
         # `extent == K // BLK_K`, which is not unique — at K=512, BLK_K=64 that extent

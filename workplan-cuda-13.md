@@ -967,9 +967,21 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > 1.27×–1.39× on the kernel, bit-exact, **+14.1% pp512**. 128 regresses on shared memory. Default is
 > now 64 (`MLC_MOE_GEMM_V2_BLKK`).
 >
+> ⚠️ **Read §17.9 first: the bench prompt is one sentence repeated (11 distinct tokens per 512, vs
+> 219 for prose), and on a MoE that concentrates the router and can flip which kernel config wins.**
+> Every pp512 number in this document is a filler number and ~4% optimistic (838.06 on prose vs
+> 875.37). They stay comparable to each other, so no earlier kernel conclusion is overturned — but
+> use `--prompt-file` for anything routing-dependent from now on.
+>
 > **The real CTAs are now roofline'd (§17.7): 85–87% of the 156 GB/s wall on balanced routing, 16%
 > of the tensor ceiling.** That is §5's tier-1 band — on balanced routing this kernel is done, and
 > `BLK_K` is visibly the whole reason (57%/68% → 85%/87%). Compute was never close.
+>
+> **Item 0h is built, measured and parked (§17.10).** The hoist works: `BLK_M=64`+hoist is **+12.6%
+> pp2048** but **−10.4% pp128**, and `BLK_M=32` is the same trade at half scale — **no compile-time
+> `BLK_M` is Pareto**, so defaults are unchanged and the shipped kernel is byte-identical to what
+> §17.6 gated. Shipping it means a runtime branch on `B` near 3600; that is the single best-costed
+> item on the list at **+12.6% on long-prompt prefill for no short-prompt cost**.
 >
 > **The one lead left in it is tile fragmentation, and it comes with a retraction.** Ragged routing
 > sits 25 points lower on *identical* unique bytes: all 256 experts are hit either way, but
@@ -1205,24 +1217,25 @@ neutral, and the 35B state gate is *identical* to `lib_skippad` in both prefix-c
 regresses (0.80×–0.93×) on shared memory. `MLC_MOE_GEMM_V2_BLKK=32` restores the old kernel. This
 parameter had never been swept.
 
-**0h. ⚖️ Shape-split and unmeasured — §17.1 measured it, §17.8 corrected what that measurement
-means.** Register-blocking `BLK_M` by hoisting the cooperative loads above `i_o`, which §16.11 called
-"the largest remaining prize in the MoE".
+**0h. ⚖️ BUILT AND MEASURED END-TO-END (§17.10) — the hoist works; it needs a runtime branch to
+ship.** Register-blocking `BLK_M` by hoisting the cooperative loads above `i_o`, which §16.11 called
+"the largest remaining prize in the MoE". `MLC_MOE_GEMM_V2_HOIST=1`; inert and bit-exact at the
+default `BLK_M=16`.
 
-*Settled:* at **pp512** it cannot help, with or without the hoist. 4096 rows over 256 experts is
-exactly 16 rows/expert and `BLK_M` is already 16, so `ceildiv` gives one tile at 16, 32 *and* 64 —
-there is no CTA count to save, and widening only inflates X and O traffic (predicted **0.76×**
-balanced, **0.91×** at production's ~40% padding). Un-hoisted it measures 0.51×–0.63×.
+*Measured, on real prose (§17.9 — the filler prompt gets this wrong by a factor of 3, and the
+synthetic microbench routings get the **sign** wrong):* `BLK_M=64`+hoist is **+12.6% pp2048** and
+**−10.4% pp128**; `BLK_M=32`+hoist is +7.8% / −5.5%. Crossover ≈ pp450. Decode neutral, state gate
+identical to `lib_blkk64` in both prefix-cache modes.
 
-*Open:* `prefill_chunk_size` is **2048**, so every prompt past one chunk runs at **B=16384**, where
-the count genuinely halves and §17.8's cost model — validated to ≤4% on three of §17.1's four
-measurements — predicts the hoist is worth **1.37×–1.51× on this kernel**. §17.1's 1.00×/1.01× there
-is the *un-hoisted* number, and it is exactly what a cancelled win looks like; it is not evidence the
-win is absent.
+*Verdict:* **no compile-time `BLK_M` is Pareto**, so defaults stay at 16/off and the shipped kernel
+is unchanged. Widening inflates the X and O traffic a tile moves whether or not its rows are real,
+and a 128-token prompt has 4 rows per expert to amortize that over.
 
-*Before building:* `BLK_M` is a compile-time constant, so a B=16384 win means regressing pp512 unless
-the kernel is specialised per chunk size — cost that first. Bit-exact at every value (the reduction
-over K is split identically), so `moe_blkm_check.py` gates it at exact equality.
+*To ship it:* specialise on `B` — emit `(BLK_M=16)` and `(BLK_M=64)` dispatch+GEMM pairs and branch
+on `x.shape[0]` near **B ≈ 3600**. `LowBatchGemvSpecialize` is the in-tree precedent. **+12.6% on
+≥2048-token prefill at no short-prompt cost**, on a 262144-context model chunked at 2048. Cost: two
+variants in the binary (the dispatch table is `BLK_M`-dependent and cannot be shared) plus a branch
+on a symbolic shape.
 
 **0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
 Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
@@ -3580,3 +3593,92 @@ chunk size. Cost that before building it.
 arithmetic, §9's priority order, and now this. Every one was an extrapolation across conditions, and
 every one was cheap to check. The check that would have caught this one is two lines of arithmetic
 over issued bytes — less work than the sweep that produced the wrong conclusion.
+
+### 17.9 The bench prompt was choosing the winner — 11 distinct tokens per 512
+
+Digging into item 0h surfaced a harness fault of the same family as §14.1, and it is worth
+reading before any other MoE number in this document.
+
+`scratch_mlc_tg_sweep.py`'s prompt is `PROMPT_FILLER = "The quick brown fox jumps over the lazy
+dog. " * 200` — **one sentence repeated**. A 512-token prompt built from it contains **11 distinct
+tokens (2.1%)**; 512 tokens of real prose contain **219 (42.8%)**, a 20× difference in diversity.
+
+On a dense model that is harmless: prefill cost does not depend on *which* tokens arrive. **On a MoE
+it decides the answer**, because the router keys on hidden states, so a low-diversity prompt
+concentrates routing onto far fewer experts — and expert concentration is exactly what sets this
+kernel's tile count (§17.7). Measured on the shipped `lib_blkk64`:
+
+| | filler prompt | real prose | filler overstates by |
+|---|---:|---:|---:|
+| pp512 | 874.49 | **838.06** | **+4.3%** |
+| pp2048 | 953.26 | **945.81** | +0.8% |
+
+So **every pp512 figure in this document is a filler number and is ~4% optimistic.** They remain
+comparable *to each other* — the bias is common to all of them — so no earlier conclusion about a
+kernel change is overturned by this. But the absolute pp512 headline is not what a real request sees.
+
+**It is worse than a scale factor for anything routing-dependent.** The first end-to-end A/B of item
+0h, run on the filler, read **+5.5% at pp512**; the same A/B on prose reads **+1.8%**. The filler
+inflated the gain 3×. And in the other direction, the microbench's synthetic routings (`even` and
+uniform `random`) predicted 0h would *lose* 25% at pp512 — the wrong **sign**, because neither
+synthetic routing resembles what a real router does.
+
+`--prompt-file` is added to the harness for this, with [scripts/make_prose_corpus.py](scripts/make_prose_corpus.py)
+to build the corpus reproducibly. It uses `zlib.crc32` rather than `hash()` to pick each run's window,
+because `hash()` on `str` is salted per process and would have silently given two libs different
+prompts — §14.1's bug class, one layer down.
+
+> **Rule going forward: a MoE A/B whose mechanism touches tile counts, expert counts or routing must
+> be run with `--prompt-file`.** The filler is fine for decode, for dense kernels, and for anything
+> whose cost is routing-independent — `BLK_K` (§17.3) is in that category, which is why its win
+> reproduced on both synthetic routings and does not need re-measuring.
+
+### 17.10 Item 0h measured end-to-end — the hoist works, and no compile-time `BLK_M` is Pareto
+
+The hoist was built (`MLC_MOE_GEMM_V2_HOIST=1`): `sch.reorder(j_o, k_o_o, k_o_i, i_o)` puts the
+row-fragment loop *inside* the k-loop that `_coop` attaches the shared loads to, so a CTA runs the
+`BLK_N x K` weight dequant once instead of `BLK_M/MICRO` times. At `BLK_M=16` `i_o` has extent 1 and
+the reorder is inert — measured **1.00× on all 8 microbench cells and bit-exact**, which is the
+check that the reorder itself is sound rather than merely fast.
+
+**Kernel level, all 48 configs bit-exact.** §17.8's predictions land:
+
+| | predicted (§17.8) | measured |
+|---|---:|---:|
+| B=4096 even, M=32 | 0.76× | 0.79× |
+| B=4096 ragged, M=32 | 1.09× | 1.01× |
+| B=16384 even, M=32 | 1.51× | 1.44× |
+| B=16384 ragged, M=32 | 1.37× | 1.32× |
+
+`BLK_M=64` + hoist, which the model was not asked about, reaches **2.12× / 1.87×** at B=16384.
+
+**End-to-end on real prose (§17.9), which is the measurement that decides it:**
+
+| pp | `lib_blkk64` (M=16, shipped) | `lib_hoist32` (M=32+hoist) | `lib_hoist64` (M=64+hoist) |
+|---:|---:|---:|---:|
+| 128 | 552.08 | 521.85 (−5.5%) | 494.89 (**−10.4%**) |
+| 256 | 707.45 | 688.79 (−2.6%) | 665.23 (−6.0%) |
+| 512 | 838.06 | 848.73 (+1.3%) | 853.14 (+1.8%) |
+| 2048 | 945.81 | 1019.31 (+7.8%) | 1064.55 (**+12.6%**) |
+
+Decode neutral throughout (59.2–60.2). `lib_hoist64` passes the 35B state gate **identically to
+`lib_blkk64` in both prefix-cache modes** — same τ columns, same near-tie counts — so the
+bit-exactness claim holds end-to-end as well as in the microbench.
+
+**Neither width is Pareto.** Both lose on short prompts and win on long ones, crossing over near
+**pp ≈ 450**. `BLK_M=32` is not the safe middle it looked like — it is merely a smaller version of
+the same trade (−5.5% short, +7.8% long). Widening `BLK_M` inflates the X and O traffic a tile must
+move whether or not the rows are real, and at 128 tokens there are only 4 rows per expert to
+amortize it over.
+
+**Therefore: defaults are unchanged — `BLK_M=16`, `MLC_MOE_GEMM_V2_HOIST=0`.** The shipped kernel is
+byte-identical to what §17.6 gated. Turning the hoist on by itself buys nothing at `BLK_M=16`, and
+changing a gated kernel for no measured benefit is not worth the risk.
+
+**What would make it shippable, now fully costed rather than guessed:** specialise on `B` at runtime
+— emit both `(BLK_M=16)` and `(BLK_M=64)` dispatch+GEMM pairs and branch on `x.shape[0]` around
+`B ≈ 3600` (pp450 × top-8). `LowBatchGemvSpecialize` is the in-tree precedent for a batch-conditioned
+Relax branch. Worth **+12.6% on ≥2048-token prefill with no short-prompt cost**, on a model whose
+context window is 262144 and whose `prefill_chunk_size` is 2048 — so long prompts run the winning
+shape for all but their last chunk. The cost is two kernel variants in the binary (the dispatch table
+is `BLK_M`-dependent, so it cannot be shared) and a branch on a symbolic shape.

@@ -88,16 +88,44 @@ The previous handoff left three uncosted candidates and no queued item. All thre
   issued bytes is what exposed the retraction. §16.8 learned this once ("a cost model denominated in
   CTAs"); it generalised.
 
+**Then dug into 0h (§17.9-§17.10), which produced a harness finding bigger than the item**
+- **Built the hoist** (`MLC_MOE_GEMM_V2_HOIST=1`): reorder so the row-fragment loop sits inside the
+  k-loop the shared loads attach to. Inert and bit-exact at BLK_M=16 (1.00x on all 8 cells), which
+  is the check that the reorder is sound. All 48 sweep configs bit-exact. §17.8's predictions land
+  within 8%, and BLK_M=64 reaches **2.12x** on the kernel at B=16384.
+- **The bench prompt was choosing the winner.** `PROMPT_FILLER` is one sentence repeated: 512 tokens
+  of it hold **11 distinct tokens (2.1%)** against **219 (42.8%)** for prose. Dense models do not
+  care which tokens arrive; a MoE router does, so low diversity concentrates routing, and expert
+  concentration is exactly what sets this kernel's tile count. Consequences: every pp512 number in
+  the workplan is **~4% optimistic** (838.06 prose vs 874.49 filler); the first 0h A/B read **+5.5%**
+  on filler and **+1.8%** on prose; and the microbench's synthetic routings predicted the wrong
+  **sign** entirely. Added `--prompt-file` + `scripts/make_prose_corpus.py`.
+- **0h parked, fully costed.** On prose, BLK_M=64+hoist is **+12.6% pp2048 / -10.4% pp128**;
+  BLK_M=32 is +7.8% / -5.5%. Crossover ~pp450. **No compile-time BLK_M is Pareto**, so defaults stay
+  16/off and the shipped kernel is byte-identical to what §17.6 gated. `lib_hoist64` passes the state
+  gate identically to `lib_blkk64` in both modes.
+
+**Learned (0h)**
+- **A harness can pick the winner without being wrong about anything it measures.** The filler
+  prompt reports honest tps; it just does not exercise the router. This is §14.1's lesson
+  ("a benchmark only measures what its harness lets it configure") with the configuration being the
+  *input data* rather than a flag. Ask what a benchmark's input makes representative, not only what
+  its options allow.
+- **Synthetic routings got the sign wrong.** `even` and uniform-`random` bracket nothing useful: a
+  real router is far more concentrated than either. Microbench ratios for this kernel are not
+  trustworthy for ranking until they are driven by a real indptr.
+- `hash()` on `str` is salted per process, so using it to pick a prompt window would have given two
+  libs different prompts silently. Used `zlib.crc32`.
+
 **Next**
 - The open list is **0c.2** (chunked recurrence, de-prioritised at a +12.5% Amdahl ceiling), **0h**
-  (now shape-split), plus the VL re-gate — which is **not** blocked: `Qwen/Qwen3.5-0.8B` is itself
+  (built and parked; needs a runtime branch on B near 3600 for +12.6% long-prompt prefill at no
+  short-prompt cost — the best-costed item on the list), plus the VL re-gate — which is **not** blocked: `Qwen/Qwen3.5-0.8B` is itself
   the VL checkpoint (153 of 488 tensors are `model.visual.*`) and has been cached since day one. All
   three `dist/` builds were just compiled `--model-type qwen3_5`, dropping the vision tower. A VL
   build is a local compile, not a download. Earlier entries claiming otherwise are corrected.
-- **0h is the live question**, and it is a scoping decision before it is a build: `BLK_M` is a
-  compile-time constant, so taking the predicted 1.37x-1.51x at B=16384 means regressing pp512
-  unless the kernel is specialised per chunk size. Cost that first. Note pp512 is the benchmark but
-  `prefill_chunk_size=2048`, so long prompts run the B=16384 shape the benchmark never touches.
+- **Re-bench the pp headline on prose** if the absolute number matters to anyone; the filler
+  figures are internally comparable but ~4% high.
 
 ---
 
