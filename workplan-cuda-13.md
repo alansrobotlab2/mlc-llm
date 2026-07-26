@@ -967,11 +967,22 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > 1.27×–1.39× on the kernel, bit-exact, **+14.1% pp512**. 128 regresses on shared memory. Default is
 > now 64 (`MLC_MOE_GEMM_V2_BLKK`).
 >
-> **Where to look next, in the absence of a queued item.** The real CTAs are the whole cost now and
-> §17 did not roofline them; that is the first thing to measure. §17.5 records one blocked route
-> (widening the W fetch to a whole `uint32` per thread hits TVM's 4-lane `Ramp` ceiling). Item 0c.2
-> remains open and de-prioritised at a +12.5% Amdahl ceiling. Do **not** re-open `BLK_M` without a
-> shape where `count_e >> BLK_M`.
+> **The real CTAs are now roofline'd (§17.7): 85–87% of the 156 GB/s wall on balanced routing, 16%
+> of the tensor ceiling.** That is §5's tier-1 band — on balanced routing this kernel is done, and
+> `BLK_K` is visibly the whole reason (57%/68% → 85%/87%). Compute was never close.
+>
+> **The one lead left in it is tile fragmentation, and it comes with a retraction.** Ragged routing
+> sits 25 points lower on *identical* unique bytes: all 256 experts are hit either way, but
+> `ceildiv(count_e, 16)` needs 2944 CTAs instead of 2048, and the extra ones re-read weights L2 can
+> serve — time without DRAM traffic. §17.8 retracts §17.1's claim that hoisting the loads above `i_o`
+> "would buy the right to break even": that was inferred from *un-hoisted* measurements. A cost model
+> validated to ≤4% against three of those four measurements says the hoist is a **loss at pp512**
+> (0.76×–0.91×, so §17.1's headline conclusion stands) but worth **1.37×–1.51× at B=16384**, the
+> shape a 2048-token prefill chunk produces — a workload pp512 cannot see. `BLK_M` is a compile-time
+> constant, so taking that would mean specialising per chunk size; cost it before building.
+>
+> §17.5 records one blocked route (widening the W fetch to a whole `uint32` per thread hits TVM's
+> 4-lane `Ramp` ceiling). Item 0c.2 remains open and de-prioritised at a +12.5% Amdahl ceiling.
 >
 > **Two non-code loose ends carried forward unchanged from 2026-07-26b:** `3rdparty/tvm` commit
 > `dff702c` is still unpushed (needs an interactive shell or an SSH remote), so `M 3rdparty/tvm` in
@@ -1193,15 +1204,24 @@ neutral, and the 35B state gate is *identical* to `lib_skippad` in both prefix-c
 regresses (0.80×–0.93×) on shared memory. `MLC_MOE_GEMM_V2_BLKK=32` restores the old kernel. This
 parameter had never been swept.
 
-**0h. ❌ Refuted by measurement, §17.1 — do not build.** Register-blocking `BLK_M` by hoisting the
-cooperative loads above `i_o`, which §16.11 called "the largest remaining prize in the MoE".
-§16.9's *diagnosis* is right — `i_o` outside the k-loop makes every extra row-fragment re-run the
-dequant — but the conclusion does not follow, because **at pp512 there is no CTA count to save**:
-4096 rows over 256 experts is exactly 16 rows/expert and `BLK_M` is already 16, so `ceildiv` gives 1
-tile at 16, 32 *and* 64. At the 2048-token chunk (B=16384) the count does halve and the win is still
-**1.00×/1.01×** on balanced routing and a loss on ragged — the halving is exactly cancelled. The
-hoist would buy the right to break even. Bit-exact at every value, which is what made the sweep
-cheap. Do not revisit without a shape where `count_e >> BLK_M`.
+**0h. ⚖️ Shape-split and unmeasured — §17.1 measured it, §17.8 corrected what that measurement
+means.** Register-blocking `BLK_M` by hoisting the cooperative loads above `i_o`, which §16.11 called
+"the largest remaining prize in the MoE".
+
+*Settled:* at **pp512** it cannot help, with or without the hoist. 4096 rows over 256 experts is
+exactly 16 rows/expert and `BLK_M` is already 16, so `ceildiv` gives one tile at 16, 32 *and* 64 —
+there is no CTA count to save, and widening only inflates X and O traffic (predicted **0.76×**
+balanced, **0.91×** at production's ~40% padding). Un-hoisted it measures 0.51×–0.63×.
+
+*Open:* `prefill_chunk_size` is **2048**, so every prompt past one chunk runs at **B=16384**, where
+the count genuinely halves and §17.8's cost model — validated to ≤4% on three of §17.1's four
+measurements — predicts the hoist is worth **1.37×–1.51× on this kernel**. §17.1's 1.00×/1.01× there
+is the *un-hoisted* number, and it is exactly what a cancelled win looks like; it is not evidence the
+win is absent.
+
+*Before building:* `BLK_M` is a compile-time constant, so a B=16384 win means regressing pp512 unless
+the kernel is specialised per chunk size — cost that first. Bit-exact at every value (the reduction
+over K is split identically), so `moe_blkm_check.py` gates it at exact equality.
 
 **0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
 Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
@@ -3355,11 +3375,15 @@ B=16384, where the count *does* halve. Measured there too — it still never win
 | down | random | 16384 | 5.817 ms | 6.357 (0.92x) | 7.412 (0.78x) |
 
 At B=16384 the halved CTA count is **exactly cancelled** by the doubled per-CTA cost — 1.00x and
-1.01x on balanced routing, and a loss on ragged routing. So the hoist would buy the right to break
-even, at every shape this model actually runs. `BLK_M` is bit-exact across all values (the reduction
-over K is split identically), which is what made the sweep cheap; it stays at 16 and
-`MLC_MOE_GEMM_V2_BLKM` stays a diagnostic. **Do not revisit this without a shape where
-`count_e >> BLK_M`.**
+1.01x on balanced routing, and a loss on ragged routing. `BLK_M` is bit-exact across all values (the
+reduction over K is split identically), which is what made the sweep cheap; it stays at 16 and
+`MLC_MOE_GEMM_V2_BLKM` stays a diagnostic.
+
+> ⚠️ **This section originally concluded "so the hoist would buy the right to break even, at every
+> shape this model actually runs." That inference is wrong and §17.8 retracts it.** The doubled
+> per-CTA cost *is* the thing the hoist removes, so "halved count × doubled cost = 1.00x" says
+> nothing about the hoisted kernel. The measurements above stand — they are all *un*-hoisted — but
+> what they support is narrower than what was claimed. Read §17.8 before acting on this section.
 
 ### 17.2 Candidate 2 (the last 20% of a skipped CTA) — built, bit-exact, and much smaller than billed
 
@@ -3459,3 +3483,88 @@ Both modes reproduce §16.11's columns exactly, including the pre-existing τ=1.
 and both near-tie counts. As in §16.11, *identical* is the claim, not *passing* — a bit-exact kernel
 that changed a mismatch count would have contradicted its own premise. The 0.8B is not rebuilt: it
 has no MoE and never reaches this kernel.
+
+### 17.7 The real CTAs, roofline'd — the question the handoff left
+
+Every "% of wall" the workplan quotes for `dequantize_group_gemm_v2` comes from §16.8, which measured
+it **before** the padding CTAs were skipped and **before** `BLK_K`. [scripts/moe_gemm_roofline.py](scripts/moe_gemm_roofline.py)
+re-measures the CTAs that do real work, on their own.
+
+It does not assume a padding cost. §16.10's `c_pad/c_real = 0.933` was measured on *unguarded*
+padding CTAs and §17.2 showed it does not carry to guarded ones, so both coefficients are **fit by
+least squares** over a sweep of (B, routing), which moves `n_real` and `n_pad` semi-independently.
+The two-parameter model holds: residual median **1.0–2.9%**, max 12.4% (worst case `gate_up` at
+BLK_K=64). `c_real · n_real` is then the real CTAs' time, and their obliged bytes are known exactly.
+
+At B=4096 — pp512's 512 tokens x top-8 — against the 156 GB/s achievable wall:
+
+| shape | routing | BLK_K=32 | **BLK_K=64** | % of the 42.6 TFLOP/s tensor ceiling |
+|---|---|---:|---:|---:|
+| gate_up | balanced | 57.0% | **85.5%** | 16.5% |
+| down | balanced | 67.7% | **87.1%** | 15.9% |
+| gate_up | ragged | 39.7% | 59.5% | 16.5% |
+| down | ragged | 47.1% | 60.6% | 15.9% |
+
+**Three things fall out.**
+
+1. **`BLK_K` was a memory-efficiency fix and the roofline says so.** 57.0% → 85.5% and 67.7% → 87.1%
+   is the whole of §17.3's win, arriving exactly where the half-sector diagnosis predicted it would.
+2. **On balanced routing the real CTAs are done.** 85–87% against §5's tier-1 band of 88–100%. There
+   is no bandwidth story left in this kernel at that routing, and compute was never close (16%).
+3. **The ragged rows are 25 points lower on *identical* unique bytes.** Both routings hit all 256
+   experts, so DRAM must supply the same 327.2 MB either way — but ragged routing needs 2944 CTAs
+   instead of 2048, because `ceildiv(count_e, 16)` fragments. The extra CTAs re-read weights that L2
+   can serve, so they cost time without costing DRAM traffic. **This is the remaining headroom, and
+   it is tile fragmentation, not bandwidth.**
+
+Note that "issued GB/s" is constant across routings by construction (issued bytes and time are both
+proportional to `n_real` at fixed `BLK_M`), so it carries no information — only the *unique* column
+does. Stated here because the printed table shows both.
+
+### 17.8 Retraction: §17.1's conclusion about the hoist does not follow from §17.1's measurements
+
+§17.1 measured `BLK_M > 16` losing at every shape and concluded that hoisting the shared loads above
+`i_o` "would buy the right to break even, at every shape this model actually runs." **That is wrong,
+and it is the same error this document has now made five sessions running: reasoning about a
+configuration from a measurement taken under a different one.** Every `BLK_M` number in §17.1 is
+un-hoisted, and the doubled per-CTA cost that cancels the halved CTA count *is precisely what the
+hoist removes*. "1.00x" is what a cancelled win looks like, not evidence that the win is not there.
+
+The right instrument is a cost model. §17.7 established that time tracks CTA count at fixed `BLK_M`;
+extending that to *issued bytes per CTA* — with `W + Scale` issued `BLK_M/16` times when un-hoisted,
+once when hoisted — reproduces §17.1's own measurements:
+
+| | predicted | measured | err |
+|---|---:|---:|---:|
+| B=4096 even, BLK_M=32 | 2.00× slower | 1.96× | 2.0% |
+| B=4096 even, BLK_M=64 | 4.00× slower | 3.85× | 4.0% |
+| B=16384 even, BLK_M=32 | 1.00× slower | 1.00× | 0.0% |
+| B=16384 even, BLK_M=64 | 1.00× slower | 1.23× | 19% |
+
+Three of four within 4%. (The `BLK_M=64` outlier is shared memory: `X_tile` scales with `BLK_M`, and
+at 64 the CTA needs ~45 KB of the 48 KB budget.) The **same model, with the hoist**, predicts:
+
+| shape | BLK_M=32 + hoist |
+|---|---:|
+| B=4096 balanced — pp512's best case | **0.76× (a loss)** |
+| B=4096 at ~40% padding — production pp512 (§16.11's inference) | **0.91× (a loss)** |
+| B=4096 ragged | 1.09× |
+| **B=16384 balanced — the 2048-token prefill chunk** | **1.51×** |
+| **B=16384 ragged** | **1.37×** |
+
+**So the corrected verdict is shape-split, not a refutation.** At pp512 — the headline benchmark —
+`BLK_M` loses *even with the hoist*, because 16 rows/expert already fills a `BLK_M=16` tile and
+widening it only inflates the X and O traffic. §17.1's conclusion is right for the number everyone
+quotes. But `prefill_chunk_size` is **2048**, so every prompt longer than one chunk runs at B=16384,
+where the model says the hoist is worth **~1.4–1.5× on this kernel** — and that is a workload the
+pp512 benchmark cannot see at all.
+
+**What this changes for the open list:** item 0h is **not refuted, it is shape-split and unmeasured**
+(entry rewritten). It is also no longer a candidate for a *default* — `BLK_M` is a compile-time
+constant, so taking the B=16384 win would mean regressing pp512 unless the kernel is specialised per
+chunk size. Cost that before building it.
+
+**And the meta-lesson, now five for five.** §16.2's probe grid, §15.6's model, item 0d's occupancy
+arithmetic, §9's priority order, and now this. Every one was an extrapolation across conditions, and
+every one was cheap to check. The check that would have caught this one is two lines of arithmetic
+over issued bytes — less work than the sweep that produced the wrong conclusion.

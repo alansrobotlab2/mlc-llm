@@ -595,16 +595,20 @@ def _dequantize_group_gemm_v2(
     # BLK_M must be a multiple of the wmma m16n8k16 tile's M=16; the schedule splits
     # it by MICRO=16 and the remainder becomes a serial loop over accumulators.
     #
-    # Leave it at 16. Widening it looks like it should amortize the BLK_N x K weight
-    # dequant over more rows, and §17.1 measured that it does not, at either shape this
-    # model runs: at pp512, 4096 rows over 256 experts is *exactly* 16 rows/expert, so
-    # ceildiv(count_e, BLK_M) is 1 at 16, 32 and 64 alike and there is no CTA count to
-    # save (0.51x-0.63x at 32). At the 2048-token chunk, B=16384, the count does halve
-    # and the win is 1.00x-1.01x on balanced routing and a loss on ragged — the halving
-    # is exactly cancelled, because i_o sits outside the k-loop so every extra
-    # row-fragment re-runs the whole dequant. Hoisting the shared loads above i_o would
-    # buy the right to break even. MLC_MOE_GEMM_V2_BLKM stays as a diagnostic; it is
-    # bit-exact at every value, since it does not touch the split over K.
+    # Leave it at 16 -- but the reason is shape-dependent, so read §17.8 before changing
+    # it. At pp512, 4096 rows over 256 experts is *exactly* 16 rows/expert, so
+    # ceildiv(count_e, BLK_M) is 1 at 16, 32 and 64 alike: there is no CTA count to save
+    # and widening only inflates X and O traffic. That holds with or without the load
+    # hoist and is why the default stays here (measured 0.51x-0.63x at 32).
+    #
+    # It does NOT generalise to B=16384, the shape a 2048-token prefill chunk produces.
+    # There the count does halve, and §17.1's 1.00x is the *un-hoisted* number: i_o sits
+    # outside the k-loop, so each extra row-fragment re-runs the whole BLK_N x K dequant
+    # and exactly cancels the saving. §17.8's cost model (validated to <=4%) predicts
+    # 1.37x-1.51x there once the shared loads are hoisted above i_o. Unmeasured.
+    #
+    # MLC_MOE_GEMM_V2_BLKM stays as a diagnostic; bit-exact at every value, since it
+    # does not touch the split over K.
     BLK_M = int(os.environ.get("MLC_MOE_GEMM_V2_BLKM", "16"))
     assert BLK_M % 16 == 0, "BLK_M must be a multiple of the wmma M=16"
     BLK_N = 128

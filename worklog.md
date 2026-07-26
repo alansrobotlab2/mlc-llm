@@ -13,13 +13,14 @@ The previous handoff left three uncosted candidates and no queued item. All thre
 -12.4%, decode unchanged (59.92 -> 59.97). New 35B lib is `lib_blkk64.so`. Details in §17.
 
 **Done**
-- **Candidate 1 refuted (item 0h, §17.1).** Register-blocking `BLK_M` — billed as "the largest
-  remaining prize in the MoE" — cannot help at any shape this model runs. pp512 is 4096 rows over
-  256 experts = **exactly 16 rows/expert**, and `BLK_M` is already 16, so `ceildiv` gives 1 tile at
-  16, 32 *and* 64: there is no CTA count to save. At the 2048-token chunk (B=16384) where the count
-  does halve, measured **1.00x/1.01x** on balanced routing and a loss on ragged — the halving is
-  exactly cancelled by the doubled per-CTA dequant. §16.9's diagnosis was right; the conclusion
-  drawn from it was not.
+- **Candidate 1 (item 0h, §17.1) — settled at pp512, and my first write-up over-claimed; §17.8
+  retracts it.** Register-blocking `BLK_M` cannot help at pp512: 4096 rows over 256 experts =
+  **exactly 16 rows/expert**, `BLK_M` is already 16, so `ceildiv` gives 1 tile at 16, 32 *and* 64 —
+  no CTA count to save, and widening only inflates X/O traffic. Measured 0.51x-0.63x. At B=16384
+  (the 2048-token chunk) the count does halve and it still measures 1.00x/1.01x — **but every one of
+  those numbers is un-hoisted**, and I wrote "so the hoist would buy the right to break even," which
+  does not follow: the doubled per-CTA cost that cancels the saving *is what the hoist removes*.
+  See below.
 - **Candidate 2 built, bit-exact, and much smaller than billed (§17.2).** Wrapped the CTA body in a
   unit loop annotated `moe_pad_guard` and applied §16.10's same `Select`-on-extent rewrite to it, so
   a padding CTA skips **everything** rather than 80% of it — one annotation match instead of the
@@ -63,12 +64,37 @@ The previous handoff left three uncosted candidates and no queued item. All thre
   artifact, not the absence of a process. Also: `nohup ... &` in a background tool call reports
   "completed" when the wrapper exits, not when the compile does. The 35B compile takes ~14 min.
 
+- **Then roofline'd the real CTAs (§17.7), which was the queued question — and it answered it.**
+  New [scripts/moe_gemm_roofline.py](scripts/moe_gemm_roofline.py) fits `n_real*c_real +
+  n_pad*c_skip` by least squares rather than assuming §16.10's padding ratio (residual median
+  1.0-2.9%). At B=4096 the real CTAs are at **85.5% / 87.1% of the 156 GB/s wall** on balanced
+  routing — §5's tier-1 band — and **16% of the tensor ceiling**. `BLK_K` is the whole of that:
+  57.0%/67.7% before. **On balanced routing this kernel is done.**
+- **Retraction (§17.8).** Ragged routing sits 25 points lower on *identical* unique bytes — tile
+  fragmentation, not bandwidth — which sent me back to `BLK_M`. A cost model in *issued bytes*
+  (W+Scale issued `BLK_M/16` times un-hoisted, once hoisted) reproduces three of §17.1's four
+  measurements to <=4%. With the hoist it predicts **0.76x-0.91x at pp512 (still a loss, so §17.1's
+  headline stands) but 1.37x-1.51x at B=16384**. Item 0h is therefore **shape-split and unmeasured**,
+  not refuted.
+
+**Learned (added after the retraction)**
+- **Five for five.** §16.2's probe grid, §15.6's model, item 0d's occupancy arithmetic, §9's priority
+  order, and now this — every correction in this document has been an *extrapolation across
+  conditions*. I measured `BLK_M` un-hoisted and concluded about `BLK_M` hoisted. "1.00x" is what a
+  cancelled win looks like; it is not evidence the win is absent. Two lines of arithmetic over issued
+  bytes would have caught it — less work than the sweep that produced the wrong conclusion.
+- **A fitted cost model is worth more than another sweep.** Fitting `c_real`/`c_skip` instead of
+  assuming §16.10's 0.933 is what made the roofline trustworthy, and extending the same model to
+  issued bytes is what exposed the retraction. §16.8 learned this once ("a cost model denominated in
+  CTAs"); it generalised.
+
 **Next**
-- No queued item. The open list is **0c.2** (chunked recurrence, de-prioritised at a +12.5% Amdahl
-  ceiling) plus the blocked VL precondition.
-- The cheap next measurement: **roofline the real (non-padding) CTAs.** They are essentially all of
-  the kernel's cost now, and nothing has measured them since §16.8 did so *before* the padding was
-  skipped. That should decide whether the MoE lane reopens at all.
+- The open list is **0c.2** (chunked recurrence, de-prioritised at a +12.5% Amdahl ceiling), **0h**
+  (now shape-split), plus the blocked VL precondition.
+- **0h is the live question**, and it is a scoping decision before it is a build: `BLK_M` is a
+  compile-time constant, so taking the predicted 1.37x-1.51x at B=16384 means regressing pp512
+  unless the kernel is specialised per chunk size. Cost that first. Note pp512 is the benchmark but
+  `prefill_chunk_size=2048`, so long prompts run the B=16384 shape the benchmark never touches.
 
 ---
 
