@@ -946,7 +946,7 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > 0.8B and −8% on the 35B — so the default configuration and every gate result above are unchanged
 > by it.
 >
-> ### The one thing to do next: item 0f, and now it *is* a build
+> ### The one thing to do next: measure item 0f end-to-end, then flip its default
 >
 > §16.7 traced 35B prefill *after* §16.5/§16.6 and **§9's priority order was wrong**:
 > `dequantize_group_gemm_v2`+`_v21` are **52.5% of prefill** (MoE machinery overall ~64%), while the
@@ -960,16 +960,21 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > And **27–50% of its CTAs are dispatch-table padding that runs the full dequant + wmma and discards
 > the result**, because the sentinel path guards only the `X` read and the store.
 >
-> **Item 0f is that early exit** — skip the `W_shared` load and the compute block when `e_v < 0`.
-> Bit-exact by construction, worth **+16% to +34% pp512** (the range is router balance; a balanced
-> router means *more* padding and a bigger win).
+> **§16.10 built item 0f and it is bit-exact.** `MLC_MOE_GEMM_V2_SKIPPAD=1` rewrites the `k_o_o`
+> loop's *extent* to `Select(e_v >= 0, K/BLK_K, 0)` — not an `IfThenElse`, because `ThreadSync`
+> refuses to place a `__syncthreads()` inside a condition. `scripts/moe_gemm_check.py` passes
+> `np.array_equal` on all 8 cases; the kernel is **1.28×–1.73×** faster. **The default is still `0`.**
 >
-> **§16.9 already burned the two obvious routes, so start from there, not from scratch.** A
-> source-level `if e_v >= 0:` dies inside `sch.compute_at` — the guard must be applied *after*
-> `_schedule_v2()`, as a stmt mutator, and this fork renames `tvm.tir` to `tvm.s_tir` with the node
-> classes moved. Widening `BLK_M` instead is a **0.64×/0.39× regression**, because `i_o` sits outside
-> the k-loop so every extra row-fragment re-runs the whole dequant. That last one also corrected
-> §16.8: the per-CTA constant is the whole k-loop body, not the dequant specifically.
+> **So the next action is the end-to-end measurement, and it is the only thing standing between this
+> and a default flip:** rebuild the 35B lib with the flag on, A/B pp512 against the current 642, run
+> `high_margin_gate.py` under both prefix-cache modes. The projection is **+14.6% to +28.0% pp512**
+> and it *is* a projection — from a microbench, via Amdahl on §16.7's 52.5%. The gate cannot change
+> its verdict (the kernel is bit-exact), so it is a check on the plumbing, not on the arithmetic.
+>
+> Do not re-litigate the routes §16.9/§16.10 already closed: a source-level `if` dies in
+> `sch.compute_at`; an `IfThenElse` around the scheduled body dies in `ThreadSync`; widening `BLK_M`
+> is a **0.64×/0.39× regression** because `i_o` sits outside the k-loop. That last one corrected
+> §16.8 — the per-CTA constant is the whole k-loop body, not the dequant specifically.
 >
 > ### Two non-code loose ends
 >
@@ -1056,7 +1061,18 @@ Its time is `n_real·c_real + n_pad·c_pad` with `c_pad ≈ 0.93 c_real`, a two-
 predicts all 12 sweep points to ≤1.6%. §16.4's "flat in batch" was the right observation with the
 wrong mechanism: the grid is 97% padding at B=8, not reading all 256 experts. Closes into **0f**.
 
-**0f. Early-exit v2's padding CTAs — bit-exact, small, and worth +16% to +34% pp512.**
+**0f. ✅ Built, §16.10, opt-in at `MLC_MOE_GEMM_V2_SKIPPAD=0` — remaining work is the end-to-end
+measurement, not the kernel.** Bit-exact on all 8 gate cases and **1.28×–1.73×** on the kernel; the
+guard is a `Select` on the `k_o_o` loop *extent*, not an `IfThenElse`, because `ThreadSync` refuses
+to place a `__syncthreads()` inside a condition. A skipped CTA still costs **20%** of a full one
+(accumulator fill + `O_tile` store + the predicated-off store loop), so 80% of the padding cost is
+recovered, not all of it. **To close it:** rebuild the 35B lib with the flag on, A/B pp512, run the
+state gate, then flip the default on those numbers — the projection is +14.6% to +28.0% and it is a
+projection. Optional follow-on worth ~7% more: zero the trailing store loops too (extents 1 and 2,
+which are not unique, so it needs a targeted match rather than extent equality).
+
+<details><summary>Original entry — the analysis that motivated it</summary>
+
 v2 launches `UPPER = (ceildiv(B, BLK_M) + Ne) · tiles_per_n` CTAs, where the `+ Ne` slack gives each
 expert a private index range without a prefix scan. Slack CTAs carry sentinel `te[bx] = -1`, and
 [moe_matmul.py:698-727](python/mlc_llm/op/moe_matmul.py#L698-L727) guards only the `X` read and the
@@ -1073,16 +1089,19 @@ loop nests dies at `sch.compute_at(w_shared, k_o_o)` with `InternalError: unorde
 `IfThenElse` between an sblock and its target loop breaks the scope bookkeeping. **The guard has to
 be applied after `_schedule_v2()` returns**, as a stmt mutator over the scheduled body. The nodes and
 the mutator live in **`tvm.tirx`** / `tvm.tirx.stmt_functor.ir_transform` (§16.9 has the details);
-the remaining unknown is `thread_extent` hoisting, since the bindings land inside the conditional.
-The no-conditional
+the remaining unknown was thought to be `thread_extent` hoisting. **It was not** — §16.10 found the
+real blocker one pass earlier, `ThreadSync` refusing a barrier inside a condition, and the fix was to
+drop the conditional entirely in favour of a zero loop extent. The no-conditional
 fallback is to stop *launching* those CTAs — compact the dispatch table with an exclusive scan over
 `ceildiv(count_e, BLK_M)` — but the grid extent is a compile-time shape expression, so that needs a
-host round-trip per call and should be costed first.
+host round-trip per call and should be costed first. Not needed now.
 
 Also: the **+34% end is the balanced-router case**; quote the range, not the top of it, until a real
 prefill's indptr histogram is dumped (§16.8's second open item). And do **not** reach for widening
 `BLK_M` as a shortcut — §16.9 measured it at 0.64× and 0.39×, because `i_o` sits outside the k-loop
 and every extra row-fragment re-runs the whole dequant.
+
+</details>
 
 **0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
 Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
