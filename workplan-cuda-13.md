@@ -842,7 +842,7 @@ Monitoring: **`nvidia-smi` does not report iGPU utilization or processes on Tegr
 
 ### Committed state (was: nothing committed)
 
-All work from both 2026-07-25 sessions is now in git on branch `qwen3_5`:
+All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_5`:
 
 | commit | what |
 |---|---|
@@ -853,12 +853,35 @@ All work from both 2026-07-25 sessions is now in git on branch `qwen3_5`:
 | `6749a630` | `analyze_decode_trace` geometry verification |
 | `3ff691f5` | §13 conv-state fusion + `conv1d_kernel_check.py` |
 | `c2fd8691` | §13 workplan, §8 build warning, §9 item 3 refutation |
+| `51d8bfd8` | §15 history-path recurrent fusion + `gdn_kernel_check.py` |
+| `dc695262` | **§16.1** `high_margin_gate.py`, `prefix_cache_roundtrip` prompt set, `gdn_recurrence_probe.cu`, bench sweeps |
+| `8ce123dc` | **§16.2/§16.3/§16.4** items 0c.1, 5 and 1 measured; MoE comment corrected |
+| `2341bb92` | **§16.1** 35B fp8 high-margin reference + the four gate runs |
+| `0c4af0e5` | **§9** restructured — 0b/1/5 closed, 0c step 1 done, VL blocker pinned down |
 
-✅ **The TVM submodule commit IS pushed — this section said otherwise for three sessions and was
-wrong.** `3rdparty/tvm` points at `4624d97` (branch `qwen35-inplace-rnn-state` on the
-`alansrobotlab2/relax` fork), carrying the three `vm.builtin.rnn_state_*` accessors that §11, §13,
-§14 and §15 all depend on. Verified 2026-07-25d: `git ls-remote origin qwen35-inplace-rnn-state`
-returns `4624d972…`, identical to local `HEAD`.
+✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
+pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
+carrying the three `vm.builtin.rnn_state_*` accessors. Verified 2026-07-25d and again 2026-07-26:
+`git ls-remote origin qwen35-inplace-rnn-state` returns `4624d972…`, identical to the pointer.
+This section said otherwise for three sessions and was wrong.
+
+⚠️ **But there is now a SECOND submodule commit, `dff702c`, and it is NOT pushed.** It is the
+§16.3 `MLC_GEMV_TSTR` probe hook in `python/tvm/s_tir/dlight/gpu/gemv.py`. Verified 2026-07-26 by
+the authoritative test: `git ls-remote origin` has no ref containing `dff702c`, and a push attempt
+fails with `could not read Username for 'https://github.com'` — **the submodule's remote is HTTPS
+with no credential helper, so it cannot be pushed non-interactively.** Push it from an interactive
+shell (or switch the remote to SSH), then advance the parent pointer:
+
+```bash
+git -C 3rdparty/tvm push origin qwen35-inplace-rnn-state
+git -C 3rdparty/tvm ls-remote origin qwen35-inplace-rnn-state   # must return dff702c…
+git add 3rdparty/tvm && git commit -m "[TVM] bump submodule to dff702c (MLC_GEMV_TSTR hook)"
+```
+
+**The parent pointer has deliberately NOT been advanced.** Pointing it at an unpushed commit is
+exactly the breakage this section spent three sessions untangling. Consequence while it is
+unpushed: a fresh clone lacks the hook, so §8's `MLC_GEMV_TSTR` reproduction line will not work
+there — nothing else depends on it, since the hook is inert when the variable is unset.
 
 ⚠️ **The check that produced the false alarm is the thing to remember.** That clone's
 `remote.origin.fetch` was narrowed to `+refs/heads/mlc:refs/remotes/origin/mlc` only, so no
@@ -873,6 +896,19 @@ that §7 said to commit was still ignored; the exception now covers both names a
 `fce533aa`.
 
 ### Start here next session
+
+> **Handoff, 2026-07-26.** Working tree is clean on branch `qwen3_5`; four commits this session
+> (`dc695262`, `8ce123dc`, `2341bb92`, `0c4af0e5`). **One action is outstanding and it is not
+> code:** the `3rdparty/tvm` commit `dff702c` (the §16.3 `MLC_GEMV_TSTR` hook) is unpushed and the
+> parent pointer is deliberately not advanced — see "Committed state" for the exact commands and
+> why. Nothing else depends on it.
+>
+> **The one substantive thing to build is the lane-split GDN recurrence (§16.2).** It is measured
+> at 2.24–2.79× on the biggest prefill kernel, the design is settled, and it is cheaper than the
+> chunked reformulation it partly substitutes for. Two things to know before starting: the
+> bit-exact bar in `gdn_kernel_check.py` **cannot** apply (the reduction order changes by design),
+> so its fp64 check becomes the bar; and per §15.2, renormalize any published estimate against a
+> trace of the actual A/B baseline rather than against the probe's numbers.
 
 > **Item IDs are stable, not sequential.** They are referenced from §12–§15 and from the Done
 > sections above, so closed items keep their number rather than being renumbered away. Ordering
@@ -961,6 +997,11 @@ Main repo:
 | `fp8_software_dequant.py` | **new** — software W8A16 fp8 path |
 | `scripts/{analyze_decode_trace,greedy_snapshot,active_params,profile_decode_35b}.py`, `scripts/bw_probe.cu` | **new/promoted**. `analyze_decode_trace` reworked in **§13** to verify kernel identity against launch geometry |
 | `scripts/conv1d_kernel_check.py` | **§13 new** — numerical unit gate for the fused conv1d |
+| `scripts/high_margin_gate.py` | **§16.1 new** — the 35B state gate. `--capture` builds a margin-annotated reference from an HF model; `--check` teacher-forces an MLC lib against it and scores only where the reference had margin. `--negative-control stale1` proves it is not vacuous |
+| `scripts/gdn_recurrence_probe.cu` | **§16.2 new** — standalone CUDA probe, four variants of the GDN recurrence (base / acc4 / ksplit2 / ksplit4). No model, no TVM |
+| `scripts/prefix_cache_roundtrip.py` | **§16.1** — prompt families replaced with the high-margin set; `--legacy-prompts` reproduces §13's numbers. **Propagate any new flag to the subprocess `common` list** — the two phases run as separate processes and mismatched sets fail everything |
+| `bench_moe_kernel.py` | **§16.3/§16.4** — K-sweep at fixed N and N-sweep at fixed K, plus achieved-bandwidth reporting against the 156 GB/s wall. ⚠️ it reuses one weight tensor, so absolute numbers are L2-inflated for small kernels (§16.3); A/Bs at a fixed shape are fine |
+| `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§16.4** — the batch-1 MoE comment now carries the measurement (51×, not ~6×) and points at option (d) |
 | `python/mlc_llm/support/auto_target.py` | **§14.6 new** — `MLC_NVCC_OPTIONS` / `MLC_DUMP_CUDA` hooks + nvcc phase timing |
 | `scratch_mlc_tg_sweep.py` | **§14.1 new** — `--prefix-cache-mode` and per-run prompt salting; without both, the default config was unmeasurable |
 | `scripts/greedy_snapshot.py` | **§14** — `--prefix-cache-mode`; it hardcoded `disable`, where a history-path change is inert and the gate passes vacuously |
@@ -1902,12 +1943,18 @@ occupancy without changing the algorithm.
 
 ---
 
-## 16. Session 2026-07-26 — the gates get teeth, and three diagnoses (in progress)
+## 16. Session 2026-07-26 — the gates get teeth, two items refuted, one answered at 2.8×
 
 Four §9 items were open at the start of this session: **0b** (a deterministic 35B state gate),
 **0c** (the parallelism-starved GDN recurrence), **1** (should the 35B decode more than one
-sequence), and **5** (the tier-2 GEMV retune). This section covers all four. Measurements that
-were still running when it was written are marked **[pending]**.
+sequence), and **5** (the tier-2 GEMV retune). All four are resolved here — 0b landed, 1 settled,
+5 refuted, and 0c's step 1 answered and measured (step 2, the chunked reformulation, is the only
+thing left open in §9).
+
+**Two of the four ended by refuting their own premise**, which is the pattern worth carrying
+forward: item 5's question assumed K=2048 was the good case when K=4096 is the best case, and
+item 1's "~6×" was a source comment nobody had measured. Item 3 went the same way in §13. Every
+time, the write-up had a plausible mechanism and the measurement said the premise was wrong.
 
 ### 16.1 Item 0b — LANDED. The 35B finally has a gate that can adjudicate a state change
 
