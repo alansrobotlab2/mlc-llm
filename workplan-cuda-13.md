@@ -429,6 +429,10 @@ regardless, because §4.6 shows 30% of the budget is kernels that do not stream 
 | 0.8B `q0f16` prefix-cache round-trip (PopN rollback), radix | ✅ **4/4 checks**, identical to the copy path (§11) |
 | 0.8B `q0f16` serial vs **6-way concurrent** decode, `disable` **and** radix | ✅ **6/6 identical**, on the in-place **and** copy-path libs (§12) |
 | 0.8B `q0f16` 4-way concurrent **JSON-schema** generation (jump-forward) | ✅ no abort, schema-valid output (§12) |
+| 0.8B `q0f16` greedy parity **after the in-place conv state**, radix **and** disable | ✅ **5/5 prompts, 50/50 tokens, both modes** (§13) |
+| 0.8B `q0f16` bit-exactness + long-prompt prefill after the conv fusion | ✅ **byte-identical**, incl. ~3.5 k-token prompt on the fused path (§13) |
+| fused conv1d kernel vs fp64, 12 shapes × both conv widths | ✅ **within fp16 rounding; state bit-exact; ring slots clean** (§13) |
+| 35B-A3B fp8 tier-2 gate after the conv fusion | ✅ **identical to `lib_inplace`, 1/15/2/5/50** (§13) |
 | 0.8B `q4f16_g16e` vs HF fp16 | 1/5 — **quantization divergence, not a bug** |
 | 35B-A3B greedy parity | ❌ **not reproducible on this box — see §6.1, neither leg fits** |
 | 35B-A3B concurrent decode | ⛔ **blocked by design, not by a bug** — `batch_decode` is compiled with batch pinned to 1 (§12) |
@@ -604,6 +608,7 @@ top of them.
 | [scripts/greedy_snapshot.py](scripts/greedy_snapshot.py) | **new** — tier-3 bit-exactness gate (§6.1): capture greedy tokens, diff after a refactor |
 | [scripts/prefix_cache_roundtrip.py](scripts/prefix_cache_roundtrip.py) | **new (§11)** — PopN rollback gate under radix. Needs no reference model, so it runs on the 35B |
 | [scripts/batch_decode_parity.py](scripts/batch_decode_parity.py) | **new (§11)** — serial vs concurrent decode; covers per-batch state-slot indexing. **Runs and passes as of §12**, and now also reports the concurrency speedup |
+| [scripts/conv1d_kernel_check.py](scripts/conv1d_kernel_check.py) | **new (§13)** — numerical unit gate for the fused conv1d: kernel vs fp64 across 12 shapes and both conv widths. Separates "wrong" from "rounded differently", which no token-diff can do on the 35B. Needs no model, no weights, no engine; runs in seconds |
 | [fp8_software_dequant.py](fp8_software_dequant.py) | **new** — software W8A16 fp8 path so the 37.5 GB fp8 checkpoint can be an HF reference on sm_87 (§6.1) |
 
 Build/run:
@@ -623,9 +628,26 @@ kernel instead and does not need NVTX; leave the range in place but do not rely 
 
 ## 8. Reproduction
 
+> ⚠️ **Compiling the 35B needs `MLC_MOE_GEMM_V2=1` in the environment, and nothing warns
+> you.** It is an env-var opt-in read at *compile* time
+> ([moe_matmul.py:875](python/mlc_llm/op/moe_matmul.py#L875)); without it the int4 MoE
+> GEMM silently falls back to the v1 persistent-loop kernel and `moe_dispatch_tables` /
+> `dequantize_group_gemm_v2` never get emitted. Cost when this was hit on 2026-07-25:
+> **pp512 560 → 225 tps (−60%)**, which read as a catastrophic regression in an A/B whose
+> two libs differed by a *model* change. The flag is in the [qwen3_5.md:183](qwen3_5.md#L183)
+> compile recipe but was missing from this section. It is not in `.envrc.local` either, so
+> it has to be typed on every 35B compile. Check a build with:
+> `nm -D --defined-only <lib>.so | grep -c 'group_gemm_v2\|moe_dispatch_tables'` — expect 4,
+> not 0. The 0.8B has no MoE and is unaffected, so a 0.8B A/B will not catch it.
+
 ```bash
 sudo nvpmodel -m 0 && sudo jetson_clocks     # REQUIRED — worth ~1.4%
 source .envrc.local
+
+# compile the 35B — MLC_MOE_GEMM_V2=1 is REQUIRED, see the warning above
+MLC_MOE_GEMM_V2=1 python -m mlc_llm compile dist/qwen3_6-35B-A3B-q4f16_1_fused/mlc-chat-config.json \
+  --device cuda --opt "flashinfer=1;cudagraph=1" \
+  -o dist/qwen3_6-35B-A3B-q4f16_1_fused/<name>.so
 
 # bench (always pass --model-lib; glob picks lib_nofi.so otherwise → ~82% of headline)
 python scratch_mlc_tg_sweep.py \
@@ -714,12 +736,21 @@ Monitoring: **`nvidia-smi` does not report iGPU utilization or processes on Tegr
    point with a dynamic batch that the engine selects when `max_num_sequence > 1`, (c) leave it
    interactive-only and say so in the docs. Until this is settled the 35B is single-sequence and
    the engine fix in §12 does nothing for it.
-2. **Consider fusing the *conv* state too (state 1).** §11 took the recurrent half; the conv half is
-   the remaining **0.294 ms/token (1.5%)** of §4.6's `rnn_state` line. Bigger prize than the raw
-   1.5%: it would remove the last 60 `vm.builtin` calls per token from the layer loop, and each one
-   currently forces `EndRegion()` in the cudagraph pass, so the whole decode body could become one
-   captured region. Harder than option 2 — the conv1d is a TE op, not a hand-written TIR kernel.
-3. **Optional: get the fused kernel back into a cudagraph.** ⚠️ **This item is reasoned from the
+2. ~~**Consider fusing the *conv* state too (state 1).**~~ **DONE — see §13.** Landed at
+   **+2.40% decode and +15.3% prefill on the 35B**. The decode estimate was right; the stated
+   rationale was not. The "removes the last 60 `vm.builtin` calls so the decode body becomes one
+   captured region" argument is wrong — see item 3. The real second prize was the TE conv itself,
+   which turned out to be **~42× off roofline** and is unrelated to state copies. **Its successor
+   item is the *history* path**, which still runs that kernel and is what the default
+   `prefix_cache_mode="radix"` uses for prefill.
+3. ~~**Optional: get the fused kernel back into a cudagraph.**~~ **REFUTED — do not build. See
+   §13.** The trace this item asked for was run. Capture prediction correct, everything built on
+   top of it wrong: eager launches went *up* 131 → 183/token, idle did not move (1.016 →
+   1.065 ms/token), and the measured marginal cost of an eager launch is ~0.9 µs, so the whole
+   lane is worth ≤0.38 ms/token rather than "the decode body becomes one region". Original text
+   kept below for the reasoning trail.
+
+   ⚠️ **This item is reasoned from the
    pass source, not from a trace — re-run §4.7's `--cuda-graph-trace=node` profile against
    `lib_inplace.so` before acting on it.** Reading
    [rewrite_cuda_graph.cc:377-387](3rdparty/tvm/src/relax/transform/rewrite_cuda_graph.cc#L377),
@@ -1199,3 +1230,154 @@ The cost: prefill for N new requests now takes N engine steps rather than one. S
 benchmarks are untouched — every `scratch_mlc_tg_sweep.py` number in this document runs one
 sequence. The loss is real only when many *short* prompts arrive together, and it is what buys the
 2.67× on the decode that follows.
+
+---
+
+## 13. Landed: in-place GDN *conv* state, and what the trace said about §9 (2026-07-25)
+
+§9 items 2 and 3. Item 2 landed; **item 3 was refuted by measurement and should not be built.**
+
+| | 35B `q4f16_1` | 0.8B `q0f16` |
+|---|---:|---:|
+| tg512 before → after | 58.79 → **60.20** | 89.57 → **90.72** |
+| | **+2.40%** | +1.28% |
+| pp512 before → after | 559.95 → **645.37** | 2841.7 → **4054.1** |
+| | **+15.3%** | **+42.7%** |
+| ttft @ pp512 | 914 → 793 ms | 180 → 126 ms |
+
+Three runs each, spread ≤0.1%; A/B back-to-back, clocks unpinned (§8). Predicted 2.2% decode
+from §4.6's traced `get_1`/`set_1`/`update_conv_state1` line; measured **2.40%**, i.e. 109% of
+estimate. That is two for two on the §5 estimation lesson — predict from a measured kernel at
+the target shape.
+
+**The prefill win was not predicted at all, and it is the larger number.** §9 called this item
+"1.5%, harder than option 2". The decode part was right. What the estimate missed is that the
+fused kernel also replaces the TE conv itself, which was catastrophically mis-scheduled.
+
+### The TE depthwise conv was ~42× off roofline
+
+`_te_depthwise_conv` is a 4-tap reduction that dlight scheduled as
+`grid=(196608,1,1) block=(16,16,1)` — **50.3 M threads for 3.1 M output elements**, 16 threads
+per output — at **3404 µs per call**. The data it moves is 12.6 MB, which is **81 µs** at the
+156 GB/s wall. Replacing it with one hand-written kernel took the same prefill work from
+**709 ms to 55 ms (13×)** on the 35B.
+
+So the ordering of prizes in this item was inverted: the state copies were the stated target
+(0.383 ms/token, 2.2% of decode) and the conv schedule was not mentioned, but the conv schedule
+was worth more.
+
+### ⚠️ The prefill win only exists under `prefix_cache_mode="disable"`
+
+Under the **default** `"radix"`, prefill routes through `batch_prefill_with_history` →
+`forward_with_history`, which keeps the copy path and the TE conv. Verified by trace: a radix
+run emits `gdn_func_history` / `set_with_history` / `depthwise_conv1d` and **zero**
+`conv1d_inplace`. Every bench harness sets `disable`, so the pp numbers above are real but are
+*not* what a default-configured user sees.
+
+This is the same blind spot the §6 warning describes, pointing the other way: there, gating only
+under `disable` hides a bug; here, benching only under `disable` shows a win that the default
+configuration does not get.
+
+**That makes the history path the biggest remaining prefill item in this document.** Its conv is
+still the 3404 µs/call kernel, it is what the default config uses, and the same treatment
+applies — with the extra work that `set_with_history` writes per-position rather than one slot.
+
+### §9 item 3 is refuted — do not build it
+
+Item 3 proposed allowlisting the `rnn_state_*` handle builtins as static in
+`rewrite_cuda_graph.cc` so the fused kernel could be captured, reasoning from pass source that
+it currently is not. Re-traced against `lib_inplace.so` with `--cuda-graph-trace=node`:
+
+- **The prediction was right about capture**: `gdn_func_inplace` is eager, 30/token.
+- **But eager launches went *up*, 131 → 183/token.** §11 pushed `gdn_func_inplace` and
+  `fused_cast3` out of the graph (their storage argument comes from a `vm.builtin`), so it
+  traded 60 captured launches for 60 eager ones and *still* won +6.04%.
+- **Idle did not move**: 1.016 ms/token before, **1.065 ms/token** after — up slightly in
+  absolute terms while the budget shrank. Halving the eager `rnn_state` population changed
+  nothing measurable.
+
+Measured cost of being eager, from inter-kernel gaps in the same trace:
+
+| | gap per launch |
+|---|---:|
+| graph-captured kernels | **0.36 µs** |
+| eager kernels | **~2.2 µs** |
+
+The eager total is dominated by two once-per-token kernels at the sampling boundary
+(`fused_dequantize_take2` 331 µs, `rms_norm` 153 µs) which are host-side engine work, not launch
+overhead. What is actually recoverable by capturing the GDN region is ~0.1–0.38 ms/token, and
+§9's "the whole decode body could become one captured region" does not follow from any of it.
+**Item 3's ≤4% ceiling was already generous; the measured marginal cost is ~0.9 µs per launch.**
+
+### Correctness — and one gate that lied
+
+The kernel is gated three ways because on this model no single gate is sufficient.
+
+| gate | 0.8B `q0f16` | 35B `q4f16_1` |
+|---|---|---|
+| [scripts/conv1d_kernel_check.py](scripts/conv1d_kernel_check.py) — kernel vs fp64, 12 shapes | ✅ | ✅ same kernel, both widths |
+| `greedy_snapshot` bit-exactness vs previous lib | ✅ **5/5 identical** | ❌ 3/5 diverge |
+| long prompt (~3.5 k tok, crosses prefill chunks), fused path | ✅ identical | — |
+| `--greedy-parity` vs HF fp16, radix **and** disable | ✅ 5/5 × 50/50 both | n/a (§6.1) |
+| `prefix_cache_roundtrip`, radix **and** disable | ✅ 4/4 both | comparative — see below |
+| `batch_decode_parity` 6-way, radix **and** disable | ✅ 6/6 both | n/a (batch pinned to 1) |
+| fp8 tier-2 semantic gate | — | ✅ **1/15/2/5/50, identical to `lib_inplace`** |
+
+**The bit-exactness asymmetry is rounding order, not a bug, and the unit gate is what proves
+it.** At `conv_dim=6144` dlight happens to accumulate the 4-tap reduction in the same ascending
+order the fused kernel uses, so the 0.8B is byte-identical; at 8192 it does not, and the 35B's
+dense near-ties cascade from the first flipped token.
+[scripts/conv1d_kernel_check.py](scripts/conv1d_kernel_check.py) settles this in seconds with no
+model loaded: against an fp64 reference the output lands within fp16 rounding
+(rel ≤7.3e-4, fp16 eps 9.8e-4) at **both** widths and at seq_len 1/2/3/4/17/512, while the new
+state is **bit-exact** and every history slot outside `{hist, hist+1}` is **untouched**. A
+mis-indexed ring would fail the last two; rounding order cannot.
+
+New standing rule, since §10 already learned half of it: `greedy_snapshot` is bit-exact only for
+changes that preserve the *schedule*. Replacing a dlight-scheduled kernel with a hand-written one
+does not, even when the arithmetic is written to match.
+
+#### The 35B rollback gate is flaky on *both* libs — quantified this time
+
+§11 asserted this from two runs. It was re-run 4–5 times per lib to check whether the conv change
+made it worse:
+
+| lib | runs | runs with ≥1 divergence | which checks | worst run |
+|---|---:|---:|---|---:|
+| `lib_inplace` (unmodified baseline) | 4 | **3** | pass1 ×1, pass2 ×2 | **18/20** |
+| `lib_convfused` | 5 | 4 | pass1 ×1, pass2 ×1, pass3base ×3 | 18/20 |
+
+**The baseline fails this gate at essentially the same rate**, and its worst run (18/20) is worse
+than the fused lib's best (a clean **20/20**). Every failure is 4/5 on the same near-tie prompt
+("The three primary colors are"), and no check ever collapsed to 0/5 — §11's stated signature of a
+real state bug, and what the deliberate negative control there produced.
+
+⚠️ **Not fully excluded**: the PopN-rollback check itself diverged in 3/5 fused runs and 0/4
+baseline runs. On this sample, of a prompt that demonstrably flips run to run, that is not
+significant — but it is the one asymmetry in the data and it is recorded rather than rounded away.
+The deterministic evidence for the ring mechanism is much stronger than this gate can be:
+`conv1d_kernel_check.py` shows the new state bit-exact and non-target slots untouched at the 35B's
+own `conv_dim=8192` with `max_history=64` and a non-zero start slot, and the 0.8B — where a
+bit-exact reference exists — is 4/4 on this same gate under both modes.
+
+**This gate needs a deterministic replacement before it can carry weight on the 35B.** Its prompt
+set is inherited from an fp16-vs-fp16 era, which is the same complaint §6.2 makes about the fp8
+gate; the fix is the same high-margin prompt set (§9 item 4).
+
+### Two mistakes worth not repeating
+
+**1. A gate that passed without testing anything.** The first long-prompt bit-exactness run was
+done at the engine default (radix), where prefill uses the history copy path — so it compared the
+fused build against itself on a path neither build changes, and passed vacuously. Only the trace
+revealed it. Any prefill-path gate on a hybrid model must pass `--prefix-cache-mode disable`
+explicitly, or it is not testing the fused path.
+
+**2. `MLC_MOE_GEMM_V2=1` was omitted from the 35B build** — see the warning now at the top of §8.
+This produced pp512 **560 → 225 (−60%)** and a 5/5 bit-exactness divergence, both of which read
+as a disastrous model-change regression. They were a missing compile-time env var. The 0.8B A/B
+was clean throughout because it has no MoE, which is exactly what made the 35B result look like a
+model bug. The `nm -D | grep -c group_gemm_v2` check in §8 takes two seconds and would have
+caught it before the bench ran.
+
+The lesson generalizes past this flag: an A/B is only an A/B if the two libs differ by the change
+under test. Both of this session's "the change broke it" moments were the harness, not the change.
