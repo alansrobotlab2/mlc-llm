@@ -927,20 +927,28 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > pointer is deliberately not advanced — see "Committed state" for the commands and why. Nothing in
 > §16.5 touches TVM, so this is unchanged rather than newly blocking.
 >
-> **The next thing to build is item 0d — splitting `V` across blocks.** §16.5's occupancy analysis
-> is what surfaced it: the binding constraint is `threads × registers` per SM and the grid is only
-> 16–32 blocks, and the `V` axis is **embarrassingly parallel** — nothing in the recurrence crosses
-> value columns, so unlike `K` it needs no shuffle, no barrier and no re-association. That last part
-> matters: it should be **bit-exact**, so `gdn_kernel_check.py`'s full exact bar applies rather than
-> §16.5's relaxed one. It should help the 35B most, which is where §16.5 delivered least.
+> **Where the recurrence now stands: ~354 GFLOP/s, 6.6% of sm_87 fp32 peak** (537 MFLOP in 1.52 ms
+> on the 0.8B at seq_len=512, §15.6's flop convention), up from 3.8%. So **~15× of theoretical
+> headroom remains, and the only lever with that ceiling is item 0c step 2**, the chunked
+> reformulation — a scalar recurrence cannot reach matmul efficiency however it is scheduled.
 >
-> **Three traps §16.5 paid for, in order of how much time they cost:**
-> 1. **Do not quote `gdn_recurrence_probe.cu` ratios against the 35B.** Its grid is `n_kh = 16`,
+> **Item 0d is the cheap thing to try first**, and its scope shrank once the arithmetic was checked:
+> it does *not* raise occupancy (see the item — the first version of it said otherwise and was
+> wrong). What it does is decouple `k_split` from block size, which makes `Vb=16, k_split=8` —
+> 128 threads, 32 warps/SM — reachable for the first time. One measurement, on an already-gated
+> kernel, and it should be bit-exact.
+>
+> **Four traps §16.5 paid for, in order of how much time they cost:**
+> 1. **In a probe that A/Bs a hand-written baseline against a hand-written variant, the *baseline* is
+>    the dangerous half.** §16.2's variant was within 1.6% of TIR; its `base` was 35% slow, which is
+>    the whole of its over-prediction. It was checkable without building anything — §15.2 had traced
+>    the real kernel at 2.65 ms/call and the probe's `base` read 3.49.
+> 2. **Do not quote `gdn_recurrence_probe.cu` ratios against the 35B.** Its grid is `n_kh = 16`,
 >    which is the 0.8B's `n_vh`; the 35B launches 32 blocks and behaves qualitatively differently
 >    (`k_split=2` is a *regression* there). Use `gdn_kernel_bench.py`, which uses the real grid.
-> 2. **ptxas takes 30–42 s on a split kernel**, so anything that recompiles in a loop gets slow
+> 3. **ptxas takes 30–42 s on a split kernel**, so anything that recompiles in a loop gets slow
 >    fast. The gate now memoizes; check before adding a sweep axis.
-> 3. `Executable` has no `time_evaluator` — it lives on `.mod`.
+> 4. `Executable` has no `time_evaluator` — it lives on `.mod`.
 
 > **Item IDs are stable, not sequential.** They are referenced from §12–§15 and from the Done
 > sections above, so closed items keep their number rather than being renumbered away. Ordering
@@ -971,26 +979,39 @@ sequence sequentially.
      chunk-state intermediate. Note it does **nothing for decode** — at `seq_len=1` the chunked form
      degenerates, and `gdn_func_inplace` is already only 2.1% of the whole-run budget.
 
-**0d. The `V` axis is embarrassingly parallel and the kernel has never used it — no reduction, no
-shuffle, no barrier.** ⚠️ **Unmeasured; this is an argument, not a result.** §16.5 established that
-the binding constraint is `threads × registers ≤ 65536` per SM, and that the grid — `(n_vh, batch)`,
-so **16 or 32 blocks on a 16-SM GPU** — is what starves the kernel. The lane split raises warps per
-block but cannot raise the block *count*, which is why `k_split=8` starts losing.
+**0d. Split `V` across blocks — not for occupancy, but to decouple `k_split` from block size.**
+⚠️ **Unmeasured; an argument, not a result. And the first version of this item, written 2026-07-26b
+before the arithmetic was checked, got the mechanism wrong — that correction is the useful part.**
 
-But nothing in the recurrence crosses value columns. Every term is indexed by `col`: the state slice
-is `storage[seq, hist, h, row, col]`, both dots reduce over `row` *within* a column, `coef` depends
-on `v[.., col]` and `dot_sk[col]`, and the output and ring scatter are both per-`col`. **Splitting
+Nothing in the recurrence crosses value columns. Every term is indexed by `col`: the state slice is
+`storage[seq, hist, h, row, col]`, both dots reduce over `row` *within* a column, `coef` depends on
+`v[.., col]` and `dot_sk[col]`, and the output and ring scatter are both per-`col`. So **splitting
 `V` across blocks needs no communication at all** — unlike `K`, which is why §15's block-split
-proposal was unbuildable. A grid of `(n_vh × V/Vb, batch)` with `Vb` columns per block multiplies the
-block count by `V/Vb` for free, and composes with the lane split: at `Vb=32, k_split=4` that is 128
-threads and 117 registers = 14976 registers/block → **4 blocks/SM (16 warps) across 64 blocks on the
-0.8B and 128 on the 35B**, where today's best is 1 block/SM across 16 or 32. It should help the 35B
-most, which is exactly where §16.5 delivered least.
+proposal was unbuildable and §16.5 had to split lanes instead.
 
-Cost: `k`/`q`/`gate`/`beta` get re-read by each column block (broadcast reads, already L2-resident),
-and the per-block preload/flush loops shorten rather than duplicate. Gate it with
-`gdn_kernel_check.py` — a pure grid refactor at fixed `k_split` should be **bit-exact**, since it
-changes no reduction order, so the full exact bar applies rather than §16.5's relaxed one.
+🚫 **What it does NOT buy is occupancy, which is what this item originally claimed.** Warps/SM is set
+by registers/thread, and registers/thread is set by the state slice `K/k_split` — which the `V` split
+does not touch. `Vb=32, k_split=4` is 128 threads at 117 registers → 4 blocks/SM × 4 warps =
+**16 warps/SM, exactly what `k_split=4` already achieves** with one 512-thread block. It repackages
+the same warps into more, smaller blocks.
+
+✅ **What it does buy is a `(Vb, k_split)` space the current kernel cannot express.** Today `k_split`
+alone sets both the register footprint *and* the block size (`V × k_split` threads), so reaching
+`k_split=8`'s 62 registers/thread forces a **1024-thread block** — one block per SM, a coarse
+scheduling unit with a tail, which is the likely reason `k_split=8` measured *worse* than 4 at
+seq_len 128 and 512 despite halving the state again. Decoupling them allows `Vb=16, k_split=8`:
+**128 threads, ~62 registers → 8 blocks/SM = 32 warps/SM**, double anything measured in §16.5, at
+128 blocks on the 0.8B and 256 on the 35B. That configuration is currently unreachable.
+
+Whether 32 warps/SM helps is the open question, and §16.5 gives reason for doubt: `k_split=8` already
+reached 33 warps/SM in theory and lost at 512, so occupancy may no longer be the binding constraint
+at that length. Worth one measurement precisely because it is cheap — a grid and index change to an
+existing, gated kernel.
+
+Cost: `k`/`q`/`gate`/`beta` get re-read by each column block (broadcast reads, already L2-resident);
+the per-block preload/flush loops shorten rather than duplicate. Gate it with `gdn_kernel_check.py`
+at the **full exact bar** — a pure grid refactor at fixed `k_split` changes no reduction order, so it
+should be bit-exact, unlike §16.5.
 
 **The VL path has not been re-gated — and it is blocked on an artifact, not on work.** Checked
 2026-07-26: there is **no VL checkpoint in the HF cache and no VL build in `dist/`**, so this needs
@@ -2471,10 +2492,39 @@ kernel is nonetheless **slower** — so where the grid already supplies 2 blocks
 term that decides and the spill fix alone buys nothing. The causal story is right; its weighting is
 geometry-dependent, which §16.2 had no way to see from one grid.
 
-The 0.8B's own shortfall (**1.94× against the probe's 2.79×**) is the other thing the probe excluded
-by design: the per-position ring flush. Note the baseline moved too — TIR `k_split=1` is 2.92 ms
-where the probe's hand-written `base` was 3.49 ms — so codegen differences are mixed in and the flush
-share is not separately isolated here.
+#### The 0.8B's own shortfall: the probe's *baseline* was 35% too slow, and the flush is secondary
+
+`--max-history 1` reduces the flush from 63 positions to 1 while changing nothing else, which
+isolates it. At seq_len=512:
+
+| | ks=1 | ks=4 | ratio |
+|---|---:|---:|---:|
+| 0.8B, `max_history=64` | 2.9270 | 1.5185 | 1.93× |
+| 0.8B, `max_history=1` | 2.5904 | 1.2296 | **2.11×** |
+| 35B, `max_history=64` | 3.6959 | 3.0443 | 1.21× |
+| 35B, `max_history=1` | 3.0336 | 2.4488 | **1.24×** |
+
+The flush costs 0.34 ms on the 0.8B and 0.66 ms on the 35B — a clean 2×, matching its 2× state
+volume, which is a good internal consistency check on the measurement.
+
+**But it explains only about half the gap, and a prediction made before running this was refuted.**
+For the probe's 2.79× to be right about the pure recurrence, the flush would have to be ~0.71 ms of
+the 2.92; it is 0.34. Removing it entirely still only reaches 2.11×.
+
+**What actually over-promised was the probe's baseline.** Comparing like with like — both flush-free:
+
+| | probe (hand-written) | TIR | |
+|---|---:|---:|---|
+| `base` / `k_split=1` | 3.4900 | **2.5904** | TIR is **26% faster** |
+| `ksplit4` / `k_split=4` | 1.2494 | 1.2296 | **1.6% apart — effectively identical** |
+
+So the probe's *variant* was faithful; its reproduction of the *shipped* kernel was 35% slower than
+what TVM actually emits. **The lesson generalises past this kernel: in a probe that A/Bs a
+hand-written reproduction against a hand-written variant, the reproduction is the more dangerous
+half, because getting it wrong inflates the ratio in the flattering direction and nothing in the
+probe catches it.** Reproduce the baseline against the real kernel's own measured time before
+trusting a ratio built on it — `gdn_func_history_inplace` was traced at 2.65 ms/call in §15.2 and
+the probe's `base` read 3.49, which was visible without building anything.
 
 #### End to end: 0.8B pp512 +25.0%, decode neutral, 108% of the traced estimate
 
