@@ -53,6 +53,7 @@ def main() -> None:
     ap.add_argument("--prompt-len", type=int, default=512)
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--mark-after", type=int, default=8)
+    ap.add_argument("--prefix-cache-mode", default="disable", choices=["disable", "radix"])
     args = ap.parse_args()
 
     from mlc_llm import MLCEngine
@@ -64,19 +65,24 @@ def main() -> None:
         model_lib=args.model_lib,
         device="cuda:0",
         mode="interactive",
-        engine_config=EngineConfig(prefix_cache_mode="disable"),
+        engine_config=EngineConfig(prefix_cache_mode=args.prefix_cache_mode),
     )
 
-    prompt = ("The quick brown fox jumps over the lazy dog. " * 200)
-    # trim to roughly prompt_len tokens by characters; exactness not required
-    prompt = prompt[: args.prompt_len * 4]
+    base = ("The quick brown fox jumps over the lazy dog. " * 200)
+
+    def make_prompt(salt: str) -> str:
+        # Under radix an identical prompt makes the second request a full cache hit, so
+        # the trace would hold no prefill at all. Salt keeps the shared prefix at ~0.
+        text = (f"Archive record {salt}. " + base) if args.prefix_cache_mode != "disable" else base
+        # trim to roughly prompt_len tokens by characters; exactness not required
+        return text[: args.prompt_len * 4]
 
     gen_cfg = GenerationConfig(temperature=0.0, top_p=1.0, max_tokens=args.tokens)
 
-    n = drain(engine, prompt, gen_cfg, "warmup", args.tokens, 10**9)
+    n = drain(engine, make_prompt("warm"), gen_cfg, "warmup", args.tokens, 10**9)
     print(f"[profile] warmup: {n} tokens")
 
-    n = drain(engine, prompt, gen_cfg, "prof", args.tokens, args.mark_after)
+    n = drain(engine, make_prompt("prof"), gen_cfg, "prof", args.tokens, args.mark_after)
     print(f"[profile] profiled: {n} tokens")
 
     engine.terminate()

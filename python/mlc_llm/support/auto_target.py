@@ -366,18 +366,61 @@ def _register_cuda_hook(target: Target):
     @register_global_func("tvm_callback_cuda_compile", override=True)
     def tvm_callback_cuda_compile(code, target):
         """use nvcc to generate fatbin code for better optimization"""
+        import time
+
         from tvm.contrib import nvcc
 
-        if multi_arch is None:
-            ptx = nvcc.compile_cuda(code, target_format="fatbin")
-        else:
+        # `MLC_DUMP_CUDA=<path>` writes the generated device source before nvcc runs, so
+        # nvcc flags can be benchmarked against a real translation unit without paying
+        # for the (much longer) TVM pass pipeline each time.
+        dump = os.environ.get("MLC_DUMP_CUDA")
+        if dump:
+            # A build emits more than one device module (the 0.8B: one ~3.5 MB unit and one
+            # ~44 KB unit), so suffix rather than overwrite — otherwise the file left on
+            # disk is the small one and any nvcc benchmark run against it is meaningless.
+            n = tvm_callback_cuda_compile.dump_count = (
+                getattr(tvm_callback_cuda_compile, "dump_count", 0) + 1
+            )
+            path = f"{dump}.{n}.cu"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(code)
+            logger.info("%s %s: wrote %s (%d bytes)", FOUND, bold("MLC_DUMP_CUDA"),
+                        path, len(code))
+
+        # `MLC_NVCC_OPTIONS` appends flags to the nvcc invocation, space-separated.
+        #
+        # Measured on the 0.8B's 3.5 MB unit (sm_87, nvcc 13.2), --fatbin -O3:
+        #   baseline 41.5s | -split-compile=12 31.6s (-24%) | -t 12 41.7s (no change)
+        # `-t/--threads` only parallelizes across `-gencode` targets, so it is inert at a
+        # single arch; `-split-compile` parallelizes the device-code optimizer *within* the
+        # one translation unit TVM emits, which is why only the latter helps.
+        #
+        # ⚠️ `-split-compile` is NOT free: the resulting fatbin disassembles to different
+        # SASS (23382 differing lines, +48 instructions on that unit), so it is a codegen
+        # change, not just a build-speed knob. A lib built with it is not A/B-comparable
+        # against one built without — the trap workplan-cuda-13.md §8 documents. Use it for
+        # correctness/iteration builds; leave it off for anything being benchmarked.
+        # It is also only ~17% of a 35B build (the TVM pass pipeline is the other ~83%).
+        extra = os.environ.get("MLC_NVCC_OPTIONS", "").split()
+        if extra:
+            logger.info("%s %s: %s", FOUND, bold("MLC_NVCC_OPTIONS"), " ".join(extra))
+
+        kwargs = {"target_format": "fatbin"}
+        if multi_arch is not None:
             arch = []
             for compute_version in multi_arch:
                 arch += [
                     "-gencode",
                     f"arch=compute_{compute_version},code=sm_{compute_version}",
                 ]
-            ptx = nvcc.compile_cuda(code, target_format="fatbin", arch=arch)
+            kwargs["arch"] = arch
+        if extra:
+            kwargs["options"] = extra
+
+        t0 = time.perf_counter()
+        ptx = nvcc.compile_cuda(code, **kwargs)
+        logger.info("nvcc: %.1fs for %.1f MB of device source",
+                    time.perf_counter() - t0, len(code) / 1e6)
         return ptx
 
 

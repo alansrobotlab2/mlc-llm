@@ -15,14 +15,26 @@ from pathlib import Path
 PROMPT_FILLER = "The quick brown fox jumps over the lazy dog. " * 200
 
 
-def build_prompt(tokenizer, target_len: int) -> tuple[str, int]:
-    filler = PROMPT_FILLER
+def build_prompt(tokenizer, target_len: int, salt: str = "") -> tuple[str, int]:
+    """Build a `target_len`-token prompt, optionally prefixed by a unique `salt`.
+
+    `salt` exists for prefix-cache benching. With `prefix_cache_mode != "disable"` an
+    identical prompt makes every run after the first a full radix-cache hit, so ttft
+    stops measuring prefill and starts measuring a cache lookup — the pp column then
+    reads as a huge win that no first-time request ever sees. A per-run salt keeps the
+    shared prefix at ~0 tokens so each run really does prefill.
+
+    The returned length is the *re-encoded* length, not the requested one: the
+    truncate-then-decode round trip is not guaranteed to be token-count stable, and
+    pp_tps divides by this number.
+    """
+    filler = (salt + " " if salt else "") + PROMPT_FILLER
     ids = tokenizer.encode(filler, add_special_tokens=False)
     if len(ids) < target_len:
-        filler = filler * (target_len // len(ids) + 2)
+        filler = filler + PROMPT_FILLER * (target_len // max(len(ids), 1) + 2)
         ids = tokenizer.encode(filler, add_special_tokens=False)
-    ids = ids[:target_len]
-    return tokenizer.decode(ids), len(ids)
+    text = tokenizer.decode(ids[:target_len])
+    return text, len(tokenizer.encode(text, add_special_tokens=False))
 
 
 def time_run(engine, prompt: str, gen_cfg, request_id: str):
@@ -51,7 +63,18 @@ def main():
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--model-lib", default=None,
                     help="Explicit lib.so path (default: first *.so under model-dir)")
+    ap.add_argument("--prefix-cache-mode", default="disable",
+                    choices=["disable", "radix"],
+                    help="Engine prefix_cache_mode. Default 'disable' — note that on a "
+                         "hybrid (RNNState) model this decides which forward path prefill "
+                         "takes, so 'disable' does NOT measure what a default-configured "
+                         "user gets. See workplan-cuda-13.md §13.")
+    ap.add_argument("--unique-prompts", default=None, action="store_true",
+                    help="Salt every run's prompt so radix cannot hit. Defaults to on "
+                         "whenever --prefix-cache-mode is not 'disable'.")
     args = ap.parse_args()
+    if args.unique_prompts is None:
+        args.unique_prompts = args.prefix_cache_mode != "disable"
 
     from mlc_llm import MLCEngine
     from mlc_llm.protocol.generation_config import GenerationConfig
@@ -87,12 +110,22 @@ def main():
         model_lib=lib_path,
         device=args.device,
         mode="interactive",
-        engine_config=EngineConfig(prefix_cache_mode="disable"),
+        engine_config=EngineConfig(prefix_cache_mode=args.prefix_cache_mode),
     )
     print(f"[mlc] Engine loaded in {time.perf_counter() - t0:.1f}s", flush=True)
 
-    prompt, prompt_len = build_prompt(tokenizer, args.pp)
+    print(f"[mlc] prefix_cache_mode={args.prefix_cache_mode} "
+          f"unique_prompts={args.unique_prompts}", flush=True)
+
+    def prompt_for(tag: str) -> tuple[str, int]:
+        return build_prompt(tokenizer, args.pp,
+                            salt=f"Archive record {tag}." if args.unique_prompts else "")
+
+    prompt, prompt_len = prompt_for("base")
     print(f"[mlc] Prompt length: {prompt_len} tokens", flush=True)
+    if args.unique_prompts and prompt_len != args.pp:
+        print(f"[mlc] NOTE: re-encoded length {prompt_len} != requested {args.pp}; "
+              f"pp_tps uses the real length", flush=True)
 
     tg_values = [int(x) for x in args.tg.split(",") if x.strip()]
     summaries = []  # (tg, pp_tps_med, tg_tps_med)
@@ -103,7 +136,8 @@ def main():
 
         for w in range(args.warmup):
             t0 = time.perf_counter()
-            ttft, total, ntok = time_run(engine, prompt, gen_cfg,
+            p_text, _ = prompt_for(f"w{tg}x{w}") if args.unique_prompts else (prompt, prompt_len)
+            ttft, total, ntok = time_run(engine, p_text, gen_cfg,
                                          f"warmup-tg{tg}-{w}")
             print(f"[mlc]   warmup {w}: ttft={ttft*1000:.1f}ms "
                   f"total={total*1000:.1f}ms tokens={ntok} "
@@ -113,11 +147,12 @@ def main():
         pp_tps_samples = []
         tg_tps_samples = []
         for r in range(args.runs):
-            ttft, total, ntok = time_run(engine, prompt, gen_cfg,
+            p_text, p_len = prompt_for(f"r{tg}x{r}") if args.unique_prompts else (prompt, prompt_len)
+            ttft, total, ntok = time_run(engine, p_text, gen_cfg,
                                          f"run-tg{tg}-{r}")
             decode_t = total - ttft
             n_decode = max(ntok - 1, 1)
-            pp_tps = prompt_len / ttft if ttft > 0 else float("inf")
+            pp_tps = p_len / ttft if ttft > 0 else float("inf")
             tg_tps = n_decode / decode_t if decode_t > 0 else float("inf")
             pp_tps_samples.append(pp_tps)
             tg_tps_samples.append(tg_tps)

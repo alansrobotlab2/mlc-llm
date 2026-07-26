@@ -52,6 +52,12 @@ def main() -> None:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--out", default=None, help="write snapshot JSON here")
     p.add_argument("--compare", default=None, help="diff against this snapshot and exit nonzero on mismatch")
+    p.add_argument("--prefix-cache-mode", default="disable", choices=["disable", "radix"],
+                   help="On a hybrid (RNNState) model this selects which forward path "
+                        "prefill takes: 'disable' uses the fused path, 'radix' (the engine "
+                        "default) uses forward_with_history. A snapshot taken in the wrong "
+                        "mode compares a build against itself on a path neither touches and "
+                        "passes vacuously — see workplan-cuda-13.md §13.")
     args = p.parse_args()
 
     if not args.out and not args.compare:
@@ -68,10 +74,10 @@ def main() -> None:
         model_lib=args.model_lib,
         device=args.device,
         mode="interactive",
-        # radix prefix cache + GDN rnn_state deadlock; see qwen3_5.md §9
-        engine_config=EngineConfig(prefix_cache_mode="disable"),
+        engine_config=EngineConfig(prefix_cache_mode=args.prefix_cache_mode),
     )
-    print(f"[snap] engine up in {time.perf_counter() - t0:.1f}s", flush=True)
+    print(f"[snap] engine up in {time.perf_counter() - t0:.1f}s "
+          f"(prefix_cache_mode={args.prefix_cache_mode})", flush=True)
 
     gen_cfg = GenerationConfig(temperature=0.0, top_p=1.0, max_tokens=args.max_tokens)
     tok = engine.tokenizer
