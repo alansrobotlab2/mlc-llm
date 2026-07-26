@@ -927,16 +927,19 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > pointer is deliberately not advanced — see "Committed state" for the commands and why. Nothing in
 > §16.5 touches TVM, so this is unchanged rather than newly blocking.
 >
-> **Where the recurrence now stands: ~354 GFLOP/s, 6.6% of sm_87 fp32 peak** (537 MFLOP in 1.52 ms
-> on the 0.8B at seq_len=512, §15.6's flop convention), up from 3.8%. So **~15× of theoretical
-> headroom remains, and the only lever with that ceiling is item 0c step 2**, the chunked
-> reformulation — a scalar recurrence cannot reach matmul efficiency however it is scheduled.
+> **Start at item 0e — the MoE expert GEMM.** §16.7 traced 35B prefill after this session's changes
+> and the priority order in §9 turned out to be wrong: `dequantize_group_gemm_v2`+`_v21` are **52.5%
+> of prefill** (MoE machinery overall ~64%), while the GDN recurrence that four sections have called
+> "the biggest prefill item by 5×" is **11.1% and third**. That framing was measured on the 0.8B and
+> §16.5 cut it further. **Item 0c.2 is capped at +12.5% on the 35B by Amdahl** and should not be
+> started first.
 >
-> **Item 0d is the cheap thing to try first**, and its scope shrank once the arithmetic was checked:
-> it does *not* raise occupancy (see the item — the first version of it said otherwise and was
-> wrong). What it does is decouple `k_split` from block size, which makes `Vb=16, k_split=8` —
-> 128 threads, 32 warps/SM — reachable for the first time. One measurement, on an already-gated
-> kernel, and it should be bit-exact.
+> The next action is a *measurement*, not a build: is `group_gemm_v2` bandwidth-, compute- or
+> schedule-bound at prefill's B=4096, and does it use tensor cores? It runs at 6.9 ms/call against a
+> ~1.94 ms bandwidth floor. `bench_moe_kernel.py` needs a large-B mode.
+>
+> **Item 0d is done (§16.6)** — `v_block`, +15.6% on the 0.8B, −8% on the 35B, so it ships opt-in at
+> default `0` and the default configuration is unchanged.
 >
 > **Four traps §16.5 paid for, in order of how much time they cost:**
 > 1. **In a probe that A/Bs a hand-written baseline against a hand-written variant, the *baseline* is
@@ -971,13 +974,30 @@ sequence sequentially.
      the probe's 2.79×, and **`k_split=2` is a 0.96× regression on the 35B** — the probe's grid is
      the 0.8B's `n_vh = 16`, and the 35B's `n_vh = 32` already fits 2 blocks/SM. Default flipped to
      4; `MLC_QWEN35_GDN_KSPLIT=1` restores §15's bit-exact kernel.
-  2. **Do item 0d first, then re-scope the chunked linear-attention formulation** — matmuls over a
-     chunk of C positions instead of a scalar loop, as in
-     `../flash-linear-attention/fla/layers/gated_deltanet.py` and vLLM's `qwen3_next.py`.
-     Substantially bigger than anything in §10–§16: it **changes the arithmetic**, so bit-exactness
-     is off the table and item 0b is a prerequisite for judging it on the 35B, and it needs its own
-     chunk-state intermediate. Note it does **nothing for decode** — at `seq_len=1` the chunked form
-     degenerates, and `gdn_func_inplace` is already only 2.1% of the whole-run budget.
+  2. ⬇️ **De-prioritised on the 35B by §16.7's trace — worth at most +12.5% there.** The chunked
+     linear-attention formulation (matmuls over a chunk of C positions instead of a scalar loop, as
+     in `../flash-linear-attention/fla/layers/gated_deltanet.py` and vLLM's `qwen3_next.py`) is
+     still the only lever with a ~15× ceiling *on the kernel*, but the kernel is now **11.1% of 35B
+     prefill**, not the dominant item §15.6 measured on the 0.8B. Amdahl caps a perfect version at
+     `1/(1 − 0.111)` = **+12.5% prefill**, for the largest and riskiest change in this document: it
+     **changes the arithmetic**, so bit-exactness is off the table, item 0b is a prerequisite for
+     judging it, and it needs its own chunk-state intermediate. It does **nothing for decode** —
+     at `seq_len=1` the chunked form degenerates. Still worth ~+27% on the 0.8B, which is the
+     iteration vehicle rather than the target. **Do item 0e first.**
+
+**0e. The MoE expert GEMM is 52.5% of 35B prefill and appears to be ~3.6× off its own roofline.**
+§16.7's trace: `dequantize_group_gemm_v2` + `_v21` are **395.9 ms of a 754 ms pp512 prefill**, and
+MoE machinery including combine/`scatter_output`/`take` is ~64%. Per call that is **6.9 ms against a
+~1.94 ms weight-bandwidth floor** (§16.4's 302 MB expert set at 156 GB/s), while the arithmetic
+(17.2 GFLOP/call at B=4096) needs ~3.2 ms even at fp32 CUDA-core peak.
+
+§16.4 already characterised this kernel — dispatch-table, sized for all 256 experts, **cost flat in
+batch** — and correctly concluded that makes it 51× worse than the b=1 gemv *at decode*. What it did
+not ask is whether flat-in-batch is efficiently *implemented* at prefill's B=4096, where that
+property is exactly what you want. **Measure before building:** is it bandwidth-bound, compute-bound
+or schedule-bound at B=4096, and does it use tensor cores? `bench_moe_kernel.py` sweeps this kernel
+already and needs a large-B mode; §16.3's L2-reuse caveat matters far less at B=4096 than at B=8 but
+should still be checked before quoting absolutes.
 
 **0d. ✅ Built and measured, §16.6 — `v_block`, worth +15.6% on the 0.8B and −8% on the 35B.**
 Ships as an opt-in knob (`MLC_QWEN35_GDN_VBLOCK`, default `0` = inert), so the default configuration
@@ -2695,6 +2715,54 @@ reduction order, so `gdn_kernel_check.py --v-block N` adds a check the §16.5 ba
 required to be **exactly 0**. At `k_split=8, v_block=16` it is `0.0e+00` on every shape, both head
 configs, including the wrapping ones — so this is the first history-path change since §15 held to an
 exact bar rather than a tolerance.
+
+### 16.7 The 35B prefill trace — the recurrence is 11%, the MoE is 64%, and §9's priorities are wrong
+
+Traced after §16.5/§16.6 (`lib_ksplit4.so`, `radix`, prompt-len 512, nsys `--cuda-graph-trace=node`).
+The profiled pp512 prefill step is **754.0 ms, 99.1% kernel-busy — only 0.9% idle**, so there is no
+launch-overhead story here at all:
+
+| kernel | calls | ms | % of prefill |
+|---|---:|---:|---:|
+| `dequantize_group_gemm_v2` | 40 | **275.71** | **36.6%** |
+| `dequantize_group_gemm_v21` | 40 | **120.21** | **15.9%** |
+| `gdn_func_history_inplace_ksplit` | 30 | 83.88 | 11.1% |
+| `fused_dequantize1_NT_matmul8_2` (GDN `in_proj_qkvzab`) | 30 | 46.10 | 6.1% |
+| `fused_multiply9_sum3` (MoE combine) | 40 | 41.25 | 5.5% |
+| `scatter_output` | 40 | 22.37 | 3.0% |
+| `take` | 40 | 20.84 | 2.8% |
+| `fused_dequantize2_NT_matmul9_2` | 40 | 19.09 | 2.5% |
+| `conv1d_history_inplace` | 30 | 11.25 | 1.5% |
+
+**Roll-ups: the MoE expert GEMM pair is 395.9 ms = 52.5% of prefill, and MoE machinery as a whole —
+the pair plus combine, `scatter_output` and `take` — is ~480 ms = 64%.** The GDN recurrence that
+§9 item 0c has called "the biggest prefill item, by 5×" through four sections is **83.9 ms, 11.1%,
+and the third-largest item**.
+
+**This retires item 0c.2's priority on the 35B.** §15.6's framing was measured on the 0.8B, where
+the recurrence *was* dominant; §16.5 then cut it further. Amdahl on 11.1%: even a **perfect**
+chunked reformulation — the full ~15× to matmul efficiency — is worth at most
+`1/(1 − 0.111) = 1.125×`, **+12.5% prefill on the 35B**, for the largest and riskiest piece of work
+in this document. (The 0.8B is a different story: it is dense, has no MoE, and its recurrence is
+~23% of ttft after §16.5, so 0c.2 is still worth ~+27% there. But the 0.8B is the iteration vehicle,
+not the target.)
+
+**The real target is `dequantize_group_gemm_v2`, and §16.4 already described why it should be
+beatable — it just drew the conclusion for the wrong phase.** §16.4 established that v2 is a
+dispatch-table kernel *sized for the full 256-expert set*, so it reads ~302 MB per call and its cost
+is **flat in batch** (+2.6% from B=8 to B=64). That made it 51× worse than the b=1 gemv at decode,
+which is where §16.4 stopped. But prefill runs it at **B = 512 tokens × top-8 = 4096 rows**, and
+flat-in-batch is exactly the property you want there — which is why it is the right *family* for
+prefill even though it is wrong for decode. The question §16.4 never asked is whether this
+*implementation* is efficient at B=4096, and the trace says probably not: 275.71 ms over 40 calls is
+**6.9 ms/call against a ~1.94 ms weight-bandwidth floor** (302 MB at 156 GB/s), i.e. **~3.6× off the
+roofline**, with the arithmetic (4096 × 2048 × 1024 × 2 = 17.2 GFLOP/call) needing only ~3.2 ms even
+at fp32 CUDA-core peak and far less on tensor cores.
+
+**Next measurement, before any building:** establish whether v2 at B=4096 is bandwidth-bound,
+compute-bound or schedule-bound, and whether it uses tensor cores at all. `bench_moe_kernel.py`
+already sweeps this kernel — it needs a large-B mode. ⚠️ Its L2-reuse instrument bug (§16.3) matters
+much less at B=4096 than at B=8, but check it before quoting absolutes.
 
 > ⚠️ **Harness failure worth recording, because it cost a discarded table.** A split kernel spends
 > 30–42 s per config in ptxas, so a sweep looks idle for many minutes. A run was wrongly declared
