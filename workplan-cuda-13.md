@@ -640,6 +640,8 @@ footgun, and §3's note that `profile_decode.py` still trips it). Always pass `-
 
 | lib | what it is |
 |---|---|
+| `lib_skippad.so` | **§16.11 — the current 35B build.** `lib_ksplit4` plus item 0f's padding-CTA skip. pp512 **769**, decode 60.09, state gate identical to `lib_ksplit4` in both modes |
+| `lib_ksplit4.so` | §16.5's lane-split build — the §16.11 A/B baseline. pp512 644 |
 | `lib_gdnhist.so` | **the current build** — everything in `lib_histconv` plus the §15 history-path recurrent fusion. Bench and gate against this |
 | `lib_histconv.so` | §14 history-path conv fusion — the §15 A/B baseline |
 | `lib_convfused.so` | §10 in_proj merge + §11 in-place recurrent state + §13 in-place conv state — the §14 A/B baseline |
@@ -940,7 +942,7 @@ that §7 said to commit was still ignored; the exception now covers both names a
 >
 > | | decode tg512 | prefill pp512 (`radix`, the default) |
 > |---|---:|---:|
-> | **35B-A3B** | **60.00** tps (from 54.13, +10.8%) — 61.5% of the 97.5 tps achievable roofline | **642** (from 355 at the start of 2026-07-25c, +81%) |
+> | **35B-A3B** | **60.09** tps (from 54.13, +11.0%) — 61.6% of the 97.5 tps achievable roofline | **769** (from 355 at the start of 2026-07-25c, **+117%**) |
 > | **0.8B** | ~90 tps | **4888** (from 1469, +233%) |
 >
 > **What landed today.** §16.5: the lane-split GDN recurrence, `MLC_QWEN35_GDN_KSPLIT` default **4**
@@ -950,7 +952,7 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > 0.8B and −8% on the 35B — so the default configuration and every gate result above are unchanged
 > by it.
 >
-> ### The one thing to do next: measure item 0f end-to-end, then flip its default
+> ### Where to start: no queued item — pick from three, none costed
 >
 > §16.7 traced 35B prefill *after* §16.5/§16.6 and **§9's priority order was wrong**:
 > `dequantize_group_gemm_v2`+`_v21` are **52.5% of prefill** (MoE machinery overall ~64%), while the
@@ -964,21 +966,27 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > And **27–50% of its CTAs are dispatch-table padding that runs the full dequant + wmma and discards
 > the result**, because the sentinel path guards only the `X` read and the store.
 >
-> **§16.10 built item 0f and it is bit-exact.** `MLC_MOE_GEMM_V2_SKIPPAD=1` rewrites the `k_o_o`
-> loop's *extent* to `Select(e_v >= 0, K/BLK_K, 0)` — not an `IfThenElse`, because `ThreadSync`
-> refuses to place a `__syncthreads()` inside a condition. `scripts/moe_gemm_check.py` passes
-> `np.array_equal` on all 8 cases; the kernel is **1.28×–1.73×** faster. **The default is still `0`.**
+> **§16.8–§16.11 closed items 0e and 0f. 35B prefill went 642 → 769 tps (+19.4%).** The MoE expert
+> GEMM was never bandwidth- or compute-bound: it is CTA-bound, and 27–50% of its CTAs were dispatch-
+> table padding running a full dequant + wmma and discarding it. `MLC_MOE_GEMM_V2_SKIPPAD` (now
+> default `1`) gives the `k_o_o` loop a zero trip count on those — a `Select` on the loop *extent*,
+> **not** an `IfThenElse`, because `ThreadSync` refuses a `__syncthreads()` inside a condition.
+> Bit-exact, and the state gate is *identical* to the pre-change lib in both modes, not merely
+> passing. Current 35B lib is **`lib_skippad.so`**.
 >
-> **So the next action is the end-to-end measurement, and it is the only thing standing between this
-> and a default flip:** rebuild the 35B lib with the flag on, A/B pp512 against the current 642, run
-> `high_margin_gate.py` under both prefix-cache modes. The projection is **+14.6% to +28.0% pp512**
-> and it *is* a projection — from a microbench, via Amdahl on §16.7's 52.5%. The gate cannot change
-> its verdict (the kernel is bit-exact), so it is a check on the plumbing, not on the arithmetic.
+> **There is no queued item.** The open list is item 0c.2 (de-prioritised, +12.5% ceiling) and the
+> blocked precondition. Three candidates, none costed:
+> 1. **Register-blocking the v2 inner loop.** §16.9 found `i_o` sits outside the k-loop, so widening
+>    `BLK_M` re-runs the whole dequant per row-fragment (0.64×/0.39×). Hoisting the shared loads above
+>    `i_o` is both the fix and the standard blocking that would lift v2 off **5.5% of the fp16 tensor
+>    ceiling**. Largest remaining prize in the MoE, still unquantified.
+> 2. **The last 20% of a skipped CTA** (§16.10) — zero the trailing store loops too. ~3% end-to-end,
+>    small and well understood, but the extents are not unique so it needs a targeted match.
+> 3. **A direct indptr histogram.** §16.11 *inferred* ~40% padding in production from the end-to-end
+>    number; observing it would check that inference.
 >
-> Do not re-litigate the routes §16.9/§16.10 already closed: a source-level `if` dies in
-> `sch.compute_at`; an `IfThenElse` around the scheduled body dies in `ThreadSync`; widening `BLK_M`
-> is a **0.64×/0.39× regression** because `i_o` sits outside the k-loop. That last one corrected
-> §16.8 — the per-CTA constant is the whole k-loop body, not the dequant specifically.
+> Do not re-litigate what §16.9/§16.10 closed: a source-level `if` dies in `sch.compute_at`; an
+> `IfThenElse` around the scheduled body dies in `ThreadSync`; widening `BLK_M` alone regresses.
 >
 > ### Two non-code loose ends
 >
@@ -1065,8 +1073,15 @@ Its time is `n_real·c_real + n_pad·c_pad` with `c_pad ≈ 0.93 c_real`, a two-
 predicts all 12 sweep points to ≤1.6%. §16.4's "flat in batch" was the right observation with the
 wrong mechanism: the grid is 97% padding at B=8, not reading all 256 experts. Closes into **0f**.
 
-**0f. ✅ Built, §16.10, opt-in at `MLC_MOE_GEMM_V2_SKIPPAD=0` — remaining work is the end-to-end
-measurement, not the kernel.** Bit-exact on all 8 gate cases and **1.28×–1.73×** on the kernel; the
+**0f. ✅ CLOSED, §16.11 — shipped on by default, +19.4% pp512 on the 35B (644.26 → 769.18 tps).**
+Bit-exact: 8/8 on `scripts/moe_gemm_check.py` under `np.array_equal`, and the 35B state gate is
+*identical* to the pre-change lib in both prefix-cache modes — same τ=1.0 mismatch count, same
+near-tie count — which is the end-to-end version of the same claim. Decode neutral (60.16 → 60.09).
+`MLC_MOE_GEMM_V2_SKIPPAD=0` restores the un-skipped kernel. Historic detail below.
+
+<details><summary>§16.10's entry — the build, before the end-to-end numbers</summary>
+
+**Was: built, opt-in, pending the end-to-end measurement.** Bit-exact on all 8 gate cases and **1.28×–1.73×** on the kernel; the
 guard is a `Select` on the `k_o_o` loop *extent*, not an `IfThenElse`, because `ThreadSync` refuses
 to place a `__syncthreads()` inside a condition. A skipped CTA still costs **20%** of a full one
 (accumulator fill + `O_tile` store + the predicated-off store loop), so 80% of the padding cost is
@@ -1074,6 +1089,8 @@ recovered, not all of it. **To close it:** rebuild the 35B lib with the flag on,
 state gate, then flip the default on those numbers — the projection is +14.6% to +28.0% and it is a
 projection. Optional follow-on worth ~7% more: zero the trailing store loops too (extents 1 and 2,
 which are not unique, so it needs a targeted match rather than extent equality).
+
+</details>
 
 <details><summary>Original entry — the analysis that motivated it</summary>
 
@@ -3151,3 +3168,68 @@ actually measured.** That is the whole failure mode §9's traps list is about. T
 rebuild the 35B lib with `MLC_MOE_GEMM_V2_SKIPPAD=1`, A/B pp512, and run the state gate — which
 **cannot** change (the kernel is bit-exact, so the gate is a regression check on the plumbing, not a
 judgement on the arithmetic). Flip the default on those numbers, not on these.
+
+### 16.11 Item 0f measured end-to-end — +19.4% pp512, and the default is flipped
+
+`MLC_MOE_GEMM_V2_SKIPPAD` now defaults to **`1`**. Lib: `lib_skippad.so`, compiled with
+`MLC_MOE_GEMM_V2=1` (4 v2 symbols confirmed by `nm`), `radix`, prompt-len 512, 3 runs after a warmup.
+
+| | `lib_ksplit4` (baseline) | `lib_skippad` | |
+|---|---:|---:|---:|
+| **pp512** | 644.26 tps | **769.18 tps** | **+19.4%** |
+| ttft | 794.7 ms | **665.6 ms** | −16.2% |
+| tg512 | 60.16 tps | 60.09 tps | −0.1% (noise) |
+
+Run-to-run spread was 0.05 tps on the new lib (769.15 / 769.18 / 769.20), so the +19.4% is not a
+sampling artifact. **Decode is untouched**, as expected — at b=1 the MoE goes through the gemv path
+(§16.4), not this kernel, so the only thing that could have moved is prefill.
+
+#### The gate: identical to the baseline, which is a stronger statement than "passes"
+
+`high_margin_gate.py` against `high_margin_ref_35b_fp8.json`, both prefix-cache modes:
+
+| mode | τ=1.0 | τ=2.0 | τ=4.0 | τ=8.0 | near-ties | |
+|---|---|---|---|---|---|---|
+| `radix` | 142 / 0 (100%) | **139/139** | 99 / 0 | 17 / 0 | 3/5 | PASS |
+| `disable` | 142 / **1** (99.30%) | **139/139** | 99 / 0 | 17 / 0 | 2/5 | PASS |
+
+`disable` has one mismatch at τ=1.0 that `radix` does not, and **passing was not enough to accept
+that** — a bit-exact kernel should reproduce the baseline's mismatch counts exactly, so an extra one
+would have contradicted the whole premise. Re-ran the baseline `lib_ksplit4` through the identical
+`disable` check as a control:
+
+```
+CONTROL lib_ksplit4 disable:  1.0 → 142 / 1 / 99.30%   2.0 → 139/139   near-ties 2/5
+```
+
+**Every column matches, including the near-tie count.** The τ=1.0 mismatch is pre-existing and
+belongs to q4 quantization vs the fp8 reference, not to this change. Bit-exactness now has end-to-end
+evidence, not just the microbench's.
+
+#### The end-to-end number back-fills §16.8's open question
+
+§16.10 projected **+14.6% to +28.0%**, the range being how balanced the production router is.
+Measured **+19.4%** sits inside it, and inverting the arithmetic turns the projection into a
+measurement of the thing that was unknown:
+
+- Amdahl at §16.7's 52.5% ⇒ the kernel pair got **1.448×** in production
+  (microbench brackets: 1.32× at 27% padding, 1.71× at 50%)
+- feeding that back through §16.10's `c_pad/c_real = 0.933` and `c_skip/c_pad = 0.201` ⇒
+  **~40% of v2's CTAs at production prefill are padding**
+
+That is between uniform-random's 27% and a perfectly balanced router's 50%, which is exactly where a
+load-balance-trained router should sit. ⚠️ **It is inferred, not observed** — it leans on §16.7's
+52.5% and on the microbench constants. A direct indptr histogram would still be worth having, and it
+is now the cheap way to check this inference rather than to size the work.
+
+#### Where the 35B stands
+
+| | before today | now |
+|---|---:|---:|
+| **pp512** (`radix`) | 642 | **769** |
+| decode tg512 | 60.00 | 60.09 |
+
+Prefill is now **2.17×** what it was at the start of 2026-07-25c (355). The remaining known headroom
+in this kernel is the ~20% of a full CTA that a skipped one still costs (§16.10) — worth ~7% more on
+the pair, ~3% end-to-end — and then the register-blocking that §16.9's `BLK_M` regression pointed at,
+which is the larger prize and still unquantified.

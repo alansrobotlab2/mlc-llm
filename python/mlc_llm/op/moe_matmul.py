@@ -902,7 +902,11 @@ def _dequantize_group_gemm_v2(
         return func.with_body(body)
 
     scheduled = _schedule_v2()
-    if os.environ.get("MLC_MOE_GEMM_V2_SKIPPAD", "0") == "1":
+    # Default ON since §16.11: bit-exact on all 8 gate cases, +19.4% pp512 on the 35B
+    # (644.26 -> 769.18 tps), decode neutral, and the state gate is *identical* to the
+    # pre-change lib in both prefix-cache modes. `MLC_MOE_GEMM_V2_SKIPPAD=0` restores
+    # the un-skipped kernel for an A/B.
+    if os.environ.get("MLC_MOE_GEMM_V2_SKIPPAD", "1") == "1":
         scheduled = _guard_padding_ctas(scheduled)
 
     return op.tensor_ir_op(
