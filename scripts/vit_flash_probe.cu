@@ -39,7 +39,10 @@
   printf("CUDA error %s at %d\n", cudaGetErrorString(e), __LINE__); exit(1); } } while (0)
 
 // The cat fixture at the tower's native patch count, and the tower's own config.
-static const int H = 12, S = 2520, D = 64, LAYERS = 12;
+// 2520 is the cat fixture's patch count -- the one shape §20's whole VL roofline rests
+// on. `SMAX` is the allocation ceiling so the sweep can ask whether that shape is
+// special; every §20 number would have to be re-taken at any other size anyway.
+static const int H = 12, S = 2520, SMAX = 5120, D = 64, LAYERS = 12;
 
 // ---------------------------------------------------------------------------
 // control: hand-tiled fp32 GEMM at the QK^T shape (M=N=2520, K=64).
@@ -333,7 +336,7 @@ static void verify(int s) {
   cudaFree(gq); cudaFree(gk); cudaFree(gv); cudaFree(go);
 }
 
-int main() {
+int main(int argc, char** argv) {
   cudaDeviceProp p;
   CHECK(cudaGetDeviceProperties(&p, 0));
   // CUDA 13 removed `clockRate` from cudaDeviceProp; the attribute query survives.
@@ -344,12 +347,12 @@ int main() {
   printf("[probe] %s  %d SMs  %.1f MHz  fp32 peak %.2f TFLOP/s\n",
          p.name, p.multiProcessorCount, clk_khz / 1e3, peak / 1e12);
 
-  CHECK(cudaMalloc(&dQ, (size_t)H * S * D * 4));
-  CHECK(cudaMalloc(&dK, (size_t)H * S * D * 4));
-  CHECK(cudaMalloc(&dV, (size_t)H * S * D * 4));
-  CHECK(cudaMalloc(&dO, (size_t)H * S * D * 4));
-  CHECK(cudaMalloc(&dC, (size_t)S * S * 4));
-  std::vector<float> host((size_t)H * S * D);
+  CHECK(cudaMalloc(&dQ, (size_t)H * SMAX * D * 4));
+  CHECK(cudaMalloc(&dK, (size_t)H * SMAX * D * 4));
+  CHECK(cudaMalloc(&dV, (size_t)H * SMAX * D * 4));
+  CHECK(cudaMalloc(&dO, (size_t)H * SMAX * D * 4));
+  CHECK(cudaMalloc(&dC, (size_t)SMAX * SMAX * 4));
+  std::vector<float> host((size_t)H * SMAX * D);
   for (auto& x : host) x = (float)drand48() - 0.5f;
   CHECK(cudaMemcpy(dQ, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
   CHECK(cudaMemcpy(dK, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
@@ -359,34 +362,48 @@ int main() {
   verify(1000);
 
   const double gemm_flop = 2.0 * (double)S * S * D;             // one head of QK^T
-  const double flash_flop = 2.0 * 2.0 * H * (double)S * S * D;  // QK^T + P@V, 12 heads
 
   const float g = time_gemm(20);
-  printf("\ncontrol — hand-tiled fp32 GEMM at the QK^T shape (the rate question)\n");
+  printf("\ncontrol - hand-tiled fp32 GEMM at the QK^T shape (the rate question)\n");
   printf("  1 head   %6.2f ms   %5.2f TFLOP/s (%4.1f%% of peak)\n",
          g, gemm_flop / (g * 1e-3) / 1e12, 100.0 * gemm_flop / (g * 1e-3) / peak);
   printf("  x12      %6.2f ms   vs cuBLAS 3.63 (2.69 TFLOP/s) and dlight 9.46 (1.03)\n",
          g * H);
 
+  // Sequence lengths to sweep. The three kernels flash replaces all scale as S^2, and so
+  // does flash, so the ratio *should* be flat -- but the softmax kernel is bandwidth-bound
+  // while the matmuls are compute-bound, so the mix can shift. Compare each column against
+  // `vit_attn_bench.py --static --prescale --seq N`, which measures the kernels being
+  // replaced at the same shape.
+  std::vector<int> seqs;
+  for (int i = 1; i < argc; ++i) seqs.push_back(atoi(argv[i]));
+  if (seqs.empty()) seqs = {1260, 2520, 5040};
+
   printf("\nflash attention, one layer (12 heads), fp32, online softmax\n");
-  printf("  %-20s %7s %8s %8s %10s %8s\n",
-         "config", "shared", "CTAs/SM", "ms/layer", "TFLOP/s", "vs 14.71");
+  printf("  %-16s %7s %8s", "config", "shared", "CTAs/SM");
+  for (int q : seqs) printf("  seq=%-5d", q);
+  printf("\n");
   float best = 1e30f; const char* bestname = "";
   for (auto& c : CFGS) {
-    float ms = time_flash(c.fn, 20);
-    if (ms < 0) { printf("  %-20s %6.1fk   (launch failed)\n", c.name, c.shared / 1024.f); continue; }
-    int ctas = (164 * 1024) / (c.shared + 1024);   // CC 8.x reserves 1 kB/block (§21.2)
-    printf("  %-20s %6.1fk %8d %8.2f %10.2f %7.2fx\n", c.name, c.shared / 1024.f,
-           ctas, ms, flash_flop / (ms * 1e-3) / 1e12, ms / 14.71f);
-    if (ms < best) { best = ms; bestname = c.name; }
+    printf("  %-16s %6.1fk %8d", c.name, c.shared / 1024.f,
+           (164 * 1024) / (c.shared + 1024));   // CC 8.x reserves 1 kB/block (§21.2)
+    for (int q : seqs) {
+      g_seq = q;
+      float ms = time_flash(c.fn, 10);
+      printf("  %8.2f", ms);
+      if (q == S && ms > 0 && ms < best) { best = ms; bestname = c.name; }
+    }
+    printf("  ms/layer\n");
   }
+  printf("  (TFLOP/s at seq=%d for the best row: %.2f)\n", S,
+         2.0 * 2.0 * H * (double)S * S * D / (best * 1e-3) / 1e12);
 
-  printf("\n§20.9's three kernels: QK^T 3.63 + softmax 4.05 + P@V 7.03 = 14.71 ms/layer,"
-         " 176.5 ms/iter\n");
-  printf("best: %s at %.2f ms/layer = %.1f ms/image_embed (%.2fx)\n",
-         bestname, best, best * LAYERS, best / 14.71f);
+  printf("\n§20.9's three kernels at seq=2520: QK^T 3.63 + softmax 4.05 + P@V 7.03"
+         " = 14.71 ms/layer, 176.5 ms/iter\n");
+  printf("best at seq=%d: %s at %.2f ms/layer = %.1f ms/image_embed (%.2fx)\n",
+         S, bestname, best, best * LAYERS, best / 14.71f);
   printf("VERDICT: %s\n", best < 14.71f
-         ? "a WIN — saves (14.71 - best) x 12 ms of image_embed; worth building in TIR"
-         : "a REGRESSION — item 0r is dead");
+         ? "a WIN - saves (14.71 - best) x 12 ms of image_embed; worth building in TIR"
+         : "a REGRESSION - item 0r is dead");
   return 0;
 }

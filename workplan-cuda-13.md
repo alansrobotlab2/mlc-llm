@@ -5729,3 +5729,67 @@ queued as such.
 (`cudaDeviceGetAttribute(cudaDevAttrClockRate)` still works) — one more entry for §3's landmine list.
 And every number here is at the cat fixture's 2520 patches, which §20's handoff already flags as the
 one shape the whole VL roofline rests on.
+
+### 22.3 Item 0r's real gate — TIR *can* match hand-written CUDA, but not as first written
+
+§22.2 left the risk that decides the item: the shipping kernel has to be TIR (CLAUDE.md), and
+break-even needs **1.33 TFLOP/s** where dlight's default fp32 matmul gets 1.03.
+[scripts/vit_flash_tir.py](scripts/vit_flash_tir.py) is the same algorithm as the `.cu` probe,
+written in TIR against a **symbolic** sequence length, verified against a NumPy reference at two
+sequence lengths that exercise the partial-tile paths (max abs diff 6.0e-8 / 6.5e-8).
+
+**First writing: 0.78 TFLOP/s — 0.44× the CUDA and *below* dlight.** On that number item 0r is dead.
+It was not TIR's ceiling; it was two defects, both visible in the generated CUDA and both general:
+
+| defect | what the emitted source showed | fix | worth |
+|---|---|---|---|
+| register tiles in **local memory** | `float acc[16]` indexed as `acc[i*4 + j]` by a *loop variable* — that is local memory, which is DRAM-backed, not registers | `T.grid`/`T.serial` → **`T.unroll`** on every register-tile loop, so every index is a literal | the bulk of it |
+| **padding silently removed** | `Qs[... + i*64 + k]` — stride **64**, not the 65 the source asks for | `CompactBufferAllocation` shrinks a buffer to the region actually *touched*, so a pad column that is never written does not exist. Write it once | the rest |
+
+Together: **0.78 → 1.75 TFLOP/s**, i.e. **0.99× of the hand-written CUDA** and **1.70× dlight**.
+
+| seq | ms/layer | TFLOP/s | % of peak | vs the `.cu` probe |
+|---:|---:|---:|---:|---:|
+| 1260 | 2.86 | 1.71 | 32.0% | 0.96× |
+| **2520** | **11.13** | **1.75** | 32.9% | **0.99×** |
+| 5040 | 44.19 | 1.77 | 33.2% | 1.00× |
+
+**Item 0r's rate risk is closed.** TIR reaches the ceiling the probe measured, with 32% of headroom
+over break-even. What remains is integration, not feasibility: fp16 I/O so the kernel absorbs the
+casts, wiring into `qwen3_vl_vit.py`, and the 184/184 gate.
+
+⚠️ **Both TIR traps are worth carrying forward beyond this item.** They are invisible in the TIR
+source, cost 2.25× together, and neither produces a warning — the only way either was found was
+reading the emitted CUDA. **Any hand-written TIR kernel in this repo should be checked for both**,
+and `scripts/moe_dump_cuda.py` already does exactly that job for the MoE.
+
+### 22.4 …and the baseline it should be measured against, which is not 14.71
+
+Measured this session at three patch counts, `vit_attn_bench.py --static --prescale --cublas`
+(the shipped configuration), end-to-end on the VM — the only number comparable across a cuBLAS
+offload:
+
+| seq | the block today | **TIR flash** | ratio |
+|---:|---:|---:|---:|
+| 1260 | 3.61 | **2.86** | 0.79× |
+| **2520** | **13.46** | **11.13** | **0.83×** |
+| 5040 | 52.66 | 44.19 | 0.84× |
+
+The ratio is flat across a 4× range of patch counts, and flash's cost is exactly quadratic in `seq`
+(2.86 → 11.13 → 44.19 is 3.9× and 4.0×), so **§20's reliance on the cat fixture's one shape does not
+bias this item** — the first shape-coverage answer the VL work has had.
+
+⚠️ **But the baseline is 13.46 here and §20.9's traced sum is 14.71, an unexplained 8.5%.** Unpinned
+clocks would make this session *slower*, not faster, so it is not that. Taking the like-for-like pair
+— both measured in one session, one clock state — the honest value of item 0r is:
+
+| | §20.9 filed | §22.2 | **§22.4, like-for-like** |
+|---|---:|---:|---:|
+| saving | ~89 ms/iter | ~44 | **~28 ms/iter** |
+| `image_embed` | 223 → ~135 | → ~180 | → **~195** |
+| ttft | 373 → ~285 | → ~329 | → **~345 (−7.5%)** |
+
+**Resolve the 8.5% with a trace before costing the integration**, because that gap is now larger than
+a third of the prize. The item is still worth doing and is still the largest open VL lever; it is
+worth a third of what it was filed at, and the three re-pricings all moved the same direction for the
+same reason — an estimate built on a rate that was never measured at the shape it was quoted for.
