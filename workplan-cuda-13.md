@@ -977,6 +977,8 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `8da5f2fc` | both remaining leads filed as items **0l** and **0m** |
 | `741bca7f`, `b7922474`, `baade217` | **§19** session record — 0l refuted, 0m fixed; the padding-row-compute premise retracted where asserted; item **0o** filed and queued |
 | `0a563a09` | **§20** item **0o** — the first VL performance numbers; cuBLAS net-negative on the tower; `MLC_BLAS_SKIP_FP32` (default `1`), ttft −8.9%, gate 184/184 exact with a to-the-digit `=0` control; `--perf-vl5`; the gate's `image_embed` hoist; item **0p** filed |
+| `12e7a95d`, `06760850`, `d0df9b9f` | commit-table backfill; the submodule loose end closed (`dff702c` pushed, pointer advanced by `3281f97f`); the VL default-lib trap flagged |
+| `0e285ea7` | **§20.5–§20.7** item **0p** half done — `vit_attn_bench.py` (1.3% fidelity); **the wall is 184.8 GB/s, not 156**, so softmax is at 98.5% and closed; symbolic shapes refuted (6.5%); prescaling worth **0.00 ms alone**, which retires §20.3's guard and unlocks 70 ms via cuBLAS. `image_embed` 293 → **223**, ttft → **372.88**, gate 184/184 exact. Item **0q** filed |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
