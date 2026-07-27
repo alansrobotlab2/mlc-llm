@@ -1031,11 +1031,22 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > `--indptr-file tuning/expert_hist_35b.npz`). Note that B=1024 is the one shape where synthetic
 > routings are all that exist; §19.3's short-prompt numbers use them and say so.
 >
-> ### The VL path
+> ### Start here: item 0o, the first VL performance number
 >
-> `dist/qwen3_5-0.8B-vl-q0f16/lib_cublas.so` is the first VL lib at **default `--opt`** (cuBLAS on),
-> and it gates **184/184**. §18.12's workaround (`cublas_gemm=0`) is no longer needed. Still true:
-> **no VL performance number has ever been taken on this box.**
+> `dist/qwen3_5-0.8B-vl-q0f16/lib_cublas.so` is the first VL lib at **default `--opt`** (cuBLAS on)
+> and it gates **184/184**, so §18.12's `cublas_gemm=0` workaround is retired — and `lib.so`, the
+> old workaround build, is now the other half of a free A/B. **No VL performance number has ever
+> been taken on this box in any configuration**, which makes it the largest unmeasured surface here
+> and the cheapest thing to fix: one harness, no compiles.
+>
+> Three separable numbers — `image_embed`, `prefill`, `decode` — from an extension of the
+> `--greedy-parity-vl5` driver ([validate.py:1180](validate.py#L1180)), which already makes all three
+> calls on the raw VM. **Do not reach for `scratch_mlc_tg_sweep.py`: `MLCEngine` cannot drive this
+> model's vision tower** (its `image_embed` call site is the llava signature, and `ImageData`
+> hardcodes the embed size). Item 0o has the details and the two other traps.
+>
+> Item **0n** is the MoE follow-up and is a measurement too, but it is the deeper hole; 0o is the one
+> that costs nothing and closes a gap nobody has looked at.
 >
 > <details><summary>Handoff, end of 2026-07-26d (superseded)</summary>
 >
@@ -1242,7 +1253,8 @@ that §7 said to commit was still ignored; the exception now covers both names a
 >
 > | item | state | worth |
 > |---|---|---|
-> | **0n — START HERE** | **new (§19.8)**; a measurement, not a build. Why is `BLK_M=64` 30–40% slower at B=1024 when it launches the *same* CTAs over the *same* rows? | it is the only unexplained term left in the MoE GEMM, and every wide-tile idea has died on it |
+> | **0n** | **new (§19.8)**; a measurement, not a build. Why is `BLK_M=64` 30–40% slower at B=1024 when it launches the *same* CTAs over the *same* rows? | it is the only unexplained term left in the MoE GEMM, and every wide-tile idea has died on it |
+> | **0o — START HERE** | **new**; the first VL performance number, in any configuration. One harness, no compiles — both libs already exist and are gated | it is the only part of this model nobody has measured *at all*, and §19.6 just made the A/B possible. ⚠️ the engine cannot drive the vision tower — see the entry |
 > | ~~**0l**~~ | ✅ **built, §19.1–§19.4 — and it refutes its own premise.** The mechanism works (`BLK_M=16` control: 1.00× where 0k cost 5–9%); the hypothesis it was built on does not | closed. pp128 is still −9.1% end-to-end, so no wider tile is Pareto and the defaults are unchanged |
 > | ~~**0m**~~ | ✅ **fixed, §19.5–§19.7** — two ops, both in the VL patch merger; the guard declines exactly those two matches | a default-`--opt` VL lib now compiles and gates **184/184** |
 > | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
@@ -1289,6 +1301,47 @@ still blocked (§8).
 *Why it matters.* §18.9's frontier has killed every wide-tile idea at the short-prompt end, and
 §19.3 shows the mechanism everyone assumed is worth 0–3% of a 31–40% gap. Until this term is named,
 any further wide-tile work is guessing — which is precisely how items 0h, 0k and 0l were each costed.
+
+**0o. Take the first VL performance number — and do not reach for the engine to do it.**
+
+*Why now.* No VL performance number has ever been taken on this box, in any configuration. §19.6 made
+the missing half of the A/B exist: `dist/qwen3_5-0.8B-vl-q0f16/lib.so` is §18.12's `cublas_gemm=0`
+build and `lib_cublas.so` is the default-`--opt` one with 20 cuBLAS offloads, so **the first
+measurement costs one harness and no compiles.** Both libs are gated (§18.14, §19.7).
+
+*What separates into three numbers.* `image_embed` (vision tower + patch merger, once per image),
+`prefill` of the merged sequence, and `decode`. They have different shapes and different consumers —
+a chat turn pays `image_embed` once and `decode` hundreds of times — so a single ttft figure would
+hide the thing worth knowing.
+
+*How, and what to reuse.* Extend the `--greedy-parity-vl5` driver
+([validate.py:1180](validate.py#L1180)): it already loads lib + params, preprocesses the fixture, and
+calls `image_embed` / `embed` / `prefill` / `decode` directly on the VM. A perf harness is that driver
+minus the reference comparison, plus `dev.sync()` and timing around each call.
+
+*⚠️ Three traps, all of them already visible in that driver.*
+
+1. **Do not time the loop.** It merges image embeddings into the text embedding **on the host** —
+   `image_embeds.numpy()`, a numpy scatter, then a re-upload — per prompt. Timing the loop measures
+   numpy. Time the three VM calls individually, with a sync on each.
+2. **`image_embed` is called inside the per-prompt loop**, under a comment reading "same image across
+   prompts; could cache but cheap". **"Cheap" is untested.** It is the first thing to measure, and if
+   it is wrong the gate has been paying it five times over.
+3. **`MLCEngine` cannot drive this model's vision tower, so `scratch_mlc_tg_sweep.py` is not the
+   instrument.** [cpp/serve/model.cc:144](cpp/serve/model.cc#L144) calls
+   `image_embed(image, resize_h, resize_w, crop_h, crop_w, params)` — the llava signature — while
+   Qwen3.5-VL's takes `(pixel_values, pos_embeds, rotary_cos, rotary_sin, params)`; and `ImageData`
+   hardcodes `embed_size` to 576/1921 ([serve/data.py:107](python/mlc_llm/serve/data.py#L107)).
+   **Serving the VL model is a separate and much larger piece of work than measuring it** — do not
+   let the two merge. Every 35B/0.8B throughput number in this document came from the engine; none of
+   that tooling transfers here.
+
+*What the A/B can and cannot answer.* Both libs differ in the text stack as well as the tower — a
+`q0f16` text build offloads 13 matmuls on its own (§19.6) — so a whole-model delta does not attribute
+itself. Split by call before comparing. If the tower turns out to be where cuBLAS matters, the
+follow-up question is whether the **two declined merger matmuls** (3072×3072 and 1024×3072, over
+`num_patches // 4` rows) are worth recovering by giving them a bare-`tir.Var` shape, which would make
+them eligible again.
 
 **0l. ✅ DONE, §19.1–§19.4 — the mechanism works and the premise does not. Historic entry below.**
 Built as `MLC_MOE_GEMM_V2_ROWSPEC=1`, though as a *predicate on a constant-extent loop* rather than
