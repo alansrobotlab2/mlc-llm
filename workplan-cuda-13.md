@@ -1002,6 +1002,7 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `965716e7` | **§22.5** the two TIR traps audited against the shipped kernels — neither is live |
 | `c1a65407` | **§22.6** item **0s** end to end — `lib_opspec_a64` pp128 −6.0% / pp512 +3.5% / pp2048 +12.8%; the baseline reproduces §19.4 to 0.2%; state gate 139/139 both modes. Still not Pareto, defaults unchanged |
 | `e973210a`, `8c14d702` | §9 brought current; final handoff — every remaining item is a build, not a measurement |
+| `3f08c74d`, `d806d1e8` | commit-table backfill; **§23** item **0r** LANDS — `vit_flash_attn.py`, VL ttft **372.66 → 322.19 ms (−13.5%)**, `image_embed` −22.6%, gate 184/184 exact, default ON, `lib_vl3.so` |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
@@ -1037,11 +1038,12 @@ that §7 said to commit was still ignored; the exception now covers both names a
 ### Start here next session
 
 > **Handoff, end of 2026-07-27c.** Branch `qwen3_5`, **no uncommitted work** — `git status` is
-> `?? COLCON_IGNORE` alone. **Defaults are unchanged on every model**; the shipping libs are the same
-> three as yesterday: 35B `lib_blkk64.so`, VL `lib_vl2.so`, 0.8B text `lib_ksplit4.so`.
+> `?? COLCON_IGNORE` alone. **One default changed: the VL tower now uses flash attention** and ships
+> as `lib_vl3.so` (§23) — ttft **372.66 → 322.19 ms, −13.5%**, gate 184/184 exact. The other two libs
+> are unchanged: 35B `lib_blkk64.so`, 0.8B text `lib_ksplit4.so`.
 >
-> **The session in one line: four occupancy models were checked against measurement and all four got
-> the sign wrong.** Shared memory was ranked first as the wide tile's cost and is worth 1.00×; a guard
+> **The session shipped one change and refuted four models.** Item 0r landed (VL ttft −13.5%), and
+> four separate occupancy models were checked against measurement and all four got the sign wrong. Shared memory was ranked first as the wide tile's cost and is worth 1.00×; a guard
 > that removes work cost 24% while *raising* occupancy; flash attention's 8-CTA tile is slower than
 > its 3-CTA one; and the winning MoE guard gains 10% while *losing* a resident CTA. The only resource
 > model that predicted correctly was the register file — and only because it was read out of `ptxas`
