@@ -969,6 +969,8 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `7c6789ff` | **§18.15** the 35B against the original, measured end to end rather than chained |
 | `7f71e2ab` | **§18.14** the VL gate gets a margin — the one divergence is a 0.05-nat near-tie, PASS |
 | `8da5f2fc` | both remaining leads filed as items **0l** and **0m** |
+| `741bca7f`, `b7922474`, `baade217` | **§19** session record — 0l refuted, 0m fixed; the padding-row-compute premise retracted where asserted; item **0o** filed and queued |
+| `0a563a09` | **§20** item **0o** — the first VL performance numbers; cuBLAS net-negative on the tower; `MLC_BLAS_SKIP_FP32` (default `1`), ttft −8.9%, gate 184/184 exact with a to-the-digit `=0` control; `--perf-vl5`; the gate's `image_embed` hoist; item **0p** filed |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
