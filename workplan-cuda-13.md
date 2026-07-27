@@ -4266,3 +4266,27 @@ inherited state path is unresolved, because nothing here measures the margin.** 
 it is small and already specified by §16.1: give `--greedy-parity-vl5` the margin-gated scoring
 `high_margin_gate.py` uses, then re-run. Until then the five state-path changes (§11, §13, §14, §15,
 §16.5) remain **ungated on the VL path** — less ungated than before this session, and not cleared.
+
+### 18.14 The 35B against the original, measured — not quoted
+
+Every "overall" figure in this document chains ratios taken on the filler prompt across five sessions
+and different clock states. This is the whole span measured directly: the **original**
+`dist/qwen3_6-35B-A3B-q4f16_1/lib.so` (2026-07-24, before §14/§15/§16/§17) against tonight's libs, on
+prose, `radix`, one clock state, 3 runs after 1 warmup.
+
+| | original (2026-07-24) | shipped `lib_blkk64` | best measured tonight |
+|---|---:|---:|---:|
+| **pp512** | 361.59 | 827.39 (**2.29×**) | 850.39 — `m32rows` (**2.35×**) |
+| **pp2048** | 399.83 | 945.00 (**2.36×**) | 1063.48 — `hoist64` (**2.66×**) |
+| **tg512** (after pp512) | 54.10 | 59.99 (+10.9%) | 60.01 (+10.9%) |
+| ttft pp2048 | 5122.5 ms | 2167.2 ms | **1925.8 ms** |
+
+**The prefill work is a 2.3–2.4× on the shipped default and up to 2.7× on the frontier, and decode
+picked up ~11% along the way** — decode was never the target of any of it, so that is fusion and
+state-path work paying off incidentally.
+
+Two things worth noting against the headline table at the top of this document. The **355 tps** it
+records for "start of 2026-07-25c" is a *filler* number, and the original lib measures **361.59** on
+prose — so in this one case the filler was not optimistic and the two agree within 2%. And the
+overall multiplier there (+147%) is the pp512 chain; measured end-to-end it is **+129%** for the
+shipped lib. The chain was close, but it was a chain.

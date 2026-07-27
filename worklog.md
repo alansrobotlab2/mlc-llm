@@ -92,6 +92,18 @@ Monotone in one parameter (padded row-space per CTA), no exception in 12 cells, 
 - **To actually clear it:** port `high_margin_gate.py`'s margin scoring into `--greedy-parity-vl5`. Small, and
   already specified. Until then the five inherited state-path changes stay ungated on the VL path.
 
+**The 35B against the original, measured rather than chained (§18.14)** — prose, radix, one clock state:
+
+| | original 2026-07-24 | shipped blkk64 | best tonight |
+|---|---|---|---|
+| pp512 | 361.59 | 827.39 (2.29x) | 850.39 m32rows (2.35x) |
+| pp2048 | 399.83 | 945.00 (2.36x) | 1063.48 hoist64 (2.66x) |
+| tg512 | 54.10 | 59.99 (+10.9%) | 60.01 |
+| ttft pp2048 | 5122.5 ms | 2167.2 ms | 1925.8 ms |
+
+Decode was never the target of any of this work and picked up ~11% anyway. The headline table's
+"+147%" is a chain of filler ratios; measured end to end it is **+129%** for the shipped lib.
+
 **Next**
 - **The next MoE lever is fuller tiles, not bigger ones** (§18.11). Every config measured picks one
   compile-time tile height and accepts the routing's padding. A per-expert tile height chosen from `indptr`
