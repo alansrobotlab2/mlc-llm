@@ -1263,6 +1263,11 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > `import tvm`. GPU clocks are pinned at max already; `jetson_clocks` itself needs an interactive
 > sudo this box does not have non-interactively.
 >
+> ⚠️ **`--mlc-lib` is not optional on the VL model any more.** `validate.py` defaults to
+> `<model-dir>/lib.so`, and for VL that is still §18.12's `cublas_gemm=0` build — now the **worst of
+> the three** on ttft (459.25 vs `lib_nofp32blas`'s 443.20). Same shape as the 35B, whose current lib
+> is `lib_blkk64.so` rather than `lib.so`; name the lib explicitly on every VL run.
+>
 > **Never run two benchmarks at once, and do not conclude one has died because it is quiet.**
 > `pgrep -f "mlc_llm compile"` **matches the polling shell itself**, because that string is in the
 > poll loop's own command line — a finished 35B compile looked like it was still running for ~20
