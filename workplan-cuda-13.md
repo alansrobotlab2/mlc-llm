@@ -5547,3 +5547,53 @@ of the bandwidth wall, not at it. The tax also shrinks with the padding share (0
 and the wide tile already *wins* at 37%), so the win concentrates at intermediate B and has to be
 measured there, at real routing, not extrapolated from B=1024. `moe_rowspec_ab.py` and
 `moe_occupancy_ab.py` both take `--indptr-file`, so this needs **no model compile** to rank.
+
+### 21.7 Item 0s built — half of it is a Pareto gain on the wide tile, half is a trap
+
+Built the same session it was filed, because §21.3 had already named the term and bounded it.
+`MLC_MOE_GEMM_V2_OPSPEC` ∈ `{0, 1, a, x}`, default **`0`**; requires `HOIST=1` and is inert at
+`BLK_M=16` by construction. [scripts/moe_opspec_ab.py](scripts/moe_opspec_ab.py) ranks the halves
+separately — which is the whole point, and is what §21 exists to enforce.
+
+**Bit-exact in 40/40 cells** (24 real-routing, 16 synthetic) against the shipped `BLK_M=16`, and both
+discipline checks pass: `OPSPEC=1` at `BLK_M=16` is byte-identical to `OPSPEC=0`, and the shipped
+kernel is byte-identical before and after the edit.
+
+Against `rowspec64` — i.e. what item 0s itself bought, at `HOIST=1` + `ROWSPEC=1`, `gate_up` / `down`:
+
+| routing | padding @64 | **`+a`** | `+x` | `+ax` |
+|---|---:|---:|---:|---:|
+| B=1024, synthetic | 94% | 1.10× / 1.08× | 0.76× / 0.74× | **1.15× / 1.14×** |
+| B=64, `decode_len512` | 97% | 1.05× / 1.01× | 0.68× / 0.74× | **1.13× / 1.07×** |
+| B=4096, `prose_len512` | 68% | **1.05× / 1.03×** | 0.72× / 0.71× | 0.98× / 1.00× |
+| B=16384, `prose_len2048` | 37% | **1.01× / 0.99×** | 0.71× / 0.73× | 0.90× / 0.91× |
+
+**Half "a" — the A-fragment load guard — is a Pareto improvement on the wide tile**: 0.99–1.10× across
+every measured shape, and it is largest exactly where the padding share is largest, which is what a
+padding-row cost has to do. Best absolute against the shipped `BLK_M=16`: `prose_len512` `gate_up`
+goes **1.07× → 1.13×**, and `prose_len2048` is a tie at 1.59–1.60× (nothing to win at 37% padding).
+
+**Half "x" — the `X_shared` store guard — loses 25–32% everywhere, and it emits strictly less work.**
+The generated source is the unguarded body wrapped in one CTA-uniform `if`, nothing else. The tell is
+in ptxas: registers go **64 → 48** and resident CTAs *up* 4 → 5. Fewer live `condval` values means
+fewer X loads in flight — the branch stops the four independent global loads being hoisted and issued
+together, and the loop goes latency-bound. **A guard that removes work can still cost 30% by
+collapsing memory-level parallelism**, and no amount of reasoning about work would have found it.
+
+**Occupancy moves opposite to performance in both halves, which is the cleanest confirmation §21.3
+gets.** `+a` gains 10% while *losing* a resident CTA (64 → 80 registers, 4 → 3 CTAs); `+x` loses 24%
+while *gaining* one. Anyone re-deriving this kernel from an occupancy model will get both signs wrong.
+
+**What it does not do: make any wide tile Pareto.** At the pp128 scale the best wide leg is still
+0.83× / 0.71× of the shipped `BLK_M=16`, because §21.1's register floor is untouched — item 0s
+removes traffic, not accumulators. §21.3's decomposition predicted the ceiling and this lands inside
+it: the 0.81× / 0.75× residual improves to **0.93× / 0.85×** against the 0.89× / 0.80× occupancy
+bound, so item 0s recovers **12 of 19** residual points on `gate_up` and **10 of 25** on `down`. The
+rest is the accumulator init/store tail and the predicated-off global store loop, both of which scale
+with `BLK_M` and neither of which is traffic.
+
+**Defaults are unchanged.** `BLK_M=16` still ships, `OPSPEC=0`. What changed is the frontier's upper
+envelope: any future wide-tile leg should be built with `OPSPEC=a`, and `x` should not be built at
+all. `lib_rowspec64` (§19.4) is now superseded as the best-known wide configuration by
+`BLK_M=64 + HOIST + ROWSPEC + OPSPEC=a`, which has never been compiled end to end — that is the one
+loose end this item leaves, and §19.4's pp128 −9.1% is the number it would have to beat.

@@ -663,6 +663,44 @@ def _dequantize_group_gemm_v2(
     # stops TVM eliminating the unit loop, so an unconditional tag would change the
     # generated code of the shipped default.
     _rowspec_active = ROWSPEC and BLK_M // MICRO > 1
+    # Item 0s (§21.6): ROWSPEC skips the padding fragments' *multiply*, and §19.3 measured
+    # that at 3% of a 31-40% gap. §21.3 then decomposed the rest: occupancy is 11 of the
+    # 28 lost points on gate_up and 20 of 40 on down, and the residual -- 0.81x / 0.75x --
+    # is the operand traffic feeding the multiply ROWSPEC already skipped. Two producers,
+    # both one level *above* the loop 0k and 0l guarded, both barrier-free:
+    #
+    #   "a"  the A-fragment `load_matrix_sync`. `A_mat` is attached at k_o_i, above i_o,
+    #        so all BLK_M/MICRO fragments are loaded on every k-step.
+    #   "x"  the X_shared cooperative store. The global *load* is already predicated on
+    #        `row_end` (padding rows cost no DRAM), but the shared store and its `condval`
+    #        are paid regardless.
+    #
+    # Predicated, not shortened: §19.1 measured that a runtime extent costs 5-9% by
+    # blocking the unroll, whichever way the guard falls.
+    #
+    # Skipping "x" leaves those X_tile rows holding whatever the previous k-step wrote.
+    # That is safe, and the partition is what makes it safe: A-fragment `i` reads exactly
+    # rows [i*MICRO, (i+1)*MICRO), which is exactly the range store iteration `i` writes,
+    # so a real fragment never reads a skipped one's rows. Downstream, a skipped
+    # fragment's accumulator reaches O_tile but its global store is predicated off by
+    # `m_offset + i < row_end` -- the same bit-exactness argument as 0f, 0k and 0l.
+    OPSPEC = os.environ.get("MLC_MOE_GEMM_V2_OPSPEC", "0").lower()
+    assert OPSPEC in ("0", "1", "a", "x"), (
+        "MLC_MOE_GEMM_V2_OPSPEC is 0 (off), 1 (both), a (A-fragment loads only) or "
+        f"x (X_shared stores only); got {OPSPEC!r}"
+    )
+    # Inert at BLK_M=16 for the §18.10 reason: both guarded loops have extent 1 there, and
+    # an `sch.annotate` alone is enough to stop TVM eliminating a unit loop. The width test
+    # comes *before* the HOIST precondition below, so that setting OPSPEC globally does not
+    # break the shipped BLK_M=16 build, where the flag cannot do anything either way.
+    _amat_spec = OPSPEC in ("1", "a") and BLK_M // MICRO > 1
+    _xstore_spec = OPSPEC in ("1", "x") and BLK_M // MICRO > 1
+    # Same legality precondition as ROWSPEC, and same reason to fail here rather than in
+    # ThreadSync: without the hoist, i_o encloses the cooperative loads' barriers. The
+    # X_shared store loop is barrier-free either way, but the A_mat nest is not.
+    assert not ((_amat_spec or _xstore_spec) and not HOIST), (
+        "MLC_MOE_GEMM_V2_OPSPEC requires _HOIST=1, for the reason _ROWSPEC does"
+    )
     tiles_per_n = (N + BLK_N - 1) // BLK_N
     assert N % BLK_N == 0, "v2 requires N % BLK_N == 0 (no col padding)"
 
@@ -898,13 +936,21 @@ def _dequantize_group_gemm_v2(
             sch.compute_at(blk, k_o_o, preserve_unit_loops=True)
             loops = sch.get_loops(blk)[-2:]
             fused = sch.fuse(*loops)
-            _, fy, fx, fv = sch.split(fused, factors=[None, TY, WARP, VEC])
+            fo, fy, fx, fv = sch.split(fused, factors=[None, TY, WARP, VEC])
             sch.bind(fy, "threadIdx.y")
             sch.bind(fx, "threadIdx.x")
             sch.vectorize(fv)
             sch.storage_align(blk, 0, axis=-2, factor=16, offset=8)
+            return fo
 
-        _coop(x_shared)
+        # Item 0s, half "x". `fo` indexes whole MICRO-row blocks of the (BLK_M, BLK_K)
+        # tile -- one split step is TY*WARP*VEC = 1024 elements = 16 rows of BLK_K=64 --
+        # so it shares `moe_row_guard`'s predicate exactly: block `fo` is live iff
+        # `fo * MICRO` is still inside the expert's rows. The loop carries no barrier of
+        # its own (the k_o_o pair brackets both cooperative blocks), so it is predicable.
+        x_coop_outer = _coop(x_shared)
+        if _xstore_spec:
+            sch.annotate(x_coop_outer, "moe_xstore_guard", 1)
         # NB: VEC is capped at 4 here and cannot be widened to cover a whole uint32.
         # At VEC=4 a thread unpacks 4 of the 8 nibbles in a word, so thread pairs fetch
         # the same word; VEC=8 would fix that but the dequant's intermediate is a uint32
@@ -951,6 +997,12 @@ def _dequantize_group_gemm_v2(
         sch.unroll(ai0)
         sch.unroll(aj0)
         sch.tensorize(ai1, intrin_group["load_a"])
+        # Item 0s, half "a". `ai0` counts A fragments exactly as the compute nest's `i_o`
+        # does, so it takes the same predicate. It is tagged after the tensorize so the
+        # annotation lands on the surviving fragment loop rather than on the loop that
+        # `load_matrix_sync` replaced.
+        if _amat_spec:
+            sch.annotate(ai0, "moe_amat_guard", 1)
 
         bi, bj = sch.get_loops(B_mat)[-2:]
         bi0, bi1 = sch.split(bi, factors=[None, MICRO])
@@ -1210,9 +1262,62 @@ def _dequantize_group_gemm_v2(
                       f"body={str(h.body)[:120]!r}")
         return func.with_body(body)
 
+    # ---------- item 0s: predicate the padding rows' *operand traffic* ----------
+    def _specialise_operand_loads(func, tags):
+        """Same predicate as item 0l, applied one level up.
+
+        §21.3 decomposed `BLK_M=64`'s 0.72x / 0.60x at B=1024 into occupancy (0.89x /
+        0.80x, measured with an instruction-identical shared-pad control) and a 0.81x /
+        0.75x residual. §19.3 had already bounded the padding *multiply* inside that
+        residual at 3%, so the residual is the traffic that feeds it: four A-fragment
+        `load_matrix_sync` per k-step and four `X_shared` cooperative stores, where a
+        `BLK_M=16` CTA does one of each for the same output.
+
+        Both loops count MICRO-row blocks, so both take `moe_row_guard`'s predicate
+        verbatim. Handled together rather than in two passes because they are one claim:
+        a fragment's operands are dead exactly when the fragment is.
+        """
+        m_off, row_end = _cta_row_bounds(func)
+        hits: dict = {t: [] for t in tags}
+
+        def _rewrite(n):
+            if not isinstance(n, tirx.For) or n.thread_binding is not None:
+                return None
+            tag = next((t for t in tags if t in (n.annotations or {})), None)
+            if tag is None:
+                return None
+            hits[tag].append(n)
+            live = n.loop_var * tirx.IntImm(n.loop_var.dtype, MICRO) < (row_end - m_off)
+            return tirx.For(
+                n.loop_var, n.min, n.extent, n.kind,
+                tirx.IfThenElse(live, n.body, None),
+                n.thread_binding, n.annotations,
+            )
+
+        body = tirx.stmt_functor.ir_transform(func.body, None, _rewrite, ["tirx.For"])
+        for tag, got in hits.items():
+            # One each, unlike `moe_row_guard`: neither loop is duplicated by
+            # `blockize`/`reverse_compute_at`, so a count of 2 means the schedule moved
+            # and the guard is landing somewhere it was not reasoned about.
+            if len(got) != 1:
+                raise RuntimeError(
+                    f"expected exactly 1 `{tag}` loop, found {len(got)}; "
+                    "the schedule dropped or duplicated it"
+                )
+        if os.environ.get("MLC_MOE_GEMM_V2_OPSPEC_DEBUG"):
+            for tag, got in hits.items():
+                for h in got:
+                    print(f"[0s] {tag}: var={h.loop_var.name} extent={h.extent} "
+                          f"body={str(h.body)[:120]!r}")
+        return func.with_body(body)
+
     scheduled = _schedule_v2()
     if _rowspec_active:
         scheduled = _specialise_row_fragments(scheduled)
+    _opspec_tags = (["moe_amat_guard"] if _amat_spec else []) + \
+                   (["moe_xstore_guard"] if _xstore_spec else [])
+    if _opspec_tags:
+        scheduled = _specialise_operand_loads(scheduled, _opspec_tags)
     # Item 0k, opt-in while it is being measured. Inert at BLK_M=16, where the row loop
     # has extent 1 and the only tile it can shorten is a padding CTA that item 0f already
     # skips whole.
