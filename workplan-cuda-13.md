@@ -5811,3 +5811,26 @@ because it has now cost three separate estimates: **a rate quoted at a shape or 
 not measured at.** §20.9 quoted cuBLAS's 51% of peak for a kernel nobody had written; §22.2 quoted a
 traced baseline against a bench candidate; §22.4's first version quoted a `--static` baseline against
 a symbolic one. The fix each time was one measurement on the matching leg.
+
+### 22.5 Audit: are §22.3's two traps live anywhere that ships?
+
+Both defects cost 2.25× together, are invisible in the TIR source, and produce no warning, so the
+first thing to do with them is check the kernels already in the tree. **Neither is live.**
+
+- **Padding stripped by compaction.** No shipped hand-written kernel pads a shared buffer in its
+  `sblock_alloc_buffer` shape. The MoE GEMM's 72-half row stride comes from `sch.storage_align`,
+  which is a schedule primitive and sets the stride explicitly rather than relying on the declared
+  shape — confirmed in the emitted CUDA, which reads `... * 72` throughout (§21.1's dumps).
+- **Register tiles in local memory.** The multi-element `scope="local"` buffers in the tree
+  (`moe_misc.py`'s top-k, `top_p_pivot.py`, `batch_spec_verify.py`) are all indexed by **Python-level**
+  `for i in range(k)` loops, which unroll at trace time into literal indices. `moe_matmul.py`'s
+  `O_tile` is tensorized into a `wmma.accumulator` before codegen.
+
+One unrelated thing the audit turned up, recorded rather than fixed:
+[moe_misc.py:39](python/mlc_llm/op/moe_misc.py#L39) writes `local_top_k_index` at `indices=[-1]`
+`k_val` times instead of `indices=[t]`, so the index array is never initialised and there is an
+out-of-bounds store. It is benign — `local_top_k` is seeded with `min_value`, so every slot is
+overwritten during the 256-expert scan before it is read — and it is **not on this project's path**:
+`gating_topk` is called by `deepseek_v2` and `llama4`, while qwen3-MoE routes through
+`gating_softmax_topk` → `_get_topk_softmax_norm_func_v2` (this project's own `535403c3`). Left alone
+because there is no model here to gate a change to it with, which is the same rule §19 used.
