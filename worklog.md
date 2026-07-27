@@ -73,12 +73,26 @@ Monotone in one parameter (padded row-space per CTA), no exception in 12 cells, 
 - **Do not edit a source file while a job is reading it.** TVM re-parses the TIR per case; a live edit killed
   a running A/B midway.
 
+**VL re-gate — ran for the first time since f667b07e (May), and it is "not cleared" (§18.12-§18.13)**
+- Three pieces of environment drift, none of them a download: `BLASDispatch` dies on the VL graph
+  (`Expect TensorStructInfo, but received: relax.ShapeStructInfo`), and `pillow` + `torchvision` were
+  both missing since the re-bootstrap.
+- **The compile break is VL-specific, established by one probe**: text-only q0f16 compiles fine through
+  the *same* default pipeline. So something in the vision tower hands the cuBLAS matcher a ShapeStructInfo.
+  `cublas_gemm` auto-enables only for q0f16, which is why no q4 build in this document ever hit it.
+  Workaround `--opt "flashinfer=1;cublas_gemm=0;cudagraph=1"`; a default-O2 VL build remains broken.
+- `torchvision==0.26.0+cu130` is on PyPI and imports cleanly against torch 2.11.0+cu130 — no Jetson wheel hunt.
+- **Gate: 167/184 (90.8%) against a 96% bar — but 4 of 5 prompts are token-identical (155/155).** The whole
+  deficit is one divergence at step 12, MLC `.` vs HF `,`, right after a grammatically complete clause on a
+  prompt asking for *one short sentence*. That is a near-tie signature — and **§16.1 is precisely the section
+  that established raw match counts cannot tell a near-tie from a regression.** The vl5 harness predates that
+  lesson and scores an unweighted count.
+- Not comparable to f667b07e's 176/180 either: the reference was rebuilt under transformers 5.14.1 and is a
+  *different* reference (prompt 1 is 29 tokens, was 25; total 184, was 180).
+- **To actually clear it:** port `high_margin_gate.py`'s margin scoring into `--greedy-parity-vl5`. Small, and
+  already specified. Until then the five inherited state-path changes stay ungated on the VL path.
+
 **Next**
-- **VL re-gate is blocked by a real compile break, not by a download.** `--model-type qwen3_5_vl` converts
-  (383 params, vision tower included) but `BLASDispatch` dies:
-  `Check failed: (tensor_sinfo) is false: Expect TensorStructInfo, but received: relax.ShapeStructInfo`.
-  `cublas_gemm` auto-enables only for q0f16, which is why no q4 build ever hit it. Retrying with
-  `cublas_gemm=0`; the discriminating probe (does text-only q0f16 break too?) is running with it.
 - **The next MoE lever is fuller tiles, not bigger ones** (§18.11). Every config measured picks one
   compile-time tile height and accepts the routing's padding. A per-expert tile height chosen from `indptr`
   at dispatch time would attack fragmentation directly. Uncosted, but the first idea in three sessions that

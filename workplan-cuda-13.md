@@ -1170,7 +1170,7 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
 > | **0h** | re-costed by §18.9; the runtime branch is the **wrong shape of fix** (§18.11) | the frontier's upper envelope, ≤ +12.5% at pp2048 only |
 > | **fuller tiles, not bigger** | **new, uncosted — the first non-frontier idea in three sessions** | attacks fragmentation directly instead of trading it (§18.11) |
-> | **VL re-gate** | **not blocked** — checkpoint is local, only a compile is missing | correctness, not perf: five state-path changes never gated on that path |
+> | **VL re-gate** | ran, §18.13 — **not cleared**: 4/5 prompts token-identical, the 5th is a near-tie the harness cannot score. Needs `high_margin_gate`'s margin scoring ported into `--greedy-parity-vl5` | correctness. Also surfaced a **VL-only `BLASDispatch` compile break** (§18.12) |
 > | **0c.2** | de-prioritised; changes the arithmetic, so bit-exactness is off the table | ≤ +12.5% by Amdahl |
 >
 > §17 largely closed the MoE lane: **0g (`BLK_K`) landed at +14.1% pp512**, §17.7 rooflined the real
@@ -4214,8 +4214,55 @@ cleanly. That is legitimate for the re-gate, whose question is whether the *stat
 produces the right tokens — cuBLAS dispatch is a throughput choice, not a correctness one — but it
 means the VL lib gated here is not the lib a default `--opt O2` would produce.
 
-**The discriminating question is whether this is VL-specific or general to `q0f16` on this
-toolchain**, and it is one recompile: the text-only `dist/qwen3_5-0.8B-q0f16` config through the same
-default pipeline. If that also dies, the finding is "no unquantized model compiles at O2 on this
-box" — considerably larger than a VL bug, and invisible to every measurement in this document
-because they are all q4.
+**It is VL-specific, and that was worth one recompile to establish.** The text-only
+`dist/qwen3_5-0.8B-q0f16` config, through the *same* default pipeline with cuBLAS enabled, compiles
+cleanly. So this is not "no unquantized model compiles on this box" — `BLASDispatch` is fine on the
+text stack and something in the **vision tower's** graph hands the cuBLAS pattern matcher a
+`ShapeStructInfo` where it expects a tensor. `qwen3_5_vl_model.py`'s `image_embed` and
+`vision/qwen3_vl_vit.py` are where to look; the likely shape is an op whose argument is a `ShapeExpr`
+(a reshape target or a `strided_slice` bound) sitting inside a matmul pattern's match region.
+
+**Scope note for the re-gate that follows:** it runs on the `cublas_gemm=0` lib. That answers the
+question the re-gate exists to answer — do the five inherited state-path changes (§11, §13, §14,
+§15, §16.5) still produce the right tokens on the VL path — because cuBLAS dispatch is a throughput
+choice. It does **not** clear a default-`O2` VL build, which remains broken.
+
+### 18.13 The VL re-gate ran — and the result is "not cleared", not "passed" or "broken"
+
+With `pillow` and `torchvision==0.26.0+cu130` installed (both missing since the re-bootstrap; the
+matching `+cu130` build exists on PyPI and imports cleanly against `torch 2.11.0+cu130`), both legs
+run for the first time since `f667b07e` in May.
+
+| prompt | tokens matched |
+|---|---|
+| 1. "Describe this image in one short sentence." | **12/29** |
+| 2. "What animal is shown in the image?" | 50/50 |
+| 3. "What is the dominant color of the animal in this image?" | 50/50 |
+| 4. "Is this a domestic pet or a wild animal?" | 50/50 |
+| 5. "Give a one-word answer: …facial expression?" | 5/5 |
+| **aggregate** | **167/184 (90.8%)** — bar is 96%, so the harness prints **FAIL** |
+
+**Do not read that as a regression, and do not read it as a pass.** Four of five prompts are
+**token-identical, 155/155**. The whole deficit is one divergence, and decoding it shows what it is:
+
+```
+first diff at step 12:  MLC = 13 ('.')   HF = 11 (',')
+reference: "...walks through a snowy forest, its thick fur and distinctive markings..."
+```
+
+MLC ends the sentence where HF continues it — on a prompt that asked for **one short sentence**, at a
+point where the clause is already grammatically complete. That is the exact signature of a near-tie,
+and **§16.1 is the section that established raw match counts cannot distinguish a near-tie from a
+regression.** The `vl5` harness predates that lesson (May 2026) and scores an unweighted count against
+a 96% bar, which is the instrument §16.1 replaced for the text path.
+
+**It is also not comparable to `f667b07e`'s 176/180.** The reference was rebuilt tonight under
+transformers 5.14.1, and it is a *different reference*: prompt 1 is now 29 tokens where it was 25, and
+the total is 184 where it was 180. The old number was never going to reproduce.
+
+**So the VL path's status is: it builds (with `cublas_gemm=0`, §18.12), it loads, it runs, and it
+agrees exactly on four of five prompts. Whether the fifth is a near-tie or a real defect in the
+inherited state path is unresolved, because nothing here measures the margin.** The work to resolve
+it is small and already specified by §16.1: give `--greedy-parity-vl5` the margin-gated scoring
+`high_margin_gate.py` uses, then re-run. Until then the five state-path changes (§11, §13, §14, §15,
+§16.5) remain **ungated on the VL path** — less ungated than before this session, and not cleared.
