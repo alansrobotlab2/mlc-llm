@@ -71,11 +71,19 @@ class VisionAttnMath(nn.Module):
 
     prescale = False
     pv_cast = True
+    flash = False
 
     def forward(self, q, k, v):
         q32 = op.astype(q, "float32")
         k32 = op.astype(k, "float32")
         v32 = op.astype(v, "float32")
+        if self.flash:
+            # Item 0r as it is wired into the model, run through the same passes and
+            # dlight schedules as every other leg here — so the number is comparable to
+            # the row above it rather than to a standalone microbench.
+            from mlc_llm.op import vit_flash_attn
+            return op.astype(vit_flash_attn.flash_attention(q32, k32, v32, SCALING),
+                             "float16")
         k_t = op.permute_dims(k32, axes=[0, 2, 1])
         scale = nn.Tensor.from_const(np.array(SCALING, dtype="float32"))
         if self.prescale:
@@ -104,13 +112,14 @@ class VisionAttnMath(nn.Module):
 
 
 def build(target, seq, static: bool, prescale: bool = False, pv_cast: bool = True,
-          cublas: bool = False):
+          cublas: bool = False, flash: bool = False):
     from mlc_llm.compiler_pass.fuse_transpose_matmul import FuseTransposeMatmul
 
     s = seq if static else "num_patches"
     m = VisionAttnMath()
     m.prescale = prescale
     m.pv_cast = pv_cast
+    m.flash = flash
     mod, _ = m.export_tvm(
         spec={
             "forward": {
@@ -161,6 +170,7 @@ def main() -> None:
     p.add_argument("--static", action="store_true", help="pin seq_len to a literal")
     p.add_argument("--prescale", action="store_true", help="scale q before the matmul, not the scores after")
     p.add_argument("--no-pv-cast", action="store_true", help="item 0q: drop the astype epilogue on P@V to price its fusion")
+    p.add_argument("--flash", action="store_true", help="item 0r: the fused kernel")
     p.add_argument("--cublas", action="store_true", help="run BLASDispatch, then time end-to-end on the VM")
     p.add_argument("--dump-cuda", default=None)
     p.add_argument("--repeat", type=int, default=20)
@@ -168,11 +178,12 @@ def main() -> None:
 
     dev = tvm.cuda(0)
     target = tvm.target.Target.from_device(dev)
-    mod = build(target, cli.seq, cli.static, cli.prescale, not cli.no_pv_cast, cli.cublas)
+    mod = build(target, cli.seq, cli.static, cli.prescale, not cli.no_pv_cast, cli.cublas,
+                cli.flash)
 
     prim = {gv.name_hint: f for gv, f in mod.functions.items()
             if isinstance(f, tvm.tirx.PrimFunc)}
-    leg = ("static" if cli.static else "symbolic") + (" +prescale" if cli.prescale else "") + (" -pvcast" if cli.no_pv_cast else "") + (" +cublas" if cli.cublas else "")
+    leg = ("static" if cli.static else "symbolic") + (" +prescale" if cli.prescale else "") + (" -pvcast" if cli.no_pv_cast else "") + (" +cublas" if cli.cublas else "") + (" +FLASH" if cli.flash else "")
     print(f"[vit-attn] seq={cli.seq}  {leg}  target={target.kind.name}")
     print(f"[vit-attn] {len(prim)} PrimFuncs: {', '.join(sorted(prim))}")
     print()

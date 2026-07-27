@@ -38,6 +38,8 @@ import numpy as np
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Tensor, op
 
+from mlc_llm.op import vit_flash_attn
+
 
 @dataclasses.dataclass
 class Qwen3VLVisionConfig:
@@ -160,6 +162,20 @@ class Qwen3VLVisionAttention(nn.Module):
         sin32 = op.astype(op.unsqueeze(sin, dim=0), "float32")
         q32 = op.add(op.multiply(q32, cos32), op.multiply(_rotate_half(q32), sin32))
         k32 = op.add(op.multiply(k32, cos32), op.multiply(_rotate_half(k32), sin32))
+
+        if vit_flash_attn.enabled(self.head_dim):
+            # Item 0r. One kernel replaces QK^T + softmax + P@V *and* the transpose
+            # below, and never materializes the (h, s, s) fp32 score matrix — 305 MB at
+            # the cat fixture's 2520 patches, which is the whole reason those three
+            # kernels cost 14.71 ms/layer against a 3.67 ms compute floor (§20.9).
+            #
+            # `MLC_QWEN35_VL_PRESCALE_Q` is inert on this path: the scale is applied to
+            # `q` as it is read into shared, which is the prescaled form by construction.
+            attn_out = vit_flash_attn.flash_attention(q32, k32, v32, self.scaling)
+            attn_out = op.astype(attn_out, in_dtype)
+            attn_out = op.permute_dims(attn_out, axes=[1, 0, 2])
+            attn_out = op.reshape(attn_out, (seq_len, self.dim))
+            return self.proj(attn_out)
 
         k_t = op.permute_dims(k32, axes=[0, 2, 1])  # (h, d, s)
         scale = nn.Tensor.from_const(np.array(self.scaling, dtype="float32"))

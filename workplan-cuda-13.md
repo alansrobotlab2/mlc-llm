@@ -778,13 +778,21 @@ MLC_MOE_GEMM_V2=1 MLC_MOE_GEMM_V2_BLKM=64 MLC_MOE_GEMM_V2_HOIST=1 MLC_MOE_GEMM_V
   --device cuda --opt "flashinfer=1;cudagraph=1" \
   -o dist/qwen3_6-35B-A3B-q4f16_1_fused/lib_rowspec64.so
 
-# VL — current lib is lib_vl2.so. Both §20 knobs are at their defaults here, so this
-# is plain --opt with nothing set; that is deliberate, it is the shipping config.
+# VL — current lib is lib_vl3.so (§23, flash attention). All three knobs are at their
+# defaults here, so this is plain --opt with nothing set; that is the shipping config.
 python -m mlc_llm compile dist/qwen3_5-0.8B-vl-q0f16/mlc-chat-config.json \
   --device cuda --opt "flashinfer=1;cublas_gemm=1;cudagraph=1" \
-  -o dist/qwen3_5-0.8B-vl-q0f16/lib_vl2.so
+  -o dist/qwen3_5-0.8B-vl-q0f16/lib_vl3.so
 python validate.py --greedy-parity-vl5 --mlc-model-dir dist/qwen3_5-0.8B-vl-q0f16 \
-  --mlc-lib dist/qwen3_5-0.8B-vl-q0f16/lib_vl2.so --device cuda:0   # 184/184, ~13 s
+  --mlc-lib dist/qwen3_5-0.8B-vl-q0f16/lib_vl3.so --device cuda:0   # 184/184, ~13 s
+
+# MLC_QWEN35_VL_FLASH=0 restores the three-kernel attention path (§23) -> lib_vl2, ttft 373.
+# The attention block alone, no compile — add --flash for item 0r's kernel:
+python scripts/vit_attn_bench.py --prescale --cublas --seq 2520          # 15.35 ms/layer
+python scripts/vit_attn_bench.py --flash --seq 2520                      # 11.13 ms/layer
+# and the two probes that decided it was worth building (§22.2, §22.3):
+nvcc -arch=sm_87 -O3 -o /tmp/vit_flash_probe scripts/vit_flash_probe.cu && /tmp/vit_flash_probe
+python scripts/vit_flash_tir.py
 
 # The two §20 knobs are coupled (§20.6). To reproduce the earlier legs:
 #   MLC_QWEN35_VL_PRESCALE_Q=0 MLC_BLAS_SKIP_FP32=1  -> lib_nofp32blas (§20.3), ttft 443
@@ -1053,7 +1061,7 @@ that §7 said to commit was still ignored; the exception now covers both names a
 >
 > | # | item | model | worth | cost / risk |
 > |---|---|---|---|---|
-> | 1 | **0r integration** — wire `scripts/vit_flash_tir.py` into `qwen3_vl_vit.py` | VL | **~43–51 ms/iter**, ttft −12 to −14% | **medium now, not large.** The kernel is written, verified and fast; what remains is fp16 I/O so it absorbs the casts, the `qwen3_vl_vit.py` swap, a compile, and the 184/184 gate. ⚠️ Resolve §22.4's 8.5% baseline gap with a trace first — it is worth a third of the prize |
+> | ~~1~~ | ~~**0r integration**~~ | VL | ✅ **LANDED (§23)** — ttft **372.66 → 322.19 ms (−13.5%)**, `image_embed` −22.6%, gate 184/184 exact, default ON, `lib_vl3.so`. Measured **50.5 ms/iter** against a predicted 43–51 |
 > | 2 | **VL serving** — `MLCEngine` cannot drive this vision tower (§20, item 0o trap 3) | VL | the model is measurable but **not servable** | medium-large, and *not* a perf task |
 > | 3 | **0h** — dual-tile dispatch | 35B | ⬇️ **re-costed down by §22.6**: the frontier's envelope is now one branchless kernel, so 0h can only buy the **pp128 cell, 6.0% at one prompt length** | §21.4 also sharpened why the single-PrimFunc form is wrong — the narrow path inherits the wide path's **registers**, dropping 6 → 4 CTAs |
 > | 4 | **0c.2** — chunked GDN recurrence | 35B | ≤ +12.5% by Amdahl | changes the arithmetic, so bit-exactness is off the table |
@@ -1142,7 +1150,7 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > |---|---:|---:|---|
 > | **35B-A3B** | **59–60** tps tg512 (from 54.13) | pp512 **836.6**, pp2048 **946.3** (prose, `radix`) | `dist/qwen3_6-35B-A3B-q4f16_1_fused/lib_blkk64.so` |
 > | **0.8B text** | **90.8** tps tg512 | pp512 **4787**, pp2048 **5073** (prose, `radix`) | `dist/qwen3_5-0.8B-q0f16_fused/lib_ksplit4.so` |
-> | **0.8B VL** | 88.1 tps | ttft **372.9 ms** = 223.3 embed + 149.5 prefill | `dist/qwen3_5-0.8B-vl-q0f16/lib_vl2.so` |
+> | **0.8B VL** | 87.8 tps | ttft **322.2 ms** = 172.7 embed + 149.5 prefill (§23) | `dist/qwen3_5-0.8B-vl-q0f16/lib_vl3.so` |
 >
 > ✅ **Every row is now a prose number** (§22.1 took the last one; the 0.8B text pp512 was 4888 on
 > filler and is 4787 on prose, −2.1%). The VL row is the cat fixture's 2520 patches and no VL number
@@ -5900,3 +5908,91 @@ disable:  139/139 wide-margin positions agree at tau=2.0   PASS   (near-ties 2/5
 The near-tie counts differ between modes on the *same* lib, which is the reminder §18.14 filed:
 near-ties are where q4 quantization legitimately differs and they carry no signal about a state path.
 The wide-margin count is the bar and it is 139/139 both ways.
+
+---
+
+## 23. Landed: flash attention for the VL vision tower (item 0r, 2026-07-27c)
+
+**ttft 372.66 → 322.19 ms (−13.5%), `image_embed` 223.22 → 172.72 (−22.6%)**, prefill and decode
+neutral, gate **184/184 exact** with a margin PASS. Default **ON**; the new shipping lib is
+`dist/qwen3_5-0.8B-vl-q0f16/lib_vl3.so`, built at plain `--opt`.
+
+[python/mlc_llm/op/vit_flash_attn.py](python/mlc_llm/op/vit_flash_attn.py) is one TIR PrimFunc that
+replaces `QK^T`, `softmax`, `P@V` **and** the `permute_dims` that fed them — the transpose is implicit
+in how `K` is read. It never materializes the `(12, 2520, 2520)` fp32 score matrix, **305 MB**, which
+is the entire reason those kernels cost 14.71 ms/layer against a 3.67 ms compute floor.
+
+### 23.1 What made this cheap was refusing to build it three times first
+
+The item was filed in §20.9 at **~89 ms/iter**, from quoting cuBLAS's 51% of fp32 peak for a kernel
+nobody had written. Three measurements re-priced it before a line of model code changed:
+
+| gate | question | answer | cost |
+|---|---|---|---|
+| §22.2 `vit_flash_probe.cu` | what rate does a *hand-written* fp32 kernel reach here? | **1.57 TFLOP/s** on a plain GEMM — between dlight's 1.03 and cuBLAS's 2.69, and closer to dlight. Flash itself 1.77, best of six tile shapes | one .cu file |
+| §22.3 `vit_flash_tir.py` | can **TIR** reach that rate? | **1.75 TFLOP/s = 0.99× the CUDA** — but only after fixing two defects that cost 2.25× | one .py file |
+| §22.4 | which baseline? | the first attempt compared a `--static` bench against a symbolic candidate; on the matching leg the block is **15.35 ms/layer**, not 13.46 | one bench run |
+
+Every one of those could have been skipped, and each would have produced a wrong decision: on §20.9's
+number the item is worth twice what it is; on the *first* TIR draft's 0.78 TFLOP/s it is a
+**1.9× regression** and would have been abandoned.
+
+### 23.2 The numbers
+
+| VL 0.8B, cat fixture (2520 patches), `radix` | `lib_vl2` (was default) | **`lib_vl3`** (flash, default) | Δ |
+|---|---:|---:|---:|
+| `image_embed` | 223.22 ms | **172.72** | **−22.6%** |
+| `prefill` (652 tok) | 149.44 | 149.47 | — |
+| `decode` | 11.37 (88.0 tok/s) | 11.39 (87.8) | — |
+| **ttft** | **372.66** | **322.19** | **−13.5%** |
+| `image_embed` share of ttft | 59.9% | 53.6% | |
+
+A plain `--opt` rebuild with the default flipped (`lib_vl3.so`) reproduces the flag-on build to
+**0.07%** (ttft 322.41, `image_embed` 172.84) and gates 184/184 — so the default is what was measured.
+
+**The prediction landed at the top of its range, and the *kernel-level* one landed exactly.** §22.4
+projected 43–51 ms/iter; measured is **50.5**. Specifically: the per-kernel projection
+(15.35 − 11.13) × 12 = **50.6 ms** is right to 0.2%, while the end-to-end-VM projection
+(15.35 − 11.91) × 12 = 41.3 ms was 9 ms pessimistic, because the bench's VM leg charges flash for
+input casts the model already pays elsewhere. **When both are available, project from the per-kernel
+number** — the opposite of what §15.2's rule says for whole-run deltas, and for the same underlying
+reason: match the denominator to the thing being changed.
+
+### 23.3 Correctness
+
+Three bars, in increasing order of authority:
+
+1. **Against NumPy, standalone** (§22.3): max abs 6.0e-8 / 6.5e-8 at seq=200 and 1000, both partial
+   tiles.
+2. **Against the path it replaces**, same inputs, one process, through the real pass pipeline:
+
+   | seq | max abs | max rel |
+   |---:|---:|---:|
+   | 2520 | 7.6e-6 | 9.8e-4 |
+   | 1000 | 1.5e-5 | 9.7e-4 |
+   | 217 | 1.5e-5 | 9.7e-4 |
+
+   That is **one fp16 ULP** — the output dtype's own rounding step, which is what a different
+   summation order has to produce. seq=217 is neither a multiple of `BM=64` nor of `BN=32`, so both
+   partial-tile paths are live.
+3. **The model gate**: `--greedy-parity-vl5` **184/184 exact**, margin verdict PASS at tau=2.0.
+
+### 23.4 Defaulting it on without breaking a tower it was never measured on
+
+The tile is fixed — `BM=64, BN=32, 16×16` won the six-way sweep at `head_dim=64` and the ranking was
+identical at 1260, 2520 and 5040 patches. A different tower could have a head dimension the tile
+cannot cover, so `supported(head_dim)` checks the three real constraints (`head_dim % 16`,
+`(head_dim // 16) % 4` for the float4 reads of `Vs`, and both cooperative loads dividing across 256
+threads) and the model **falls back to the three-kernel path** rather than asserting. Verified:
+`head_dim` 64 → on, 128 → on, 80 → off. `MLC_QWEN35_VL_FLASH=0` restores the old path for an A/B.
+
+### 23.5 What this leaves
+
+`image_embed` is now **53.6% of ttft** rather than 69% (§20's starting point) — it is no longer the
+dominant term, and prefill at 149.5 ms is. Within the tower, the attention block went from three
+kernels at 45% off their bound to one at **33% of fp32 peak**; the remaining headroom is the gap to
+cuBLAS's demonstrated 51%, worth ~4 ms/layer if it could be closed by a better tile, and the six-way
+sweep says this tile shape is not where it is hiding.
+
+**Across §20 and this session the VL model's ttft has gone 486.65 → 322.19 ms, −33.8%**, with the
+gate at 184/184 at every step and no change to prefill or decode.
