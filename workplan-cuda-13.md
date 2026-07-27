@@ -978,23 +978,18 @@ carrying the three `vm.builtin.rnn_state_*` accessors. Verified 2026-07-25d and 
 `git ls-remote origin qwen35-inplace-rnn-state` returns `4624d972…`, identical to the pointer.
 This section said otherwise for three sessions and was wrong.
 
-⚠️ **But there is now a SECOND submodule commit, `dff702c`, and it is NOT pushed.** It is the
-§16.3 `MLC_GEMV_TSTR` probe hook in `python/tvm/s_tir/dlight/gpu/gemv.py`. Verified 2026-07-26 by
-the authoritative test: `git ls-remote origin` has no ref containing `dff702c`, and a push attempt
-fails with `could not read Username for 'https://github.com'` — **the submodule's remote is HTTPS
-with no credential helper, so it cannot be pushed non-interactively.** Push it from an interactive
-shell (or switch the remote to SSH), then advance the parent pointer:
+✅ **The second submodule commit, `dff702c`, is now pushed too, and the parent pointer is advanced
+(2026-07-27b).** It is the §16.3 `MLC_GEMV_TSTR` probe hook in
+`python/tvm/s_tir/dlight/gpu/gemv.py`. It was unpushable non-interactively for three sessions — the
+submodule's remote is HTTPS with no credential helper, so a push attempt failed with
+`could not read Username for 'https://github.com'` — and was pushed from an interactive shell.
+Verified by the authoritative test: `git -C 3rdparty/tvm ls-remote origin` returns
+`dff702c… refs/heads/qwen35-inplace-rnn-state`, matching the parent pointer that `3281f97f` now
+records.
 
-```bash
-git -C 3rdparty/tvm push origin qwen35-inplace-rnn-state
-git -C 3rdparty/tvm ls-remote origin qwen35-inplace-rnn-state   # must return dff702c…
-git add 3rdparty/tvm && git commit -m "[TVM] bump submodule to dff702c (MLC_GEMV_TSTR hook)"
-```
-
-**The parent pointer has deliberately NOT been advanced.** Pointing it at an unpushed commit is
-exactly the breakage this section spent three sessions untangling. Consequence while it is
-unpushed: a fresh clone lacks the hook, so §8's `MLC_GEMV_TSTR` reproduction line will not work
-there — nothing else depends on it, since the hook is inert when the variable is unset.
+**Both loose ends in this section are therefore closed**, and `git status` is down to a single
+entry, `?? COLCON_IGNORE`. A fresh clone now gets the hook, so §8's `MLC_GEMV_TSTR` reproduction
+line works there.
 
 ⚠️ **The check that produced the false alarm is the thing to remember.** That clone's
 `remote.origin.fetch` was narrowed to `+refs/heads/mlc:refs/remotes/origin/mlc` only, so no
@@ -1035,6 +1030,11 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > 84.3, `softmax` 48.4) that all move the same 305 MB score matrix. The prize is not a faster GEMM,
 > it is **not materializing the matrix**. Item **0n** (the MoE per-CTA cost) is still open and is
 > still a measurement, not a build.
+>
+> ✅ **The submodule loose end is closed** (not by me — pushed interactively this session).
+> `dff702c` is on the remote and `3281f97f` advances the parent pointer, so the three-session
+> "`M 3rdparty/tvm` is deliberate" caveat is retired and **`git status` is down to `?? COLCON_IGNORE`
+> alone**.
 >
 > <details><summary>Handoff, end of 2026-07-27 (superseded)</summary>
 >
@@ -1270,9 +1270,10 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > **The 35B compile takes ~14 min**; a full `mlc_llm compile` of the 0.8B VL model takes ~3 min; one
 > `scratch_mlc_tg_sweep.py` leg on the 35B is ~2 min including load.
 >
-> **Two non-code loose ends, unchanged.** `3rdparty/tvm` commit `dff702c` is still unpushed (needs an
-> interactive shell or an SSH remote), so `M 3rdparty/tvm` is deliberate; `COLCON_IGNORE` is an
-> untracked ROS artifact predating this work.
+> **One non-code loose end left.** ✅ `3rdparty/tvm` commit `dff702c` was pushed interactively and the
+> parent pointer advanced (`3281f97f`, 2026-07-27b), so `M 3rdparty/tvm` is **gone** — see "Committed
+> state". `COLCON_IGNORE` remains an untracked ROS artifact predating this work, and is the only
+> entry `git status` now shows.
 
 > **Item IDs are stable, not sequential.** They are referenced from §12–§16 and from the Done
 > sections above, so closed items keep their number rather than being renumbered away. Ordering
