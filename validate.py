@@ -38,7 +38,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -116,6 +116,12 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--mrope-collapse", action="store_true", help="Phase 10 Stage 5b diagnostic: drive VL lib on text-only prompt with 3 identical position rows; should reduce to 1D RoPE and match the text-only reference cache.")
     mode.add_argument("--reference-vl5", action="store_true", help="Phase 10 Stage 5b: build 5-prompt multimodal reference cache (HF VLM, cat fixture, 5 queries).")
     mode.add_argument("--greedy-parity-vl5", action="store_true", help="Phase 10 Stage 5b: drive VL lib on the 5-prompt set, aggregate match count across prompts.")
+    mode.add_argument("--perf-vl5", action="store_true", help="Workplan item 0o: time image_embed / prefill / decode separately on the VL lib. No reference comparison; MLCEngine cannot drive this model's vision tower (see workplan item 0o trap 3).")
+
+    p.add_argument("--perf-iters", type=int, default=20, help="--perf-vl5: timed iterations per call (after warmup).")
+    p.add_argument("--perf-warmup", type=int, default=5, help="--perf-vl5: untimed warmup iterations per call.")
+    p.add_argument("--perf-decode-steps", type=int, default=64, help="--perf-vl5: decode steps to time per repeat.")
+    p.add_argument("--perf-max-history", type=int, default=None, help="--perf-vl5: RNN-state max_history. Default measures both 1 ('disable'-equivalent) and 64 ('radix'-equivalent).")
 
     p.add_argument("--vl-cache", default=str(CACHE_FILE_VL), help="Path to reference_outputs_vl.pt (Phase 10 Stage 1).")
     p.add_argument("--vl-image", default=str(VL_FIXTURE_IMAGE), help="Fixed image fixture for --reference-vl.")
@@ -1242,6 +1248,16 @@ def run_greedy_parity_vl5(args: argparse.Namespace) -> None:
     wide_failures = 0
     per_prompt_results = []
 
+    # One image, five prompts — so run the tower once, not five times. This used
+    # to sit inside the loop under a comment reading "could cache but cheap";
+    # §20.1 measured it at **337 ms**, 69% of ttft and 2.26x the prefill of the
+    # whole 652-token sequence, so the loop was paying ~1.35 s per gate run for
+    # five identical results. The value is input-independent: same fixture, same
+    # preprocessing, same params.
+    image_embeds_np = mod["image_embed"](
+        pixel_values_d, pos_embeds_d, rotary_cos_d, rotary_sin_d, params
+    ).numpy()
+
     for i, p in enumerate(cache["prompts"]):
         query = p["query"]
         ref_tokens = p["generated_token_ids"]
@@ -1251,11 +1267,7 @@ def run_greedy_parity_vl5(args: argparse.Namespace) -> None:
         rope_position_ids = p["rope_position_ids"]
         rope_deltas = p["rope_deltas"]
 
-        # Run image_embed (same image across prompts; could cache but cheap)
-        image_embeds = mod["image_embed"](pixel_values_d, pos_embeds_d, rotary_cos_d, rotary_sin_d, params)
-        image_embeds_np = image_embeds.numpy()
-
-        # Build full input embed
+        # Build full input embed (image_embeds_np hoisted above the loop, §20.1)
         input_ids_d = tvm.runtime.tensor(np.asarray(input_ids, dtype=np.int32), device=dev)
         text_embed = mod["embed"](input_ids_d, params).numpy()
         if text_embed.ndim == 3:
@@ -1382,6 +1394,284 @@ def run_greedy_parity_vl5(args: argparse.Namespace) -> None:
                 if a != b:
                     print(f"    first diff at step {i}: MLC={a} HF={b}")
                     break
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Workplan item 0o — the first VL performance number
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _stats(samples: List[float]) -> dict:
+    """Median-centred summary. Median, not mean: a single scheduler hiccup on
+    this box moves the mean of a 20-sample run by more than the effects being
+    measured."""
+    s = sorted(samples)
+    n = len(s)
+    return {
+        "n": n,
+        "median": s[n // 2],
+        "min": s[0],
+        "max": s[-1],
+        "p90": s[min(n - 1, int(0.9 * n))],
+    }
+
+
+def run_perf_vl5(args: argparse.Namespace) -> None:
+    """Time image_embed / prefill / decode separately on the compiled VL lib.
+
+    This is `--greedy-parity-vl5` minus the reference comparison, plus a sync
+    and a clock around each VM call. Three deliberate differences from that
+    driver, each one a trap the workplan (item 0o) names:
+
+      1. **The host-side embedding merge is never timed.** That driver does
+         `image_embeds.numpy()` -> numpy scatter -> re-upload per prompt.
+         Timing the enclosing loop measures numpy and a PCIe round trip, not
+         the model. Every number below brackets exactly one VM call.
+      2. **`image_embed` is hoisted and timed on its own.** The parity driver
+         calls it once per prompt under a comment reading "could cache but
+         cheap"; that was never measured, which is the first thing to fix.
+      3. **No `MLCEngine`.** `cpp/serve/model.cc` calls `image_embed` with the
+         llava signature and `ImageData` hardcodes the embed size, so the
+         engine cannot drive this vision tower at all. Everything here runs on
+         the raw VM.
+    """
+    cache_path = CACHE_FILE_VL5
+    if not cache_path.exists():
+        print(f"[perf-vl5] No cache at {cache_path}. Run --reference-vl5 first.")
+        sys.exit(1)
+    cache = torch.load(cache_path, weights_only=False)
+
+    if args.mlc_model_dir is None:
+        print("[perf-vl5] Missing --mlc-model-dir.")
+        sys.exit(1)
+    model_dir = Path(args.mlc_model_dir)
+    lib_path = Path(args.mlc_lib) if args.mlc_lib else model_dir / "lib.so"
+    if not lib_path.exists():
+        print(f"[perf-vl5] No lib at {lib_path}.")
+        sys.exit(1)
+
+    import json as _json
+    import time
+    import tvm
+    from tvm import relax
+    from tvm.contrib import tvmjs
+    from tvm.runtime import ShapeTuple
+    from PIL import Image
+    from mlc_llm.model.qwen3_5_vl.qwen3_5_vl_image import preprocess_image
+
+    device_str = args.device if args.device != "cuda" else "cuda:0"
+    dev = tvm.device(device_str)
+    print(f"[perf-vl5] lib   = {lib_path}")
+    print(f"[perf-vl5] dev   = {device_str}")
+    ex = tvm.runtime.load_module(str(lib_path))
+    vm = relax.VirtualMachine(ex, device=dev)
+    mod = vm.module
+    metadata = _json.loads(mod["_metadata"]())
+    params, _meta = tvmjs.load_tensor_cache(str(model_dir), dev)
+    param_names = [p["name"] for p in metadata["params"]]
+    params = [params[n] for n in param_names]
+
+    pos_embed_weight = _load_vl_pos_embed_weight(args.model)
+    rgb = np.asarray(Image.open(cache["image_path"]).convert("RGB"), dtype=np.uint8)
+    pre = preprocess_image(rgb, pos_embed_weight=pos_embed_weight)
+    pixel_values_d = tvm.runtime.tensor(pre.pixel_values, device=dev)
+    pos_embeds_d = tvm.runtime.tensor(pre.pos_embeds, device=dev)
+    rotary_cos_d = tvm.runtime.tensor(pre.rotary_cos, device=dev)
+    rotary_sin_d = tvm.runtime.tensor(pre.rotary_sin, device=dev)
+    n_patches = int(pre.pixel_values.shape[0])
+
+    if mod.implements_function("create_flashinfer_paged_kv_cache"):
+        kv_create = mod["create_flashinfer_paged_kv_cache"]
+    elif mod.implements_function("create_tir_paged_kv_cache"):
+        kv_create = mod["create_tir_paged_kv_cache"]
+    else:
+        print("[perf-vl5] No KV cache create function.")
+        sys.exit(1)
+    kv_add_seq = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
+    kv_remove_seq = tvm.get_global_func("vm.builtin.kv_state_remove_sequence")
+    kv_begin = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
+    kv_end = tvm.get_global_func("vm.builtin.kv_state_end_forward")
+
+    warmup, iters = args.perf_warmup, args.perf_iters
+
+    # ── 1. image_embed — the vision tower + patch merger, once per image ──────
+    for _ in range(warmup):
+        mod["image_embed"](pixel_values_d, pos_embeds_d, rotary_cos_d, rotary_sin_d, params)
+    dev.sync()
+    embed_samples = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        image_embeds = mod["image_embed"](pixel_values_d, pos_embeds_d, rotary_cos_d, rotary_sin_d, params)
+        dev.sync()
+        embed_samples.append((time.perf_counter() - t0) * 1e3)
+    ie = _stats(embed_samples)
+    n_img_tok = int(image_embeds.shape[0])
+    image_embeds_np = image_embeds.numpy()
+
+    print()
+    print("=" * 74)
+    print(f"[perf-vl5] image_embed  ({n_patches} patches -> {n_img_tok} tokens)")
+    print("=" * 74)
+    print(f"  median {ie['median']:8.2f} ms   min {ie['min']:8.2f}   p90 {ie['p90']:8.2f}   "
+          f"max {ie['max']:8.2f}   (n={ie['n']})")
+
+    # ── 2. prefill and decode, per prompt ────────────────────────────────────
+    # max_history is the RNN-state knob the engine sets from prefix_cache_mode:
+    # 'disable' -> 1, 'radix' (the default) -> 64. The state path is sized by
+    # it (§15), so measuring only one of them would report half the model.
+    histories = [args.perf_max_history] if args.perf_max_history else [1, 64]
+
+    p = cache["prompts"][0]
+    input_ids = p["input_ids"][0]
+    seq_len = len(input_ids)
+    rope_position_ids = p["rope_position_ids"]
+    rope_deltas = p["rope_deltas"]
+    image_token_id = 248056
+
+    # Build the merged embedding ONCE, outside all timing. This is the host
+    # scatter trap: it is not model work and must not land in a number.
+    input_ids_d = tvm.runtime.tensor(np.asarray(input_ids, dtype=np.int32), device=dev)
+    text_embed = mod["embed"](input_ids_d, params).numpy()
+    if text_embed.ndim == 3:
+        text_embed = text_embed[0]
+    image_pad_pos = np.where(np.asarray(input_ids) == image_token_id)[0]
+    n_sub = min(len(image_pad_pos), image_embeds_np.shape[0])
+    full_embed = text_embed.copy()
+    full_embed[image_pad_pos[:n_sub]] = image_embeds_np[:n_sub]
+    full_embed_d = tvm.runtime.tensor(
+        full_embed.reshape(1, seq_len, -1).astype(text_embed.dtype), device=dev
+    )
+    pos_ids_d = tvm.runtime.tensor(np.asarray(rope_position_ids, dtype=np.int32), device=dev)
+    mrope_deltas_d = tvm.runtime.tensor(np.asarray(rope_deltas, dtype=np.int32), device=dev)
+
+    n_steps = args.perf_decode_steps
+    print()
+    print("=" * 74)
+    print(f"[perf-vl5] prefill + decode  (seq_len={seq_len}, {n_sub} image tokens, "
+          f"{n_steps} decode steps)")
+    print("=" * 74)
+
+    results = {}
+    for max_hist in histories:
+        max_total = seq_len + n_steps + 32
+        prefill_chunk = max(seq_len + 32, 4096)
+
+        def fresh_state():
+            kv_cache = kv_create(
+                ShapeTuple([1]), ShapeTuple([max_total]), ShapeTuple([prefill_chunk]),
+                ShapeTuple([16]), ShapeTuple([0]),
+            )
+            rnn_state = mod["create_rnn_state"](ShapeTuple([1]), ShapeTuple([max_hist]))
+            kv_add_seq(kv_cache, 0)
+            kv_add_seq(rnn_state, 0)
+            return kv_cache, rnn_state
+
+        def one_prefill(kv_cache, rnn_state):
+            kv_begin(kv_cache, ShapeTuple([0]), ShapeTuple([seq_len]))
+            kv_begin(rnn_state, ShapeTuple([0]), ShapeTuple([seq_len]))
+            logits, kv_cache, rnn_state = mod["prefill"](
+                full_embed_d, pos_ids_d, kv_cache, rnn_state, params
+            )
+            kv_end(kv_cache)
+            kv_end(rnn_state)
+            return logits, kv_cache, rnn_state
+
+        # -- prefill. Fresh state per iteration, created outside the clock. --
+        for _ in range(warmup):
+            kv_cache, rnn_state = fresh_state()
+            one_prefill(kv_cache, rnn_state)
+            kv_remove_seq(kv_cache, 0)
+            kv_remove_seq(rnn_state, 0)
+        dev.sync()
+        prefill_samples = []
+        for _ in range(iters):
+            kv_cache, rnn_state = fresh_state()
+            dev.sync()
+            t0 = time.perf_counter()
+            logits, kv_cache, rnn_state = one_prefill(kv_cache, rnn_state)
+            dev.sync()
+            prefill_samples.append((time.perf_counter() - t0) * 1e3)
+            kv_remove_seq(kv_cache, 0)
+            kv_remove_seq(rnn_state, 0)
+        pf = _stats(prefill_samples)
+
+        # -- decode. One prefill to establish state, then N timed steps. --
+        # Reported per-step; the KV cache grows across the run, so the spread
+        # between min and p90 is signal, not noise.
+        def timed_decode():
+            kv_cache, rnn_state = fresh_state()
+            logits, kv_cache, rnn_state = one_prefill(kv_cache, rnn_state)
+            logits_np = logits.numpy()
+            if logits_np.ndim == 3:
+                logits_np = logits_np[0, -1]
+            elif logits_np.ndim == 2:
+                logits_np = logits_np[-1]
+            next_token = int(np.argmax(logits_np))
+            dev.sync()
+            samples = []
+            for _ in range(n_steps):
+                tok_d = tvm.runtime.tensor(np.array([next_token], dtype=np.int32), device=dev)
+                dev.sync()
+                t0 = time.perf_counter()
+                kv_begin(kv_cache, ShapeTuple([0]), ShapeTuple([1]))
+                kv_begin(rnn_state, ShapeTuple([0]), ShapeTuple([1]))
+                tok_embed = mod["embed"](tok_d, params)
+                if tok_embed.shape[0] != 1 or len(tok_embed.shape) == 2:
+                    tok_embed = tvm.get_global_func("vm.builtin.reshape")(
+                        tok_embed, ShapeTuple([1, 1, tok_embed.shape[-1]])
+                    )
+                logits, kv_cache, rnn_state = mod["decode"](
+                    tok_embed, mrope_deltas_d, kv_cache, rnn_state, params
+                )
+                kv_end(kv_cache)
+                kv_end(rnn_state)
+                dev.sync()
+                samples.append((time.perf_counter() - t0) * 1e3)
+                logits_np = logits.numpy()
+                if logits_np.ndim == 3:
+                    logits_np = logits_np[0, -1]
+                elif logits_np.ndim == 2:
+                    logits_np = logits_np[-1]
+                next_token = int(np.argmax(logits_np))
+            kv_remove_seq(kv_cache, 0)
+            kv_remove_seq(rnn_state, 0)
+            return samples
+
+        timed_decode()  # warmup repeat, discarded
+        decode_samples = timed_decode()
+        dc = _stats(decode_samples)
+
+        tag = f"max_history={max_hist}" + (
+            "  ('disable')" if max_hist == 1 else "  ('radix', the default)" if max_hist == 64 else ""
+        )
+        print()
+        print(f"  {tag}")
+        print(f"    prefill   median {pf['median']:8.2f} ms  min {pf['min']:8.2f}  "
+              f"p90 {pf['p90']:8.2f}   -> {1e3 * seq_len / pf['median']:8.1f} tok/s")
+        print(f"    decode    median {dc['median']:8.2f} ms  min {dc['min']:8.2f}  "
+              f"p90 {dc['p90']:8.2f}   -> {1e3 / dc['median']:8.1f} tok/s")
+        results[max_hist] = (pf, dc)
+
+    # ── 3. What a chat turn actually costs ───────────────────────────────────
+    ref_hist = 64 if 64 in results else histories[0]
+    pf, dc = results[ref_hist]
+    ttft = ie["median"] + pf["median"]
+    print()
+    print("=" * 74)
+    print(f"[perf-vl5] One chat turn at max_history={ref_hist}")
+    print("=" * 74)
+    print(f"  ttft (image_embed + prefill)  {ttft:8.2f} ms  "
+          f"= {ie['median']:.2f} + {pf['median']:.2f}")
+    print(f"  image_embed share of ttft     {100 * ie['median'] / ttft:8.1f} %")
+    print(f"  ...and of a {n_steps}-token turn      "
+          f"{100 * ie['median'] / (ttft + n_steps * dc['median']):8.1f} %")
+    if len(results) > 1:
+        p1, d1 = results[1]
+        p64, d64 = results[64]
+        print()
+        print(f"  radix vs disable:  prefill {p64['median'] / p1['median']:.3f}x   "
+              f"decode {d64['median'] / d1['median']:.3f}x")
+    print()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1560,6 +1850,8 @@ def main() -> None:
         run_reference_vl5(args)
     elif args.greedy_parity_vl5:
         run_greedy_parity_vl5(args)
+    elif args.perf_vl5:
+        run_perf_vl5(args)
 
 
 if __name__ == "__main__":

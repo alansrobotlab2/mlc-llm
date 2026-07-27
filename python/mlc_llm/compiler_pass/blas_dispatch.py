@@ -1,5 +1,7 @@
 """A compiler pass that dispatches patterns to CUBLAS."""
 
+import os
+
 import tvm
 from tvm import IRModule, relax
 from tvm.relax.backend import get_patterns_with_prefix
@@ -65,12 +67,60 @@ def _region_needs_tir_vars(context: relax.transform.PatternCheckContext) -> bool
     return bool(used - definable)
 
 
-def _decline_free_symbolic_vars(pattern: relax.transform.FusionPattern):
-    """Wrap a fusion pattern's check with `_region_needs_tir_vars`."""
+def _region_is_fp32(context: relax.transform.PatternCheckContext) -> bool:
+    """Does this match compute in fp32?
+
+    Used to decline the offload — see `_decline_free_symbolic_vars` for why that
+    is the safe way to say "not this one". The rule is measured, not assumed
+    (workplan §20):
+
+    On the Qwen3.5-VL vision tower cuBLAS picks `ampere_sgemm_128x128_tn` for the
+    fp32 `matmul(q32, k_t)` and `ampere_fp16_s16816gemm_*` for the fp16 FFN GEMMs.
+    The fp16 kernels are tensor-core; the fp32 one is plain SIMT. So the fp32
+    offload buys a *scheduling* win only — 2.69 vs 1.03 TFLOP/s, real but small in
+    absolute terms — while costing the `matmul -> multiply` fusion it displaces.
+
+    That trade is decided by the output tensor, not the GEMM. The tower's score
+    tensor is `(12, 2520, 2520)` fp32 = 305 MB, so breaking the fusion adds a
+    610 MB/layer DRAM round trip: 3.91 ms/layer predicted at the 156 GB/s wall,
+    3.94 ms measured. Twelve layers turns cuBLAS's 3.6 ms GEMM win into a
+    **47 ms loss**, and `image_embed` goes 297 -> 337 ms.
+
+    Restricted to fp32 because that is the case where cuBLAS brings no tensor
+    cores to the trade and therefore cannot win back a fusion. The fp16 offloads
+    measured +3.0 ms/iteration in the tower's favour and are kept.
+
+    ⚠️ **Scope, stated honestly.** The mechanism is really "the displaced fusion
+    writes a tensor bigger than the GEMM reads", and fp32 is a *proxy* for it, not
+    the thing itself. The precise test — is the matmul expanding? — is not
+    computable in a pattern check here: the tower's shapes are symbolic in
+    `num_patches`, and `12*s*s > 4*(12*s*64 + 12*64*s)` is unprovable without a
+    bound on `s`, so an analyzer-based version would decline nothing and fix
+    nothing. The proxy is exact on every configuration in this project, because
+    `_cublas_gemm` only enables the pass for `q0f16`/`q0bf16`/`q0f32`/fp8
+    ([compiler_flags.py:103](../interface/compiler_flags.py#L103)) and the VL
+    `q0f16` build is the only one of those here — where the sole fp32 GEMMs are
+    the vision tower's attention. The 35B and 0.8B text models are `q4f16_1`, so
+    the whole pass is off for them and this guard is unreachable.
+
+    On a **`q0f32`** model, though, this would decline cuBLAS wholesale, and that
+    case is unmeasured. `MLC_BLAS_SKIP_FP32=0` restores the previous behaviour.
+    """
+    for value in context.matched_bindings.values():
+        sinfo = value.struct_info
+        if isinstance(sinfo, relax.TensorStructInfo) and sinfo.dtype == "float32":
+            return True
+    return False
+
+
+def _decline_free_symbolic_vars(pattern: relax.transform.FusionPattern, skip_fp32: bool):
+    """Wrap a fusion pattern's check with the guards above."""
     inner = pattern.check
 
     def _check(context: relax.transform.PatternCheckContext) -> bool:
         if inner is not None and not inner(context):
+            return False
+        if skip_fp32 and _region_is_fp32(context):
             return False
         return not _region_needs_tir_vars(context)
 
@@ -85,21 +135,29 @@ class BLASDispatch:
     """A compiler pass that dispatches patterns to cuBLAS/hipBLAS."""
 
     def __init__(self, target: tvm.target.Target) -> None:
+        # A/B knob for the fp32 guard (§20). Default `1`: measured Pareto on the
+        # VL model — it is the only model here with an fp32 GEMM in the graph, so
+        # on everything else the guard is inert.
+        skip_fp32 = os.environ.get("MLC_BLAS_SKIP_FP32", "1") == "1"
         if target.kind.name == "cuda":
             self.has_blas = tvm.get_global_func("relax.ext.cublas", True)
             if not self.has_blas:
                 raise Exception("cuBLAS is not enabled.")
             self.patterns = [
-                _decline_free_symbolic_vars(p) for p in get_patterns_with_prefix("cublas")
+                _decline_free_symbolic_vars(p, skip_fp32)
+                for p in get_patterns_with_prefix("cublas")
             ]
         elif target.kind.name == "rocm":
             self.has_blas = tvm.get_global_func("relax.ext.hipblas", True)
             if not self.has_blas:
                 raise Exception("hipBLAS is not enabled.")
             # Same serializer, same failure mode — hipBLAS goes through the identical
-            # BYOC JSON path, so it gets the identical guard.
+            # BYOC JSON path, so it gets the identical guard. The fp32 guard carries
+            # over on the same argument: it is the broken fusion on a 305 MB tensor
+            # that decides it, not anything Ampere-specific.
             self.patterns = [
-                _decline_free_symbolic_vars(p) for p in get_patterns_with_prefix("hipblas")
+                _decline_free_symbolic_vars(p, skip_fp32)
+                for p in get_patterns_with_prefix("hipblas")
             ]
         else:
             raise Exception(f"Unsupported target {target.kind.name} for BLAS dispatch.")
