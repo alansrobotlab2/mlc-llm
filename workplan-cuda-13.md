@@ -5373,3 +5373,177 @@ That is the remaining prize and it is a real build: fp32 (fp16 collapses tower p
 to copy (the reference runs eager attention), and a tiled online softmax to write in TIR. Filed as
 item **0r**. `scripts/vit_attn_bench.py` is the loop for it — it takes no compile and has a 1.3%
 fidelity bar against the traced kernels.
+
+---
+
+## 21. Session 2026-07-27c — item 0n: the wide tile's cost is named, and it is not what §19.8 ranked first
+
+Item **0n** was filed as "a measurement, not a build", with three candidates read off the emitted
+CUDA and a standing instruction not to cost another wide-tile variant until one of them was named.
+It is now answered. **Candidate (a) is dead, (b) and (c) are the answer, and occupancy — which nobody
+had listed at all — is a real but minority term.** `ncu` is still blocked (§8); none of this needed it.
+
+New instrument: [scripts/moe_occupancy_ab.py](scripts/moe_occupancy_ab.py). It reads the register
+count straight out of `ptxas -v`, computes resident CTAs under all three sm_87 limits, and then
+perturbs occupancy *without touching the instruction stream* by injecting a static `__shared__` pad
+into the generated CUDA through an overridden `tvm_callback_cuda_compile`.
+
+### 21.1 The resource table, which settles candidate (a) on its own
+
+Every leg is bit-exact against the shipped `BLK_M=16`; the wide legs carry `HOIST=1` + `ROWSPEC=1`,
+the configuration §19 measured.
+
+| leg | regs | shared/CTA | CTAs by thr / reg / shm | resident | occupancy | shm/SM | L1 | binds |
+|---|---:|---:|---|---:|---:|---:|---:|---|
+| **M16** (shipped) | **40** | 20.25 kB | 6 / 6 / 7 | **6** | 100% | 127.5 kB | 60 kB | regs, threads |
+| M32 | 48 | 22.50 kB | 6 / 5 / 6 | 5 | 83% | 117.5 kB | 60 kB | regs |
+| **M64** | **64** | 27.00 kB | 6 / **4** / 5 | **4** | 67% | 112.0 kB | 60 kB | **regs** |
+
+**§19.8's candidate (a) is wrong in both of its numbers.** It read the footprint growth as "8 resident
+CTAs against 6". Eight is unreachable — 1536 threads/SM ÷ 256 caps every width at 6 — and 6 is what
+`BLK_M=64`'s footprint *still allows*. The shared column never binds at any width. What binds is the
+**register file**, and the wide tile's own footprint costs it nothing: `M64` vs `M64` + 4 kB of pad
+(both 4 CTAs, both 60 kB L1) is **0.99× / 1.00×**.
+
+**The register delta is accounted to the register.** The emitted CUDA declares, at `BLK_M=64`,
+`accumulator[4]` + `matrix_a[4]` + `matrix_b[1]` against `BLK_M=16`'s `[1] + [1] + [1]`. Six extra
+16×16 fp16 fragments at 4 registers/lane = **24**, and ptxas reports exactly 40 → 64.
+
+**So no wide tile can ever be occupancy-neutral on sm_87, and this is structural.** Six CTAs of 8
+warps need ≤ 1365 registers/warp, i.e. **≤ 40 per thread** after the 256-register allocation
+granularity. `BLK_M=16` sits at exactly 40 — on the boundary. Every widening step adds 4 registers per
+extra accumulator, and the extra accumulators *are* the wide tile. There is no version of this that
+fits.
+
+### 21.2 The occupancy-only control, and the 1 kB nobody had modelled
+
+A pad leg changes two things at once, and the first pass of this measurement got that wrong. Adding
+1792 B of shared per CTA cost **20%** at what the model said was unchanged occupancy *and* unchanged
+L1 — which is impossible, so the model was wrong. Sweeping the pad in 256 B steps located the cliff:
+
+| pad | 256 | 512 | **768** | **1024** | 1280 | 1536 | 1792 | 2048 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| gate_up vs M16 | 1.00× | 1.00× | **1.00×** | **0.79×** | 0.80× | 0.80× | 0.80× | 0.80× |
+
+**CC 8.x reserves 1 kB of shared memory per thread block**, so a CTA costs `shared + 1024` against
+both the occupancy limit and the carveout. Without that term the step would sit between 1792 and 2048;
+it sits between 768 and 1024. That is a 21% cliff produced by **256 bytes**, and it is not occupancy —
+it is the driver crossing from the 132 kB shared carveout to the 164 kB one, halving L1 from 60 kB to
+28 kB.
+
+**This kernel is L1-sensitive by construction and the code already said so.** The `VEC=4` note in
+[moe_matmul.py](python/mlc_llm/op/moe_matmul.py) records that `W_q`'s cooperative fetch issues
+duplicate-address loads which "cost L1 requests, not DRAM". Halving L1 costs **20% / 11%**.
+
+Three adjacent pad values make the point better than any argument, because the *middle* one — fewer
+resident CTAs but more L1 — is the fastest of the three:
+
+| pad | resident CTAs | L1 | gate_up | down |
+|---:|---:|---:|---:|---:|
+| 11776 | 5 | 28 kB | 0.79× | 0.85× |
+| **12032** | **4** | **60 kB** | **0.89×** | **0.80×** |
+| 12288 | 4 | 28 kB | 0.76× | 0.78× |
+
+256 B more shared costs 15% on `gate_up` by dropping L1 alone. Any shared-memory perturbation that
+does not hold the carveout fixed cannot attribute its own result — and the pad legs in the first three
+runs of this section did not, which is why they are not the numbers below.
+
+### 21.3 The decomposition
+
+`pad=12032` is the leg that matters: **identical instructions to the shipped kernel, 4 resident CTAs
+and 60 kB of L1 — exactly `BLK_M=64`'s resource state.** It isolates occupancy with nothing else moving.
+
+| term, B=1024 (tile counts identical at both widths) | gate_up | down | how |
+|---|---:|---:|---|
+| `BLK_M=64` total | **0.72×** | **0.60×** | direct A/B, reproduces §19.3 |
+| ├ occupancy 6 → 4 CTAs | 0.89× | 0.80× | `M16` + 12032 B pad, L1 held at 60 kB |
+| └ **residual: the wide tile's own per-CTA work** | **0.81×** | **0.75×** | by division |
+| candidate (a), the shared footprint itself | 1.00× | 1.00× | `M64` vs `M64` + 4 kB pad |
+
+**Occupancy is 11 of the 28 lost points on `gate_up` and 20 of 40 on `down`. The rest is candidates
+(b) and (c)** — and §19.3 already bounded the padding *multiply* inside that residual at 3%
+(`ROWSPEC`), so what is left is **operand traffic for rows that are not there**: the 4× `X_shared`
+cooperative store and the 4× A-fragment `load_matrix_sync`, both of which sit above the loop items 0k
+and 0l guarded. §19.8's closing sentence — "0l skipped the multiply, not the operand traffic feeding
+it" — is now the measured answer rather than the suspicion.
+
+### 21.4 What this refutes, and what it re-motivates
+
+**§19.8's proposed follow-up is refuted before being built.** It suggested "a narrower `BLK_N` at
+`BLK_M=64`, trading the same shared budget the other way". The shared budget is not the binding one,
+and warps/SM under a register limit is `65536 / (regs × 32)` — **independent of CTA size**. Halving
+`BLK_N` to 64 halves the CTA to 128 threads and doubles the CTA count, leaving 32 warps/SM either way.
+It buys nothing.
+
+**§18.11's objection to a single-PrimFunc dual-tile branch is right, for the wrong reason.** It argued
+the narrow path would inherit the wide path's *shared-memory* footprint and lose occupancy. It would
+inherit the wide path's **register count**, which is the budget that actually binds, and the narrow
+path would drop 6 → 4 CTAs. Same verdict, correct mechanism — and it now has a number: 0.89× / 0.80×.
+
+**The §18.9 frontier is explained**, and the two halves can now be separated without inference: the
+tile saving is a counting fact off `tuning/expert_hist_35b.npz`, and the tax is what is left.
+
+| real routing | `M64` vs `M16` (measured) | tile saving (exact) | padding share at `BLK_M=64` |
+|---|---:|---:|---:|
+| B=64, `decode_len512` | 0.74× / 0.66× | **1.00×** | 96.9% |
+| B=4096, `prose_len512` | 1.07× / 1.00× | 1.80× | 68.3% |
+| B=16384, `prose_len2048` | **1.59× / 1.48×** | 2.83× | 36.8% |
+
+The first row is the clean one: the tile saving there is **exactly** 1.00×, so 0.74× / 0.66× *is* the
+tax, measured at a second shape and agreeing with B=1024's 0.72× / 0.60×. And the tax shrinks as the
+padding share falls, which is what a residual made of padding-row operand traffic has to do. Whether
+removing it is worth the build is the open question §21.6 leaves.
+
+### 21.5 Side finding: ptxas scheduling is a ±8% lottery at fixed occupancy
+
+`-maxrregcount` legs that land on the **same** register count and the **same** resident CTAs still
+move the clock, reproducibly, in both directions:
+
+| leg | regs (default → forced) | resident CTAs | gate_up | down |
+|---|---|---:|---:|---:|
+| `M32` + `-maxrregcount=40` | 48 → **48** (unchanged) | 5 → 5 | **1.08×** | **1.07×** |
+| `M16` + `-maxrregcount=40` | 40 → **40** (unchanged) | 6 → 6 | 1.00× | **0.92×** |
+| `M64` + `-maxrregcount=40` | 64 → 48 | 4 → 5 | **0.90×** | 0.96× |
+
+ptxas floors well above the requested budget in every case and schedules differently on the way.
+It is deterministic per compile, so it is not noise — but it does not generalise across `BLK_M`, so it
+is not a lever either. **Any MoE A/B whose two legs differ only in schedule carries this much compiler
+variance**, which is the same magnitude as several items that were built and ranked on it.
+
+Drift control: `jetson_clocks` still needs an interactive sudo, so every run re-measures the reference
+leg last (`M16'`). It came back **0.99–1.01×** on every run in this section; absolutes sit ~1–3% under
+a pinned session and the ratios are unaffected.
+
+Note the last row against the decomposition: `M64` + `-maxrregcount=40` **gains** a resident CTA
+(4 → 5, a 25% occupancy increase) and still loses 10%. Occupancy being the minority term is the only
+reading that survives that.
+
+### 21.6 Where the wide-tile lane stands now, and item 0s
+
+Item 0n's whole purpose was to stop the guessing: "until this term is named, any further wide-tile
+work is guessing — which is precisely how items 0h, 0k and 0l were each costed." It is named.
+
+**What is closed.** Candidate (a) — the shared footprint — costs nothing on either channel it was
+suspected of (**1.00×** measured). §19.8's narrower-`BLK_N` follow-up is refuted without a build.
+No wide tile can be occupancy-neutral on sm_87, because `BLK_M=16` sits *exactly* on the 40-register
+boundary and each extra accumulator costs 4 more. That part of the lane is structurally shut.
+
+**What is open, and is now a specific build rather than a guess — item 0s.** The residual is
+**19 points of 28 on `gate_up`, 25 of 40 on `down`**, it is operand traffic for rows that are not
+there, and both producers are annotatable exactly as items 0k and 0l's loops were, one level up:
+
+- **(c) the A-fragment `load_matrix_sync`** — `A_mat` is attached at `k_o_i`, above the `i_o` loop that
+  `ROWSPEC` predicates, so all four fragments are loaded on every k-step. Its cache-read nest carries
+  no barrier, so 0l's predicate form applies directly.
+- **(b) the `X_shared` cooperative store** — 4 fragments stored per k-step regardless of `row_end`.
+  The load is already predicated (padding rows cost no DRAM), but the shared store and its `condval`
+  are paid. `ax0_ax1_fused_0` carries no barrier of its own, so item 0k's *extent* trick applies —
+  and §19.1's finding that a runtime extent costs 5–9% by blocking the unroll says to use 0l's
+  predicate instead.
+
+**Do not pre-cost it from the tile counts.** The obvious arithmetic — tile saving × tax — predicts
+1.39× at B=4096 `prose_len512` where the measurement is 1.07×, because §18.4 put this kernel at 45%
+of the bandwidth wall, not at it. The tax also shrinks with the padding share (0.74× at 97% padding,
+and the wide tile already *wins* at 37%), so the win concentrates at intermediate B and has to be
+measured there, at real routing, not extrapolated from B=1024. `moe_rowspec_ab.py` and
+`moe_occupancy_ab.py` both take `--indptr-file`, so this needs **no model compile** to rank.
