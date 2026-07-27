@@ -614,6 +614,10 @@ def _dequantize_group_gemm_v2(
     # so widening BLK_M amortizes one weight dequant over more rows instead of repeating
     # it. Inert at BLK_M=16 (i_o has extent 1). See _schedule_v2 and §17.8.
     HOIST = os.environ.get("MLC_MOE_GEMM_V2_HOIST", "0") == "1"
+    # Item 0j: the order the dispatch table walks (m-tile, n-tile) within one expert.
+    # See the comment at its use site in _dispatch_func. Bit-exact either way.
+    TILE_N_MAJOR = os.environ.get("MLC_MOE_GEMM_V2_TILEORDER", "m") == "n"
+    SKIPROWS = os.environ.get("MLC_MOE_GEMM_V2_SKIPROWS", "0") == "1"
     assert BLK_M % 16 == 0, "BLK_M must be a multiple of the wmma M=16"
     BLK_N = 128
     # BLK_K sets the k-step of the cooperative fetch, and therefore how many bytes of
@@ -669,6 +673,48 @@ def _dequantize_group_gemm_v2(
                         te[(sb + nb + sl) * tiles_per_n + tni] = -1
                         tm[(sb + nb + sl) * tiles_per_n + tni] = 0
                         tn[(sb + nb + sl) * tiles_per_n + tni] = 0
+
+    # Item 0j (refuted, §18.6): the same tiles handed out n-major instead of m-major, so
+    # consecutive CTAs share a weight slice rather than an X_tile. Both orders cover
+    # [0, nb*tiles_per_n) exactly and assign the identical set of (e, m, n) triples to
+    # disjoint outputs, so it is bit-exact by construction — and measured so, 10/10.
+    # It buys **nothing**: 0.99x-1.01x at B=4096 and B=16384 across BLK_M and hoist, so
+    # §18.4's 2.9x issued/unique is not a cache-ordering problem. Kept as a flag because
+    # the idea is an obvious one to re-propose; written as a second whole prim_func rather
+    # than a parameterised index so the shipped path above stays byte-for-byte what §17.6
+    # gated (verify with scripts/moe_dump_cuda.py).
+    if TILE_N_MAJOR:
+
+        @T.prim_func(private=True)
+        def _dispatch_func(  # noqa: F811
+            indptr_buf: T.Buffer((Ne + 1,), indptr_dtype),
+            var_te: T.handle,
+            var_tm: T.handle,
+            var_tn: T.handle,
+        ):
+            T.func_attr({"tirx.is_scheduled": 1, "tirx.noalias": True})
+            UPPER = T.int32(is_size_var=True)
+            te = T.match_buffer(var_te, (UPPER,), "int32")
+            tm = T.match_buffer(var_tm, (UPPER,), "int32")
+            tn = T.match_buffer(var_tn, (UPPER,), "int32")
+
+            with T.sblock("root"):
+                for eid in T.thread_binding(0, Ne, thread="threadIdx.x"):
+                    sb: T.int32 = T.ceildiv(indptr_buf[eid], BLK_M) + eid
+                    nb: T.int32 = T.ceildiv(indptr_buf[eid + 1] - indptr_buf[eid], BLK_M)
+                    sb_next: T.int32 = T.ceildiv(indptr_buf[eid + 1], BLK_M) + eid + 1
+                    for tmi in T.serial(nb):
+                        for tni in T.serial(tiles_per_n):
+                            te[sb * tiles_per_n + tni * nb + tmi] = eid
+                            tm[sb * tiles_per_n + tni * nb + tmi] = (
+                                indptr_buf[eid] + tmi * BLK_M
+                            )
+                            tn[sb * tiles_per_n + tni * nb + tmi] = tni * BLK_N
+                    for sl in T.serial(sb_next - (sb + nb)):
+                        for tni in T.serial(tiles_per_n):
+                            te[(sb + nb + sl) * tiles_per_n + tni] = -1
+                            tm[(sb + nb + sl) * tiles_per_n + tni] = 0
+                            tn[(sb + nb + sl) * tiles_per_n + tni] = 0
 
     te_t, tm_t, tn_t = op.tensor_ir_op(
         _dispatch_func,
@@ -799,6 +845,17 @@ def _dequantize_group_gemm_v2(
         else:
             sch.reorder(i_o, j_o, k_o_o, k_o_i)
         sch.bind(j_o, "threadIdx.y")
+        # Item 0k: tag the row-fragment loop so `_guard_padding_rows` can shorten it to
+        # the fragments that hold real rows.
+        #
+        # Only when the guard is actually wanted. An annotation is not free even if
+        # nothing reads it: it stops TVM eliminating the unit loop, so at the shipped
+        # BLK_M=16 an unconditional `annotate` emits `for (a0_0 = 0; a0_0 < 1; ++a0_0)`
+        # around the entire CTA body. nvcc would delete that, but "the shipped kernel is
+        # unchanged" is a claim worth being able to prove by diffing the generated CUDA
+        # (scripts/moe_dump_cuda.py) rather than by arguing about the optimiser.
+        if SKIPROWS:
+            sch.annotate(i_o, "moe_row_guard", 1)
         # Tag k_o_o so item 0f can find it by name. It used to be located by matching
         # `extent == K // BLK_K`, which is not unique — at K=512, BLK_K=64 that extent
         # is 8 and so is another loop, and the rewrite refused to run at all.
@@ -966,7 +1023,93 @@ def _dequantize_group_gemm_v2(
                 )
         return func.with_body(body)
 
+    # ---------- item 0k: skip row fragments that hold no real rows ----------
+    def _guard_padding_rows(func):
+        """Shorten the row-fragment loop to `ceildiv(real rows in this tile, MICRO)`.
+
+        A CTA covers `BLK_M` rows of one expert, but the expert's last tile is usually
+        partial: item 0i measured a real pp512 prefill at ~23 rows per hit expert, so at
+        `BLK_M=64` a tile carries 23 real rows and 41 padding ones. The `X_shared` load is
+        already predicated on `row_end`, so those rows cost no DRAM traffic — but the wmma
+        reduction still runs over all `BLK_M/MICRO` fragments and two of the four here are
+        entirely zeros.
+
+        **This is the whole reason widening `BLK_M` has a short-prompt cost.** §17.10 found
+        `BLK_M=64` losing 10.4% at pp128 and concluded no compile-time width is Pareto; the
+        loss is padding-row compute, and padding rows are exactly what a wider tile creates
+        when experts are small. Removing it is what could make a wide tile safe everywhere.
+
+        Mechanism is item 0f's, for item 0f's reason: an `if` cannot wrap these loops
+        because the cooperative loads carry `__syncthreads()` and ThreadSync refuses to
+        place a barrier inside a condition. The extent is CTA-uniform — it depends only on
+        `tm[bx]` and `indptr` — so every thread agrees on the trip count.
+
+        Bit-exact by construction: a skipped fragment's accumulator is never initialised
+        and never stored, and the global store is predicated on `m_offset + i < row_end`,
+        which is false for exactly those rows. Nothing skipped was ever observable, the
+        same argument that gates item 0f.
+        """
+        # `m_offset` and `row_end` are bound near the top of the CTA block, but the
+        # schedule moves and re-nests those bindings, so collect them by name over the
+        # whole body rather than by position. Duck-typed on `.var`: the let-statement node
+        # is not exported under a stable name from `tvm.tirx`.
+        want = {"m_offset", "row_end"}
+        lets: dict = {}
+
+        def _collect(n):
+            var = getattr(n, "var", None)
+            if var is not None and getattr(var, "name", None) in want:
+                lets.setdefault(var.name, var)
+
+        tirx.stmt_functor.post_order_visit(func.body, _collect)
+        missing = want - set(lets)
+        if missing:
+            raise RuntimeError(
+                f"CTA block does not bind {missing} (found {sorted(lets)}); "
+                "source layout changed"
+            )
+        m_off, row_end = lets["m_offset"], lets["row_end"]
+
+        hits = []
+
+        def _rewrite(n):
+            if not isinstance(n, tirx.For) or n.thread_binding is not None:
+                return None
+            if "moe_row_guard" not in (n.annotations or {}):
+                return None
+            hits.append(n)
+            zero = tirx.IntImm(m_off.dtype, 0)
+            rows = tirx.Max(row_end - m_off, zero)
+            frags = tirx.floordiv(rows + (MICRO - 1), MICRO)
+            return tirx.For(
+                n.loop_var, n.min,
+                tirx.Min(tirx.Cast(n.extent.dtype, frags), n.extent),
+                n.kind, n.body, n.thread_binding, n.annotations,
+            )
+
+        body = tirx.stmt_functor.ir_transform(func.body, None, _rewrite, ["tirx.For"])
+        # Two hits is the expected shape, not drift: `sch.blockize` leaves the row-fragment
+        # loop in the compute nest, and `reverse_compute_at` of the accumulator -> O_tile
+        # store re-materialises it in the store nest. Both must be shortened, and both are
+        # safe to shorten for the same reason — a fragment that holds no real rows has its
+        # global store predicated off regardless of what O_tile holds.
+        if not 1 <= len(hits) <= 2:
+            raise RuntimeError(
+                f"expected 1 or 2 `moe_row_guard` loops, found {len(hits)}; "
+                "the schedule dropped or duplicated it"
+            )
+        if os.environ.get("MLC_MOE_GEMM_V2_SKIPROWS_DEBUG"):
+            for i, h in enumerate(hits):
+                print(f"[0k] guard {i}: var={h.loop_var.name} extent={h.extent} "
+                      f"body={str(h.body)[:120]!r}")
+        return func.with_body(body)
+
     scheduled = _schedule_v2()
+    # Item 0k, opt-in while it is being measured. Inert at BLK_M=16, where the row loop
+    # has extent 1 and the only tile it can shorten is a padding CTA that item 0f already
+    # skips whole.
+    if SKIPROWS:
+        scheduled = _guard_padding_rows(scheduled)
     # Default ON since §16.11: bit-exact on all 8 gate cases, +19.4% pp512 on the 35B
     # (644.26 -> 769.18 tps), decode neutral, and the state gate is *identical* to the
     # pre-change lib in both prefix-cache modes.

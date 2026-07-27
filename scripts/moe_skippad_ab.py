@@ -29,7 +29,7 @@ import numpy as np
 import tvm
 
 sys.path.insert(0, os.path.dirname(__file__))
-from moe_gemm_check import SHAPES, build, make_inputs, run  # noqa: E402
+from moe_gemm_check import SHAPES, build, load_real_counts, make_inputs, run  # noqa: E402
 
 MODES = ["0", "koo", "1"]
 
@@ -37,31 +37,45 @@ MODES = ["0", "koo", "1"]
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--batches", default="4096", help="comma-separated batch sizes")
+    p.add_argument("--indptr-file", default=None,
+                   help=".npz from scripts/moe_expert_histogram.py. The padding share this "
+                        "measures is the whole point of the flag, and the synthetic "
+                        "routings get it wrong (workplan 17.9); B comes from the file")
+    p.add_argument("--indptr-key", default=None, help="a single key from the .npz")
+    p.add_argument("--indptr-picks", default="min,med,max",
+                   help="which layers to take, ranked by tile count at BLK_M=16")
     cli = p.parse_args()
 
     dev = tvm.cuda(0)
     target = tvm.target.Target.from_device(dev)
     print(f"[skippad] target=sm_87  modes={MODES}")
 
+    if cli.indptr_file:
+        legs = [(int(c.sum()), lbl, c)
+                for lbl, c in load_real_counts(cli.indptr_file, cli.indptr_key,
+                                               cli.indptr_picks)]
+    else:
+        legs = [(B, r, None) for B in (int(v) for v in cli.batches.split(","))
+                for r in ("even", "random")]
+
     failures = 0
     for name in SHAPES:
         N, K = SHAPES[name]
-        for B in (int(v) for v in cli.batches.split(",")):
-            for routing in ("even", "random"):
-                args, indptr = make_inputs(N, K, B, routing, dev)
-                ref_o, ref_ms, cells = None, None, []
-                for mode in MODES:
-                    os.environ["MLC_MOE_GEMM_V2_SKIPPAD"] = mode
-                    out, ms = run(build(N, K, B, target, dev), args, dev, True)
-                    if ref_o is None:
-                        ref_o, ref_ms = out, ms
-                        cells.append(f"{mode}: {ms:7.3f} ms (ref)")
-                        continue
-                    exact = np.array_equal(ref_o, out)
-                    failures += 0 if exact else 1
-                    tag = "exact" if exact else f"DIFF({int((ref_o != out).sum())})"
-                    cells.append(f"{mode}: {ms:7.3f} ms {ref_ms / ms:5.2f}x {tag}")
-                print(f"{name:8} B={B:<5} {routing:7} " + " | ".join(cells))
+        for B, routing, counts in legs:
+            args, indptr = make_inputs(N, K, B, routing, dev, counts=counts)
+            ref_o, ref_ms, cells = None, None, []
+            for mode in MODES:
+                os.environ["MLC_MOE_GEMM_V2_SKIPPAD"] = mode
+                out, ms = run(build(N, K, B, target, dev), args, dev, True)
+                if ref_o is None:
+                    ref_o, ref_ms = out, ms
+                    cells.append(f"{mode}: {ms:7.3f} ms (ref)")
+                    continue
+                exact = np.array_equal(ref_o, out)
+                failures += 0 if exact else 1
+                tag = "exact" if exact else f"DIFF({int((ref_o != out).sum())})"
+                cells.append(f"{mode}: {ms:7.3f} ms {ref_ms / ms:5.2f}x {tag}")
+            print(f"{name:8} B={B:<5} {routing:16} " + " | ".join(cells))
 
     print(f"\n{'PASS' if failures == 0 else f'FAIL ({failures} case(s) not bit-exact)'}")
     sys.exit(1 if failures else 0)

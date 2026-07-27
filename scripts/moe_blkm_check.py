@@ -32,7 +32,9 @@ import numpy as np
 import tvm
 
 sys.path.insert(0, os.path.dirname(__file__))
-from moe_gemm_check import NE, SHAPES, build, make_inputs, run  # noqa: E402
+from moe_gemm_check import (  # noqa: E402
+    NE, SHAPES, build, load_real_counts, make_inputs, run,
+)
 
 
 def main() -> None:
@@ -42,6 +44,15 @@ def main() -> None:
     p.add_argument("--batches", default="4096", help="comma-separated batch sizes to time")
     p.add_argument("--hoist", default="0", help="comma-separated MLC_MOE_GEMM_V2_HOIST values "
                                                 "(item 0h). Every combination is swept")
+    p.add_argument("--indptr-file", default=None,
+                   help=".npz from scripts/moe_expert_histogram.py. Replaces the synthetic "
+                        "even/random routings with measured ones and takes B from them; "
+                        "REQUIRED for any BLK_M conclusion, since the synthetics got item "
+                        "0h's sign wrong (workplan 17.9)")
+    p.add_argument("--indptr-key", default=None,
+                   help="a single key from the .npz (e.g. prose_len2048); default is all")
+    p.add_argument("--indptr-picks", default="min,med,max",
+                   help="which layers to take, ranked by tile count at BLK_M=16")
     cli = p.parse_args()
 
     blkms = [int(v) for v in cli.blkm.split(",")]
@@ -57,11 +68,21 @@ def main() -> None:
     target = tvm.target.Target.from_device(dev)
     print(f"[blkm] target=sm_87  SKIPPAD={os.environ['MLC_MOE_GEMM_V2_SKIPPAD']}  blkm={blkms}")
 
-    cases = [(n, B, r) for n in SHAPES for B in batches for r in ("even", "random")]
+    if cli.indptr_file:
+        # Measured routing (item 0i). B comes from the histogram, so --batches is ignored:
+        # a real pp512 prefill is B=4096 *and* a particular shape of raggedness, and the
+        # two cannot be varied independently. §17.9 is why the synthetic legs are not the
+        # thing to quote — keep them only if --routings asks for them.
+        real = load_real_counts(cli.indptr_file, cli.indptr_key, cli.indptr_picks)
+        cases = [(n, int(c.sum()), lbl, c) for n in SHAPES for lbl, c in real]
+        print(f"[blkm] real routing from {cli.indptr_file}: "
+              + ", ".join(f"{lbl} (B={int(c.sum())})" for lbl, c in real))
+    else:
+        cases = [(n, B, r, None) for n in SHAPES for B in batches for r in ("even", "random")]
     failures = 0
-    for name, B, routing in cases:
+    for name, B, routing, counts in cases:
         N, K = SHAPES[name]
-        args, indptr = make_inputs(N, K, B, routing, dev)
+        args, indptr = make_inputs(N, K, B, routing, dev, counts=counts)
         ref_o, ref_ms, row = None, None, []
         for hoist in hoists:
             for blkm in blkms:

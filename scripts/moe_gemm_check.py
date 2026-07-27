@@ -80,9 +80,39 @@ def build(N: int, K: int, B: int, target, dev):
     return relax.VirtualMachine(relax.build(mod, target=target), dev)
 
 
-def make_inputs(N: int, K: int, B: int, routing: str, dev, seed: int = 0):
+def load_real_counts(path: str, key: str | None = None, picks: str = "min,med,max"):
+    """Real per-layer expert counts, as dumped by `scripts/moe_expert_histogram.py`.
+
+    The synthetic routings below bracket nothing real — they predicted item 0h's *wrong
+    sign* (§17.9), which is why item 0i measured the actual distribution. An `.npz` entry
+    is `(windows, layers, NE)` for prefill or `(layers, NE)` for decode; every
+    (window, layer) pair is one candidate routing, and `picks` selects among them by tile
+    count at `BLK_M=16` — the shipped config, so the ranking is the one that ships.
+
+    Returns `[(label, counts)]`; each `counts` carries its own B (`counts.sum()`), which
+    the caller must use instead of a `--batches` value.
+    """
+    data = np.load(path)
+    keys = [key] if key else [k for k in data.files if k not in ("top_k",)]
+    out = []
+    for k in keys:
+        arr = np.asarray(data[k]).reshape(-1, NE)
+        tiles = np.sum(-(-arr // 16), axis=1)
+        order = np.argsort(tiles, kind="stable")
+        chosen = {"min": order[0], "med": order[len(order) // 2], "max": order[-1]}
+        for p in picks.split(","):
+            i = chosen[p.strip()]
+            out.append((f"{k}/{p.strip()}", arr[i].astype(np.int64)))
+    return out
+
+
+def make_inputs(N: int, K: int, B: int, routing: str, dev, seed: int = 0, counts=None):
     rng = np.random.default_rng(seed)
-    if routing == "random":
+    if counts is not None:
+        # A measured routing (item 0i). B is a property of the histogram, not a free knob.
+        counts = np.asarray(counts, dtype=np.int32)
+        assert int(counts.sum()) == B, f"real routing has B={int(counts.sum())}, asked {B}"
+    elif routing == "random":
         counts = np.bincount(rng.integers(0, NE, size=B), minlength=NE).astype(np.int32)
     else:
         counts = np.full(NE, B // NE, dtype=np.int32)

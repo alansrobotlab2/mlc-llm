@@ -6,6 +6,89 @@ Format: one entry per work session. Keep it terse — what was done, what was le
 
 ---
 
+## 2026-07-26e — Item 0i lands and retracts the roofline: the MoE is at 45% of the wall, not 85%
+
+Item 0i (the real expert histogram) was the queued task. It did what §17.9 predicted — moved numbers —
+and then retracted §17.7, the section that declared this kernel finished. Two new items were built on
+the back of it; one is refuted, one works but only slides along a frontier. **Defaults unchanged**, and
+for the first time that claim is proved by diffing the generated CUDA rather than argued from timing.
+
+**Item 0i — the histogram (§18.1)**
+- Forward hooks on the 40 routers under the existing fp8 HF path. `scripts/moe_expert_histogram.py`.
+- pp512 real prose: **171 of 256 experts hit**, busiest expert takes **396 of 4096 rows** (25x uniform),
+  tiles 362/246/191 at BLK_M 16/32/64, padding **29.3%**. pp2048: 217 hit, tiles 1145/646/404, 10.6%.
+- **§16.11's inferred ~40% padding was too high.** Measured 29.3% / 10.6%.
+- **§17.9's filler bias now has a mechanism and the arithmetic closes**: filler yields 5.5% fewer tiles,
+  and §17.9 measured pp512 reading 4.3% faster on filler.
+- **Tile count is flat across layer depth** (349-380 at pp512) though hit-count varies 50%. So one
+  representative routing is legitimate — the microbench needed a *real* distribution, not a per-layer one.
+
+**What the instruments were getting wrong (§18.2)** — it is shape-specific, which is why it hid so long.
+At B=16384 synthetic `random` is a good proxy (1146 vs 1145 tiles). At B=4096 it is not: real routing
+cuts tiles as BLK_M widens (362->246->191) while both synthetics saturate. That missing term is what
+inverted item 0h's sign at the headline shape.
+
+**§17.7 RETRACTED (§18.4).** Re-rooflined on the measured indptr: `gate_up` at B=4096 is **45.3% of the
+156 GB/s wall**, not 86.5%; `down` 46.2%, not 86.8%. Real routing hits fewer experts (unique bytes down
+to 61%) *and* fragments more (tiles up 42%), so the kernel issues **2.9x** the bytes DRAM supplies.
+"No bandwidth story left" was an `even`-routing artifact. **The meta-lesson is now six for six** — every
+one an extrapolation across conditions, and this one was a *careful re-measurement* on the wrong routing.
+
+**Item 0h re-measured (§18.3)** — wins at every shape now: GEMM pair 1.033x at pp512, **1.56x at pp2048**.
+Cross-check: 1.033x on 52.5% of prefill predicts +1.7% e2e vs §17.10's measured +1.3%. Instrument fixed.
+
+**Item 0j — reorder dispatch tiles for L2. REFUTED (§18.6).** 0.99-1.01x across 10 bit-exact configs.
+Useful negative: §18.4's 2.9x amplification is not a cache-ordering problem.
+
+**Item 0k — skip all-padding row fragments. Built, bit-exact, but it interpolates (§18.7, §18.9).**
+Pays only at BLK_M=32 (1.06x); *loses* 5-9% at 16 and 64 — at 16 the guard is logically inert, so that
+loss is the cost of replacing a constant loop extent with a runtime expression. End-to-end it moves
+BLK_M=32 from -4.9%/+0.8%/+8.0% to **-2.1%/+2.8%/+5.3%** (pp128/512/2048): it buys short-prompt safety
+with long-prompt gain, the same currency BLK_M spends the other way.
+
+**The frontier, one session, one clock state (§18.9)** — prose, radix, 4 libs x 3 lengths, decode neutral:
+
+| pp | blkk64 (shipped) | m32rows | hoist32 | hoist64 |
+|---|---|---|---|---|
+| 128 | **576.33** | 564.16 | 548.11 | 524.67 |
+| 512 | 827.39 | **850.39** | 833.71 | 826.86 |
+| 2048 | 945.00 | 995.41 | 1020.29 | **1063.48** |
+
+Monotone in one parameter (padded row-space per CTA), no exception in 12 cells, **nothing is Pareto**.
+§17.10 reproduces within 1.5 points everywhere, which is what makes the sessions comparable.
+
+**Gates.** 12/12 SKIPROWS, 10/10 TILEORDER, 8/8 SKIPPAD-under-SKIPROWS, all bit-exact. 35B state gate on
+`lib_m32rows`: **139/139 in both prefix-cache modes.**
+
+**Learned**
+- **"Inert when disabled" is checkable, and it was false.** An unconditional `sch.annotate` — with nothing
+  reading it — stopped TVM eliminating a unit loop and changed the *shipped* kernel. Timing said 0.3%
+  (noise); exactness gates compare outputs and cannot see scheduling. `scripts/moe_dump_cuda.py` diffs the
+  emitted CUDA. Four sessions have asserted some version of this claim from evidence that could not support it.
+- **Diffing generated code needs a control.** TVM's CSE numbering is not run-to-run stable: two dumps of the
+  *identical* source differ by ~14 lines, more than the real 8-line delta. Normalize `cse_v[0-9]+` and check
+  the same-source control diffs empty first.
+- **A `--dry-run` on the meta device is worth writing before an 11-minute model load.** Two AttributeErrors
+  (`model.layers.*` not `language_model.layers.*`; `config` is already the text config) each cost a full load.
+- **Do not edit a source file while a job is reading it.** TVM re-parses the TIR per case; a live edit killed
+  a running A/B midway.
+
+**Next**
+- **VL re-gate is blocked by a real compile break, not by a download.** `--model-type qwen3_5_vl` converts
+  (383 params, vision tower included) but `BLASDispatch` dies:
+  `Check failed: (tensor_sinfo) is false: Expect TensorStructInfo, but received: relax.ShapeStructInfo`.
+  `cublas_gemm` auto-enables only for q0f16, which is why no q4 build ever hit it. Retrying with
+  `cublas_gemm=0`; the discriminating probe (does text-only q0f16 break too?) is running with it.
+- **The next MoE lever is fuller tiles, not bigger ones** (§18.11). Every config measured picks one
+  compile-time tile height and accepts the routing's padding. A per-expert tile height chosen from `indptr`
+  at dispatch time would attack fragmentation directly. Uncosted, but the first idea in three sessions that
+  is not a point on the frontier §18.9 mapped.
+- Item 0h's runtime branch is the **wrong shape of fix**: `LowBatchGemvSpecialize` branches inside one
+  PrimFunc, so the narrow path would inherit the wide path's shared-memory footprint — the exact cost the
+  branch exists to avoid. A Relax `If` avoids it and there is **no `relax.If` anywhere in mlc_llm**.
+
+---
+
 ## 2026-07-26d — Both queued candidates refuted; the win was a parameter nobody had swept (769 -> 875)
 
 The previous handoff left three uncosted candidates and no queued item. All three are settled, and

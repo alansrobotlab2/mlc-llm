@@ -20,6 +20,11 @@ was never measured until 2026-07-25c, and it was getting barely half the headlin
 | 35B-A3B | 355 | 628 | 642 | 769 | **875 (+147% overall, +14.1% from §17)** |
 | 0.8B | 1469 | 3912 | **4888 (+233% overall)** | — | — (no MoE; §17 cannot reach it) |
 
+> ⚠️ **Every number in that row is a filler-prompt number and is ~4% optimistic** (§17.9). §18 measured
+> the shipped lib on real prose at **827 tps** pp512 / **945** pp2048, and mapped a frontier of
+> alternative `BLK_M` configurations reaching **995–1063 tps at pp2048** — §18.9. Defaults are
+> unchanged; the choice is a workload judgement and the evidence for making it is now in one table.
+
 §16.5 is the lane-split GDN recurrence; decode is neutral on both models (≤0.1%). The two models
 differ by 10× on it because the kernel's grid is `(num_value_heads, batch)` — 16 blocks on the 0.8B,
 32 on the 35B — so only the 0.8B was ever grid-starved. **This is the standing trap for anything
@@ -1150,13 +1155,21 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 #### Open
 
-> As of the **end of 2026-07-26d** the open list is **three items and no queued one**, ordered by
-> how well they are costed:
+> ### ⬆️ Superseded by §18 — read §18.11 first.
+>
+> **Item 0i is done** (§18.1) and it moved more than expected: it retracted §17.7's roofline (the
+> kernel is at **45%** of the bandwidth wall, not 85–87% — §18.4), corrected §16.11's padding share
+> (29.3%, not ~40%), and turned item 0h from "wrong sign at pp512" into "wins at every measured
+> shape". Two new items were built and measured on the back of it: **0j (tile order) is refuted**
+> (§18.6) and **0k (row-fragment skip) works but only interpolates** along the same frontier (§18.7).
+> §18.9 maps that frontier across 4 libs × 3 prompt lengths; **no configuration is Pareto** and the
+> defaults are unchanged. The list below is kept for the items §18 did not touch.
 >
 > | item | state | worth |
 > |---|---|---|
-> | **0i — START HERE** | not started; ~half a day, no compile needed | **unblocks ranking of everything else in the MoE.** Both instruments currently in use misrepresent real routing badly enough to have inverted a sign (§17.9) |
-> | **0h** | built, bit-exact, parked — needs a runtime branch on `B` near 3600 | **+12.6% on ≥2048-token prefill, no short-prompt cost** (§17.10) — but the figure rests on one prose corpus, which is what 0i fixes |
+> | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
+> | **0h** | re-costed by §18.9; the runtime branch is the **wrong shape of fix** (§18.11) | the frontier's upper envelope, ≤ +12.5% at pp2048 only |
+> | **fuller tiles, not bigger** | **new, uncosted — the first non-frontier idea in three sessions** | attacks fragmentation directly instead of trading it (§18.11) |
 > | **VL re-gate** | **not blocked** — checkpoint is local, only a compile is missing | correctness, not perf: five state-path changes never gated on that path |
 > | **0c.2** | de-prioritised; changes the arithmetic, so bit-exactness is off the table | ≤ +12.5% by Amdahl |
 >
@@ -3780,3 +3793,429 @@ Relax branch. Worth **+12.6% on ≥2048-token prefill with no short-prompt cost*
 context window is 262144 and whose `prefill_chunk_size` is 2048 — so long prompts run the winning
 shape for all but their last chunk. The cost is two kernel variants in the binary (the dispatch table
 is `BLK_M`-dependent, so it cannot be shared) and a branch on a symbolic shape.
+
+---
+
+## 18. Session 2026-07-26e — the routing nobody had measured, and what it overturns
+
+Item 0i was the whole point of this session, and it did what §17.9 predicted it would: it moved
+numbers. It also produced a **retraction of §17.7**, the section that declared the MoE GEMM finished.
+
+| | claim | status |
+|---|---|---|
+| §18.1 | the real expert histogram | **measured** — 171/256 experts hit at pp512, busiest takes 396 of 4096 rows |
+| §18.2 | both synthetic routings judged against it | wrong at B=4096, `random` is fine at B=16384 |
+| §18.3 | item 0h re-measured on real routing | **wins at every measured shape**, up to 1.56× on the GEMM pair |
+| §18.4 | **§17.7 retracted** | the kernel is at **45% of the wall**, not 85–87%. The lane is re-opened |
+| §18.5 | item 0f re-measured | 1.35× on prose, and the filler overstated it |
+| §18.6 | item 0j — dispatch tile order | ❌ **refuted**, 0.99–1.01× across 10 configs, bit-exact |
+| §18.7 | item 0k — skip all-padding row fragments | built, bit-exact; **only pays at `BLK_M=32`** |
+| §18.9 | the frontier, 4 libs × 3 lengths, one clock state | **monotone, nothing Pareto**; best pp2048 **1063 tps** |
+| §18.10 | "defaults unchanged" checked by diffing generated CUDA | **was false when written**; now true and proved |
+| §18.11 | where the lane stands | re-opened; next lever is **fuller tiles, not bigger** |
+| §18.12 | VL re-gate | ⛔ **blocked by a real compile break**, not by a download |
+
+### 18.1 Item 0i — the real expert histogram
+
+[scripts/moe_expert_histogram.py](scripts/moe_expert_histogram.py) puts a forward hook on each of the
+40 text-stack routers under the existing fp8 HF path (§6.1) and bincounts the top-8 assignments. No
+MLC instrumentation, no compile. Prompts come from the bench harness's own `build_prompt`, so the
+routing measured is the routing the §17.10 pp numbers ran under.
+
+Two implementation notes that cost time and are worth not repeating. The routers are at
+**`model.layers.N.mlp.gate`** — *not* `language_model.layers...` as §9's item entry assumed; the
+multimodal prefix does not appear when `AutoModelForCausalLM` unwraps to the text model, and
+`model.config` is then a bare `Qwen3_5MoeTextConfig` with no `.text_config`. Both were discovered by
+an `AttributeError` **after an 11-minute weight load**, which is why the script now has a `--dry-run`
+that builds the model on the meta device and checks the layout in seconds. There is also no MTP
+router in this instantiation at all (the excluded-group count came back empty), so the "exclude layer
+40" warning in item 0i's entry was guarding against something that is not there.
+
+**pp512 (B = 512 × top-8 = 4096), median over 40 layers, 3 corpus windows:**
+
+| | experts hit | busiest expert | tiles @16 | @32 | @64 | padding @16 |
+|---|---:|---:|---:|---:|---:|---:|
+| **real prose** | **171** / 256 | **396 rows** | **362** | **246** | **191** | **29.3%** |
+| synthetic `even` | 256 | 16 | 256 | 256 | 256 | 0% |
+| synthetic `random` | 256 | 29 | 368 | 256 | 256 | 30.4% |
+| bench filler | 137 | **512** (saturated) | 342 | 222 | 168 | 25.0% |
+
+**pp2048 (B = 16384):**
+
+| | experts hit | busiest expert | tiles @16 | @32 | @64 | padding @16 |
+|---|---:|---:|---:|---:|---:|---:|
+| **real prose** | **217** / 256 | 1660 rows | **1145** | **646** | **404** | **10.6%** |
+| synthetic `random` | 256 | 88 | 1146 | 635 | 379 | 10.6% |
+| synthetic `even` | 256 | 64 | 1024 | 512 | 256 | 0% |
+
+**Three things fall out.**
+
+1. **Real routing is heavily skewed.** The busiest expert takes 396 of 4096 rows — 9.7% of a
+   256-expert layer's traffic, **25× uniform**. Neither synthetic routing has anything like it.
+2. **§16.11's padding share was inferred and is too high.** It reasoned ~40% from an end-to-end
+   ratio; measured is **29.3% at pp512 and 10.6% at pp2048** (range across layers 25.4–34.9% and
+   9.7–11.5%).
+3. **§17.9's filler bias now has a mechanism, and the arithmetic checks out.** The filler yields 342
+   tiles against prose's 362 — **5.5% fewer** — and §17.9 measured pp512 reading **4.3% faster** on
+   filler. The routing histogram predicts the tps bias almost exactly. Its busiest expert absorbs
+   *all 512 tokens*; prose's takes 396.
+
+**Layer depth barely matters, and that is the useful part.** Expert-hit count varies 50% across
+depth (247 at layer 0, 158 by layer 36) but tile count does not: 349–380 at pp512, 1139–1152 at
+pp2048. Concentrating rows onto fewer experts makes longer runs (fewer partial tiles) but leaves
+fewer experts contributing one, and the two nearly cancel. **So a single representative routing is
+legitimate for tile-count work** — the microbench does not need per-layer specialisation, it needed a
+*real* distribution. Layer 0 is the one outlier: it routes near-uniformly (247 hit), as if the router
+has not yet specialised on anything.
+
+Corpus-window spread is small (176.6 / 185.4 / 178.4 experts hit at pp512), so the numbers are not an
+artifact of one window — though they remain one corpus, and one corpus is not English.
+
+**Decode is a different regime and is not this kernel's problem.** Eight decode steps touch 32
+distinct experts (41 after a 2048-token prefill), so a decode *sequence* streams ~1/8 of the expert
+weights. That is a weight-residency fact, not a tile-count one: at b=1 the MoE goes through the gemv
+path (§16.4), not this GEMM.
+
+### 18.2 What the two instruments were actually getting wrong
+
+The failure is **shape-specific, not universal**, which is why it went unnoticed so long.
+
+At **B=16384** synthetic `random` is a good proxy — 1146 tiles against the real 1145, and within 6%
+even at `BLK_M=64`. That is why §17.10's pp2048 microbench prediction matched its end-to-end result.
+
+At **B=4096** it is not. Real routing cuts tiles as `BLK_M` widens — 362 → 246 → 191 — while both
+synthetics **saturate**: `even` sits flat at 256 and `random` goes 368 → 256 → 256. The synthetics are
+blind to the `BLK_M=64` reduction entirely, and that missing term is precisely what made them predict
+item 0h's **wrong sign** at the headline benchmark shape.
+
+The mechanism is expert *count*, not raggedness. 4096 rows over 256 experts is 16 rows each — exactly
+one `BLK_M=16` tile, nothing to save. 4096 rows over the **171** experts real routing hits is ~24
+each, which spills into a second tile at width 16 and fits one at width 32. Uniform routings cannot
+produce that because they hit every expert by construction.
+
+### 18.3 Item 0h re-measured on real routing — it wins at every shape measured
+
+All 24 configs bit-exact. `H=1` is the item-0h hoist.
+
+| | shipped M=16 | M=32/H=1 | M=64/H=1 |
+|---|---:|---:|---:|
+| **pp512** `gate_up` | 3.771 ms | 3.614 (1.04×) | 3.647 (1.03×) |
+| **pp512** `down` | 1.916 ms | 1.889 (1.01×) | 1.918 (1.00×) |
+| **pp512 pair** | **5.687** | **5.503 (1.033×)** | 5.565 (1.022×) |
+| **pp2048** `gate_up` | 11.235 ms | 8.511 (1.32×) | **7.065 (1.59×)** |
+| **pp2048** `down` | 5.815 ms | 4.594 (1.27×) | **3.857 (1.51×)** |
+| **pp2048 pair** | **17.050** | 13.105 (1.30×) | **10.922 (1.56×)** |
+
+Without the hoist every width still loses (0.41×–0.90×), which is §17.1's measurement reproduced and
+its diagnosis confirmed.
+
+**The sign is now right.** The synthetic microbench predicted a **25% loss** at pp512; real routing
+says a small win, and the end-to-end prose A/B in §17.10 measured +1.3% / +1.8%. Cross-checking:
+1.033× on a GEMM pair that is 52.5% of prefill predicts **+1.7%** end-to-end against §17.10's measured
+**+1.3%**. The instrument and the end-to-end number now agree, which is the thing item 0i was for.
+
+At pp2048 the kernel gain (1.56×) is much larger than the end-to-end one (§17.10's +12.6%), and that
+is expected rather than contradictory: the 52.5% MoE share was traced at pp512, and full attention
+grows quadratically, so the MoE is a smaller slice of a 2048-token prefill.
+
+### 18.4 Retraction: §17.7's "no bandwidth story left" was measured on a routing that never happens
+
+§17.7 concluded the real CTAs sit at **85–87% of the 156 GB/s wall**, inside §5's tier-1 band, and
+that "there is no bandwidth story left in this kernel." Both figures are `even`-routing figures.
+Re-run with the measured `indptr` at B=4096:
+
+| `gate_up`, B=4096 | n_real CTAs | unique MB | **% of the wall** | issued/unique |
+|---|---:|---:|---:|---:|
+| synthetic `even` (§17.7's number) | 2048 | 327.2 | **86.5%** | 1.36× |
+| synthetic `random` | 2944 | 327.2 | 60.2% | 1.95× |
+| **real prose (median layer)** | 2912 | 200.9 | **45.3%** | **2.96×** |
+| real prose (min / max layer) | 2744 / 3144 | 200.9 / 287.0 | 39.7% / 49.5% | 2.96× / 2.38× |
+
+`down` is the same story: 86.8% → **46.2%**.
+
+**The mechanism is that real routing moves both terms the wrong way at once.** Only ~171 of 256
+experts are hit, so unique DRAM traffic falls to 61% of what `even` requires — but fragmentation
+*raises* tile count 42%, so the kernel issues **2.9× the bytes DRAM actually supplies** and L2 absorbs
+the difference. §17.7 saw a 1.36× ratio and concluded the kernel was bandwidth-saturated. It is not:
+it is at **~45% of the wall**, and the gap is tile fragmentation.
+
+**So the MoE lane is re-opened, and §18.3 is the first evidence of what that is worth** — widening
+`BLK_M` attacks exactly this term, which is why it buys 1.56× at pp2048 rather than the ~1.0× the
+`even`-calibrated model expected.
+
+The two-parameter fit still holds under real routing (`c_skip/c_real` = 34.0% for `gate_up`, 17.6%
+for `down`; residual median 3.8%/1.2%).
+
+**And the meta-lesson is now six for six.** §16.2's probe grid, §15.6's model, item 0d's occupancy
+arithmetic, §9's priority order, §17.1's hoist conclusion, and now §17.7's roofline. Every one was a
+number measured under conditions that did not hold where it was applied. §17.9 named the disease and
+this section is another case of it — the roofline was *re-measured* in §17.7, carefully, on the wrong
+routing.
+
+### 18.5 Item 0f re-measured on real routing
+
+The padding-CTA skip is worth **less** than the filler said and still a lot:
+
+| B=4096 `gate_up` | unskipped | skipped | gain |
+|---|---:|---:|---:|
+| real prose | 5.090 ms | 3.757 | **1.35×** |
+| bench filler | 5.041 ms | 3.477 | 1.45× |
+| decode (B=64) | 2.500 ms | 0.437 | 5.73× |
+
+Bit-exact throughout. The shipped default is unchanged and remains correct.
+
+### 18.6 Item 0j — reorder the dispatch table's tiles for L2. Refuted.
+
+§18.4's 2.9× issued/unique is L2 traffic, and how much L2 can absorb depends on the order CTAs visit
+tiles. Within one expert's private CTA range the order is free:
+
+* **m-major (shipped)** `off = tmi*tiles_per_n + tni` — consecutive CTAs share `X_tile` and sweep the
+  expert's whole weight set, then sweep it again for the next row-tile. Each weight slice is
+  re-fetched `nb` times at a reuse distance of the expert's entire footprint (1 MB for `gate_up`),
+  against a 4 MB L2 with several experts in flight.
+* **n-major** `off = tmi + tni*nb` — consecutive CTAs share the *weight* slice, cutting the reuse
+  distance to one slice.
+
+Both assign the identical set of `(e, m, n)` triples to disjoint outputs, so it is bit-exact by
+construction — and it measured so, in all 10 configs.
+
+**It buys nothing: 0.99×–1.01× across `BLK_M` ∈ {16,64} × hoist ∈ {0,1} × both shapes at B=16384,
+and 0.99× at B=4096.** L2 is evidently already capturing the reuse the m-major order leaves on the
+table, so the 2.9× amplification is not costing what its size suggests. Kept as
+`MLC_MOE_GEMM_V2_TILEORDER=n`, default `m` (unchanged), as a documented dead end.
+
+That is a useful negative: it means §18.4's headroom is **not** a cache-ordering problem, and the
+tile-count lever (§18.3) is the one that works.
+
+### 18.7 Item 0k — skip the row fragments that hold no real rows. Width-dependent, and it changes the ranking.
+
+§18.4 says the kernel's problem is tile fragmentation, and §18.1 says why there is so much of it:
+a real pp512 prefill puts **~24 rows on each hit expert**, so at `BLK_M=64` a tile carries 24 real
+rows and 40 padding ones. `X_shared` is already predicated on `row_end`, so padding rows cost no DRAM
+traffic — but the wmma reduction still runs all `BLK_M/MICRO` row fragments and the ones past the
+real rows reduce nothing but zeros. **That is the mechanism behind §17.10's short-prompt loss**, and
+removing it looked like it should make a wide tile safe everywhere.
+
+Built as `MLC_MOE_GEMM_V2_SKIPROWS=1`: rewrite the row-fragment loop's *extent* to
+`min(ceildiv(row_end - m_offset, MICRO), BLK_M/MICRO)`. Mechanism and justification are item 0f's,
+one level down — an `if` is impossible because the cooperative loads carry `__syncthreads()` and
+ThreadSync refuses a barrier inside a condition, the extent is CTA-uniform, and a skipped fragment's
+global store is predicated off by `m_offset + i < row_end` regardless of what its accumulator holds.
+**All 12 A/B cells bit-exact.**
+
+Two implementation notes. The annotation lands on **two** loops after scheduling — the accumulator
+init nest and the compute nest — because `blockize` leaves one and `reverse_compute_at` re-materialises
+the other; both must be shortened and both are safe. And `m_offset`/`row_end` have to be found **by
+name over the whole body**, not by walking the CTA block's leading let-chain: the schedule re-nests
+those bindings, and the let-statement node is not exported under a stable name from `tvm.tirx`.
+
+| H=1, real routing | pp512 (B=4096) | pp2048 (B=16384) |
+|---|---:|---:|
+| M=16 | 0.91× / 0.95× | 0.95× / 0.97× |
+| **M=32** | **1.06× / 1.06×** | **1.03× / 1.01×** |
+| M=64 | 0.91× / 0.91× | 0.91× / 0.92× |
+
+(`gate_up` / `down`.)
+
+**It only pays at `BLK_M=32`, and it costs at both 16 and 64.** At 16 the guard should be inert — the
+loop has extent 1 — and instead it loses 5–9%, which is the tell: replacing a constant extent with a
+runtime expression is not free, it blocks the unroll. At 64 the fragments skipped do not pay for that
+same loss. At 32 they just do.
+
+**Where that leaves the ranking.** Both surviving configs now beat the shipped `BLK_M=16` at *both*
+measured shapes, which nothing did before this session:
+
+| GEMM pair vs shipped M=16 | pp512 | pp2048 |
+|---|---:|---:|
+| **M=32 / hoist / skiprows** | **1.098×** | 1.323× |
+| M=64 / hoist | 1.022× | **1.558×** |
+
+Neither dominates the other, but the interesting one is `M=32+skiprows`: §17.10 measured plain
+`M=32+hoist` at **−5.5% end-to-end on pp128**, and padding-row compute is exactly what a 128-token
+prefill has most of. Whether the row skip removes that loss is not a kernel question — it needs the
+end-to-end A/B, which is §18.8.
+
+### 18.8 End-to-end, on prose, one session, one clock state
+
+`lib_m32rows` = `BLK_M=32` + hoist + row-skip, compiled with
+`MLC_MOE_GEMM_V2_BLKM=32 MLC_MOE_GEMM_V2_HOIST=1 MLC_MOE_GEMM_V2_SKIPROWS=1`. Benched against the
+shipped `lib_blkk64` on `--prompt-file` prose, `--prefix-cache-mode radix`, 3 runs after 1 warmup.
+
+⚠️ **`jetson_clocks` was not set for these runs** (no passwordless sudo in this session), so absolute
+figures sit slightly under §17.10's. The A/B is unaffected — every leg here ran under the same clock
+state, and `lib_blkk64` at pp2048 reproduces §17.10's number to 0.1% (945.00 vs 945.81), which is the
+check that the two sessions are comparable at all.
+
+| pp | `lib_blkk64` (shipped) | `lib_m32rows` | Δ |
+|---:|---:|---:|---:|
+| 128 | 576.33 | 564.16 | **−2.1%** |
+| 512 | 827.39 | **850.39** | **+2.8%** |
+| 2048 | 945.00 | **995.41** | **+5.3%** |
+
+Decode neutral throughout (59.1–60.2 tps on both).
+
+**The row skip does what §18.7 predicted at the short end and the opposite at the long end.** §17.10
+measured plain `BLK_M=32`+hoist at −5.5% / +1.3% / +7.8%; adding the row skip moves that to
+−2.1% / +2.8% / **+5.3%**. So it more than halves the short-prompt loss and nearly doubles the pp512
+gain — and it gives back 2.5 points at pp2048.
+
+That shape is consistent with the mechanism rather than with noise. The guard's cost (a runtime loop
+extent, which §18.7 isolated at 5–9% where it skips nothing) is paid by **every** CTA; its benefit
+accrues only to **partial** tiles. Padding share at `BLK_M=32` is 47.9% at pp512 and 20.8% at pp2048
+(§18.1), so the trade gets worse exactly as the prompt gets longer. The row skip and `BLK_M` widening
+pull in *opposite* directions with prompt length, which is why neither alone is Pareto.
+
+### 18.9 The whole family, measured in one session — and it is monotone
+
+§18.8's cross-session comparison against §17.10 was suggestive, not evidence, so all four libs were
+re-benched back to back under one clock state. `lib_hoist32` / `lib_hoist64` are §17.10's legs
+(`BLK_M` 32 / 64 + hoist, no row skip).
+
+| pp | `lib_blkk64` (shipped) | `lib_m32rows` | `lib_hoist32` | `lib_hoist64` |
+|---:|---:|---:|---:|---:|
+| 128 | **576.33** | 564.16 (−2.1%) | 548.11 (−4.9%) | 524.67 (−9.0%) |
+| 512 | 827.39 | **850.39 (+2.8%)** | 833.71 (+0.8%) | 826.86 (−0.1%) |
+| 2048 | 945.00 | 995.41 (+5.3%) | 1020.29 (+8.0%) | **1063.48 (+12.5%)** |
+
+Decode neutral on all four (59.1–60.2). §17.10's figures reproduce within 1.5 points at every cell
+(−5.5/+1.3/+7.8 vs −4.9/+0.8/+8.0 for `hoist32`; −10.4/+1.8/+12.6 vs −9.0/−0.1/+12.5 for `hoist64`),
+which is what makes the two sessions comparable.
+
+**The family is monotone in exactly one parameter — how much padded row-space a CTA carries.** Read
+left to right, every step trades short-prompt throughput for long-prompt throughput, with no
+exception in 12 cells. `lib_m32rows` is a strictly milder version of `lib_hoist32`, not a different
+trade: the row skip moves it *back toward* the shipped kernel at pp128 (−4.9% → −2.1%) and *also*
+back at pp2048 (+8.0% → +5.3%). It buys its short-prompt safety with long-prompt gain, which is the
+same currency `BLK_M` spends in the other direction.
+
+**So the row skip does not rescue a wide tile, it interpolates.** §18.7 hoped it would remove the
+short-prompt loss and make a wide `BLK_M` Pareto. It does not: it slides along the same frontier.
+That frontier is real and nothing measured this session crosses it.
+
+**In absolute latency the trade is more favourable than the percentages suggest**, because the
+short-prompt loss is small in ms and the long-prompt gain is large:
+
+| ttft, ms | shipped | `m32rows` | `hoist32` | `hoist64` |
+|---:|---:|---:|---:|---:|
+| pp128 | 222.1 | 226.9 (+4.8) | 233.5 (+11.4) | 244.0 (+21.9) |
+| pp512 | 608.5 | 586.1 (−22.4) | 597.2 (−11.3) | 598.5 (−10.0) |
+| pp2048 | 2167.2 | 2057.4 (−109.8) | 2007.3 (−159.9) | **1925.8 (−241.4)** |
+
+Every non-shipped lib pays single-digit milliseconds at pp128 to save tens or hundreds at pp512 and
+pp2048. On a model with a 262144-token context chunked at 2048, that is a trade worth making — but it
+is a *workload* judgement, not a measurement, so **the defaults are left unchanged** (`BLK_M=16`,
+`HOIST=0`, `SKIPROWS=0`, `TILEORDER=m`) and the four libs are kept as the evidence for making it
+deliberately. §17.10 declined the same choice for the same reason; the difference is that the
+frontier is now mapped rather than guessed at.
+
+### 18.10 Gates, and a claim that turned out not to be true until it was fixed
+
+| check | result |
+|---|---|
+| v2 GEMM bit-exactness across **`SKIPROWS` 0/1** × `BLK_M` 16/32/64 × 2 shapes × B 4096/16384, real routing (§18.7) | ✅ **12/12 exact** |
+| v2 GEMM bit-exactness across **`TILEORDER` m/n** × `BLK_M` 16/64 × hoist 0/1 × 2 shapes (§18.6) | ✅ **10/10 exact** |
+| item 0f's `SKIPPAD` gate re-run under `SKIPROWS=1`, `BLK_M=64` | ✅ 8/8 exact |
+| **35B state gate, `lib_m32rows`, `radix`** | ✅ **139/139 wide-margin positions** (near-ties 3/5) |
+| **35B state gate, `lib_m32rows`, `disable`** | ✅ **139/139 wide-margin positions** (near-ties 2/5) |
+| **generated CUDA for the shipped default, before vs after this session** | ✅ **identical** — see below |
+
+**The "defaults are unchanged" claim was false when first written, and diffing the generated
+CUDA is what caught it.** [scripts/moe_dump_cuda.py](scripts/moe_dump_cuda.py) emits the device
+source so the claim can be checked rather than argued. Two real findings:
+
+1. **An unconditional `sch.annotate` is not free.** Tagging the row-fragment loop for item 0k — even
+   with the guard disabled and nothing reading the annotation — stopped TVM eliminating the unit
+   loop, so the *shipped* `BLK_M=16` build gained a `for (a0_0 = 0; a0_0 < 1; ++a0_0)` wrapped round
+   the entire CTA body. nvcc would delete it and the timing delta was 0.3% (inside noise), which is
+   exactly why timing could not have caught this. The annotate is now under `if SKIPROWS`.
+2. **Item 0j's parameterised index left dead locals in the dispatch kernel.** Rewriting the tile
+   offset as strides so one loop nest serves both orders emitted two unused `int`s per iteration.
+   Rewritten as a second whole prim_func under `if TILE_N_MAJOR`, so the shipped nest is verbatim.
+
+**Diffing generated code needs a control.** TVM's CSE numbering is **not stable run to run** — two
+dumps of the *identical* source differ by ~14 lines of pure `cse_vN` renaming, which is *more* than
+the 8-line delta the real comparison showed. Normalising `cse_v[0-9]+` and confirming the same-source
+control diffs empty is what makes the result mean anything. Without that step the honest reading of
+the raw diff would have been "it changed", and the honest reading after over-correcting would have
+been "it didn't" — neither supported.
+
+**Generalised: a claim of the form "this change is inert when disabled" is checkable, and cheap to
+check.** Four sessions of this document have asserted some version of it from exactness gates plus
+timing. Exactness gates compare *outputs* and cannot see a scheduling change; timing cannot resolve
+sub-1% effects. The artifact to compare is the emitted code.
+
+### 18.11 Where this leaves the MoE lane
+
+**The lane is open again, and §18.4 is why.** §17.7 closed it on the strength of an 85–87% roofline
+that turns out to be an artifact of `even` routing; the real figure is **45%**, and the gap is tile
+fragmentation rather than bandwidth. Everything measured this session is consistent with that single
+diagnosis:
+
+* widening `BLK_M` (fewer, fuller tiles) **works** — up to 1.56× on the GEMM pair at pp2048 (§18.3);
+* skipping empty row fragments **works where padding dominates** — +2.8% end-to-end at pp512 (§18.7);
+* reordering tiles for L2 **does nothing** (§18.6), so the 2.9× issued/unique is not a locality
+  problem the kernel can fix by scheduling.
+
+**What is now known that was not:**
+
+| | before §18 | after §18 |
+|---|---|---|
+| experts hit at pp512 | assumed 256 | **171** |
+| padding share at `BLK_M=16` | inferred ~40% (§16.11) | **29.3%** measured (10.6% at pp2048) |
+| % of the bandwidth wall | 85–87% (§17.7) | **45%** |
+| best known pp2048 | 945 tps | **1063 tps** (`lib_hoist64`, +12.5%) |
+| whether any `BLK_M` is Pareto | "no" (§17.10), from one A/B pair | **no**, from a mapped 4×3 frontier |
+
+**The next lever is the one nothing this session tried: make the tiles fuller instead of bigger.**
+Every configuration measured here picks a single compile-time tile height and lives with whatever
+padding the routing produces. The histogram says the *distribution* is the problem — 171 experts
+holding a median 24 rows each, with one expert holding 396. A dispatch table that packed short
+experts together, or that chose a per-expert tile height from `indptr` at dispatch time (the table
+already stores a row offset per CTA, so a height column is not a structural change), would attack
+fragmentation directly instead of trading it against X and O traffic. That is speculative and
+uncosted — but it is the first MoE idea in three sessions that is not a point on the frontier
+§18.9 just mapped.
+
+**And item 0h's runtime branch is now clearly the wrong shape of fix.** §17.10 costed it as
+"emit both `BLK_M=16` and `BLK_M=64` pairs, branch on `x.shape[0]` near 3600". §18.9's frontier says
+a branch buys the *upper envelope* of that table — roughly 576 / 850 / 1063 — which is worth having,
+but it doubles the kernel count in the binary to buy at most +12.5% at one end. The in-tree
+`LowBatchGemvSpecialize` precedent is also weaker than it looked: it branches inside **one** PrimFunc,
+where the launch config is the max over both bodies, so the narrow-tile path would inherit the wide
+path's shared-memory footprint and lose occupancy — the exact cost the branch exists to avoid.
+A Relax-level `If` avoids that, and there is **no `relax.If` anywhere in mlc_llm** to copy from.
+
+### 18.12 The VL re-gate — the checkpoint was never the blocker, and neither is a download
+
+§9's entry was corrected once already (the claim that a multi-GB download was needed was wrong —
+`Qwen/Qwen3.5-0.8B` *is* the VL checkpoint). The build was then described as "a local
+`convert_weight` + `gen_config` + `compile`... the rebuild itself should be uneventful." It was not.
+
+**`convert_weight` and `gen_config` work exactly as predicted.** `--model-type qwen3_5_vl` produces
+**383 MLC params** against the text-only build's 284 — the ~99 extra are the vision tower, so the
+loader's `HF_VISUAL_PREFIX` lines up as §9 said — and `mtp.*` is correctly reported unused.
+
+**`compile` dies in `BLASDispatch`:**
+
+```
+tvm.error.InternalError: Check failed: (tensor_sinfo) is false:
+    Expect TensorStructInfo, but received: relax.ShapeStructInfo
+  ... mlc_llm/compiler_pass/blas_dispatch.py:40, in FuseOpsByPattern/RunCodegen
+```
+
+**Why no other build has ever hit this:** `cublas_gemm` auto-enables only for **unquantized**
+weights — `_cublas_gemm` in [compiler_flags.py:103](python/mlc_llm/interface/compiler_flags.py#L103)
+returns False unless the quantization is `q0f16`/`q0bf16`/`q0f32` or fp8. Every 35B build in this
+document is `q4f16_1`, so `BLASDispatch` was never in their pipeline at all. The VL build is the
+first `q0f16` compile since the box moved to CUDA 13.2 / LLVM 18.
+
+**Workaround, and it is a workaround:** `--opt "flashinfer=1;cublas_gemm=0;cudagraph=1"` compiles
+cleanly. That is legitimate for the re-gate, whose question is whether the *state path* still
+produces the right tokens — cuBLAS dispatch is a throughput choice, not a correctness one — but it
+means the VL lib gated here is not the lib a default `--opt O2` would produce.
+
+**The discriminating question is whether this is VL-specific or general to `q0f16` on this
+toolchain**, and it is one recompile: the text-only `dist/qwen3_5-0.8B-q0f16` config through the same
+default pipeline. If that also dies, the finding is "no unquantized model compiles at O2 on this
+box" — considerably larger than a VL bug, and invisible to every measurement in this document
+because they are all q4.

@@ -43,7 +43,9 @@ import numpy as np
 import tvm
 
 sys.path.insert(0, os.path.dirname(__file__))
-from moe_gemm_check import GROUP_SIZE, NE, SHAPES, build, make_inputs, run  # noqa: E402
+from moe_gemm_check import (  # noqa: E402
+    GROUP_SIZE, NE, SHAPES, build, load_real_counts, make_inputs, run,
+)
 
 # Same walls every other number in the workplan is quoted against (bench_moe_kernel.py).
 BW_WALL_GBS = 156.0
@@ -87,23 +89,34 @@ def main() -> None:
     p.add_argument("--batches", default="1024,2048,4096,8192,16384")
     p.add_argument("--ref-batch", type=int, default=4096,
                    help="batch to report the roofline at (4096 = pp512's 512 tok x top-8)")
+    p.add_argument("--indptr-file", default=None,
+                   help=".npz from scripts/moe_expert_histogram.py. Adds measured routings "
+                        "to the sweep; they are always reported, whatever --ref-batch is. "
+                        "The even/ragged split below is 25 points wide, so which side real "
+                        "routing falls on is the whole question (workplan 17.7, 17.9)")
+    p.add_argument("--indptr-key", default=None, help="a single key from the .npz")
+    p.add_argument("--indptr-picks", default="min,med,max",
+                   help="which layers to take, ranked by tile count at BLK_M=16")
     cli = p.parse_args()
 
     dev = tvm.cuda(0)
     target = tvm.target.Target.from_device(dev)
     batches = [int(v) for v in cli.batches.split(",")]
+    legs = [(B, r, None) for B in batches for r in ("even", "random")]
+    if cli.indptr_file:
+        legs += [(int(c.sum()), lbl, c) for lbl, c in
+                 load_real_counts(cli.indptr_file, cli.indptr_key, cli.indptr_picks)]
 
     for blkk in (int(v) for v in cli.blkk.split(",")):
         os.environ["MLC_MOE_GEMM_V2_BLKK"] = str(blkk)
         print(f"\n{'=' * 78}\nBLK_K={blkk}  (SKIPPAD={os.environ['MLC_MOE_GEMM_V2_SKIPPAD']})\n{'=' * 78}")
         for name, (N, K) in SHAPES.items():
             rows = []
-            for B in batches:
-                for routing in ("even", "random"):
-                    args, indptr = make_inputs(N, K, B, routing, dev)
-                    _, ms = run(build(N, K, B, target, dev), args, dev, True)
-                    n_real, n_pad = cta_counts(indptr, B, N)
-                    rows.append((B, routing, n_real, n_pad, ms, indptr))
+            for B, routing, counts in legs:
+                args, indptr = make_inputs(N, K, B, routing, dev, counts=counts)
+                _, ms = run(build(N, K, B, target, dev), args, dev, True)
+                n_real, n_pad = cta_counts(indptr, B, N)
+                rows.append((B, routing, n_real, n_pad, ms, indptr, counts is not None))
 
             # Least squares: ms ~= n_real*c_real + n_pad*c_skip
             A = np.array([[r[2], r[3]] for r in rows], dtype=float)
@@ -117,8 +130,8 @@ def main() -> None:
                   f"c_skip/c_real={c_skip / c_real:.1%}   "
                   f"residual max {resid.max():.2%} median {np.median(resid):.2%}")
 
-            for B, routing, n_real, n_pad, ms, indptr in rows:
-                if B != cli.ref_batch:
+            for B, routing, n_real, n_pad, ms, indptr, is_real in rows:
+                if B != cli.ref_batch and not is_real:
                     continue
                 t_real = n_real * c_real
                 bf = bytes_and_flops(indptr, B, N, K, n_real)
