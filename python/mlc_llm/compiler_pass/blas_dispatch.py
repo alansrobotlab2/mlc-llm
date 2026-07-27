@@ -135,10 +135,21 @@ class BLASDispatch:
     """A compiler pass that dispatches patterns to cuBLAS/hipBLAS."""
 
     def __init__(self, target: tvm.target.Target) -> None:
-        # A/B knob for the fp32 guard (§20). Default `1`: measured Pareto on the
-        # VL model — it is the only model here with an fp32 GEMM in the graph, so
-        # on everything else the guard is inert.
-        skip_fp32 = os.environ.get("MLC_BLAS_SKIP_FP32", "1") == "1"
+        # A/B knob for the fp32 guard (§20.3). **Default `0` — superseded (§20.5).**
+        #
+        # It shipped at `1` for one session and was right about the mechanism and
+        # wrong about the fix. Declining the offload avoided the broken fusion; it
+        # also gave up cuBLAS's 2.46x-faster GEMM, leaving 5.3 ms/layer unclaimed.
+        # Moving the score scale onto `q` (`MLC_QWEN35_VL_PRESCALE_Q`, default `1`)
+        # removes the *reason* for the fusion instead, so the QK matmul is a bare
+        # GEMM cuBLAS can take for free: 9.46 -> 3.63 ms/layer, `image_embed`
+        # 293 -> 223 ms. With that change the guard only costs, so it defaults off.
+        #
+        # ⚠️ The two knobs are coupled. `MLC_QWEN35_VL_PRESCALE_Q=0` restores the
+        # `matmul -> multiply` fusion, and *then* this guard is worth `1` again —
+        # without it that configuration pays §20.2's 47 ms. Do not set one to its
+        # non-default without considering the other.
+        skip_fp32 = os.environ.get("MLC_BLAS_SKIP_FP32", "0") == "1"
         if target.kind.name == "cuda":
             self.has_blas = tvm.get_global_func("relax.ext.cublas", True)
             if not self.has_blas:

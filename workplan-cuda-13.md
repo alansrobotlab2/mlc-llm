@@ -771,19 +771,25 @@ MLC_MOE_GEMM_V2=1 MLC_MOE_GEMM_V2_BLKM=64 MLC_MOE_GEMM_V2_HOIST=1 MLC_MOE_GEMM_V
   --device cuda --opt "flashinfer=1;cudagraph=1" \
   -o dist/qwen3_6-35B-A3B-q4f16_1_fused/lib_rowspec64.so
 
-# VL — cuBLAS is on at default --opt as of §19.6, but §20.3 declines the fp32 offloads.
-# Current VL lib is lib_nofp32blas.so; MLC_BLAS_SKIP_FP32 defaults to 1, so this is just --opt.
+# VL — current lib is lib_vl2.so. Both §20 knobs are at their defaults here, so this
+# is plain --opt with nothing set; that is deliberate, it is the shipping config.
 python -m mlc_llm compile dist/qwen3_5-0.8B-vl-q0f16/mlc-chat-config.json \
   --device cuda --opt "flashinfer=1;cublas_gemm=1;cudagraph=1" \
-  -o dist/qwen3_5-0.8B-vl-q0f16/lib_nofp32blas.so
-MLC_BLAS_SKIP_FP32=0 python -m mlc_llm compile ... -o .../lib_ctrl_skip0.so   # the §20.3 control
+  -o dist/qwen3_5-0.8B-vl-q0f16/lib_vl2.so
 python validate.py --greedy-parity-vl5 --mlc-model-dir dist/qwen3_5-0.8B-vl-q0f16 \
-  --mlc-lib dist/qwen3_5-0.8B-vl-q0f16/lib_nofp32blas.so --device cuda:0   # 184/184, ~13 s
+  --mlc-lib dist/qwen3_5-0.8B-vl-q0f16/lib_vl2.so --device cuda:0   # 184/184, ~13 s
+
+# The two §20 knobs are coupled (§20.6). To reproduce the earlier legs:
+#   MLC_QWEN35_VL_PRESCALE_Q=0 MLC_BLAS_SKIP_FP32=1  -> lib_nofp32blas (§20.3), ttft 443
+#   MLC_QWEN35_VL_PRESCALE_Q=0 MLC_BLAS_SKIP_FP32=0  -> lib_cublas     (§20.1), ttft 487
 
 # VL performance (§20.1) — three separate numbers. NOT MLCEngine: it cannot drive this
 # vision tower (llava image_embed signature + hardcoded ImageData embed_size).
 python validate.py --perf-vl5 --mlc-model-dir dist/qwen3_5-0.8B-vl-q0f16 \
-  --mlc-lib dist/qwen3_5-0.8B-vl-q0f16/lib_nofp32blas.so
+  --mlc-lib dist/qwen3_5-0.8B-vl-q0f16/lib_vl2.so
+
+# The tower's attention block alone, no compile (§20.5). Fidelity bar: 1.3% vs the trace.
+python scripts/vit_attn_bench.py --static --prescale
 
 # kernel unit gates — no model, no engine. Run these FIRST on any state change.
 python scripts/gdn_kernel_check.py                     # §15, recurrent, ~51 s; --seq-lens narrows
@@ -1005,31 +1011,38 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 ### Start here next session
 
-> **Handoff, end of 2026-07-27b.** Branch `qwen3_5`. **Item 0o is closed and it changed a default**
-> — the first thing this session did was also the first VL performance number ever taken on this box,
-> and it overturned §19.6's conclusion. Current 35B lib is unchanged (**`lib_blkk64.so`**); the
-> current VL lib is now **`lib_nofp32blas.so`**.
+> **Handoff, end of 2026-07-27b.** Branch `qwen3_5`. **Item 0o closed, item 0p half closed, and the
+> VL model is 23% faster to first token.** The first VL performance number ever taken on this box was
+> also the thing that overturned §19.6 — and then §20.5 overturned §20.3 one section later. 35B lib
+> unchanged (**`lib_blkk64.so`**); current VL lib is **`lib_vl2.so`**, built at plain `--opt` with no
+> environment variables set.
 >
-> | VL 0.8B, cat fixture, `radix` | `lib_cublas` (was default) | `lib.so` (`cublas_gemm=0`) | **`lib_nofp32blas`** |
+> | VL 0.8B, cat fixture, `radix` | `lib_cublas` (was default) | `lib_nofp32blas` (§20.3) | **`lib_vl2`** |
 > |---|---:|---:|---:|
-> | `image_embed` | 337.28 ms | 297.34 | **293.33** |
-> | `prefill` (652 tok) | **149.37** | 161.91 | 149.87 |
-> | `decode` | 11.36 (88.1 tok/s) | 11.37 | 11.38 |
-> | **ttft** | 486.65 | 459.25 | **443.20** (−8.9%) |
+> | `image_embed` | 337.28 ms | 293.33 | **223.33** (−33.8%) |
+> | `prefill` (652 tok) | 149.37 | 149.87 | 149.54 |
+> | `decode` | 11.36 (88.1 tok/s) | 11.38 | 11.38 |
+> | **ttft** | 486.65 | 443.20 | **372.88** (−23.4%) |
 >
-> **`image_embed` is 69% of ttft and 2.26× the prefill of the whole sequence** — it was never
-> measured and the gate called it "cheap" while running it five times per pass (now hoisted; gate is
-> 184/184 in 13.2 s). **cuBLAS at default `--opt` was net-negative on the VL model**: it wins the
-> fp16 FFN GEMMs by 3.0 ms and loses the fp32 QK^T by 47.3 ms, because offloading that matmul breaks
-> its fusion with the score `multiply` and forces a 610 MB/layer round trip of a 305 MB fp32 score
-> tensor — **3.91 ms/layer predicted at the 156 GB/s wall, 3.94 measured**. `MLC_BLAS_SKIP_FP32`
-> (default `1`) declines fp32 offloads only; gate is 184/184 exact and a `=0` control rebuild
-> reproduces the old lib **to the digit**. Full accounting in §20.
+> Gate **184/184 exact, margin PASS** at every step. **`image_embed` was 69% of ttft and had never
+> been measured**; the gate called it "cheap" and ran it five times per pass (now hoisted — gate is
+> 184/184 in 13.2 s).
 >
-> **Next: item 0p** — 84% of the tower is three fp32 kernels (`QK^T+scale` 113.5 ms, `P@V+cast`
-> 84.3, `softmax` 48.4) that all move the same 305 MB score matrix. The prize is not a faster GEMM,
-> it is **not materializing the matrix**. Item **0n** (the MoE per-CTA cost) is still open and is
-> still a measurement, not a build.
+> **Two knobs, coupled — read this before touching either.** `MLC_QWEN35_VL_PRESCALE_Q` (default
+> `1`) applies the attention scale to `q` instead of to the scores, using
+> `matmul(q,k^T)·c ≡ matmul(q·c,k^T)`. `MLC_BLAS_SKIP_FP32` (default `0`) declines fp32 cuBLAS
+> offloads. §20.3 shipped the second at `1` and §20.6 retired it: the fusion it was protecting was
+> worth **0.00 ms**, so protecting it bought 3.0 ms/iter and gave up **70**. Set `PRESCALE_Q=0` and
+> `SKIP_FP32` is worth `1` again — that configuration pays §20.2's 47 ms.
+>
+> ⚠️ **The 156 GB/s wall does not apply to this model.** §20.5 measured 184.8 GB/s by D2D copy at the
+> score tensor's exact size. 156 is the MoE's *strided* figure and is correct there; the tower streams
+> contiguously. Quoting either out of its shape is how §20.2's roofline came out wrong.
+>
+> **Next: §20.7 — price the P@V fusion, which is now the tower's largest kernel** (84.34 ms/iter,
+> 3.8× off bound). It is the identical question §20.5 just answered for QK^T and it has not been
+> asked here; `scripts/vit_attn_bench.py` answers it with no compile. Item **0n** (the MoE per-CTA
+> cost) is still open and still a measurement, not a build.
 >
 > ✅ **The submodule loose end is closed** (not by me — pushed interactively this session).
 > `dff702c` is on the remote and `3281f97f` advances the parent pointer, so the three-session
@@ -1300,7 +1313,8 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > |---|---|---|
 > | **0n** | **(§19.8)**; a measurement, not a build. Why is `BLK_M=64` 30–40% slower at B=1024 when it launches the *same* CTAs over the *same* rows? | it is the only unexplained term left in the MoE GEMM, and every wide-tile idea has died on it |
 > | **0o** | ✅ **DONE (§20)** — first VL numbers taken; cuBLAS was net-negative and `MLC_BLAS_SKIP_FP32` fixes it, ttft −8.9%, gate 184/184 | — |
-> | **0p — START HERE** | **new (§20.4)**; the tower's score matrix is never worth materializing. 84% of `image_embed` is three fp32 kernels all moving the same 305 MB `(12, 2520, 2520)` tensor | it is the largest single structure left in this model, and §20.2 already shows a 305 MB round trip costs 47 ms. Flash-attention-shaped, so it is a build, not a measurement |
+> | **0p** | 🔶 **half done (§20.5–§20.7)** — softmax is closed (98.5% of the *measured* 184.8 GB/s wall), QK^T is closed (cuBLAS, after prescaling made it eligible), `image_embed` 293 → **223 ms**. `scripts/vit_attn_bench.py` built, 1.3% fidelity | — |
+> | **0q — START HERE** | **new (§20.7)**; price the `astype` fusion on `matmul(attn_probs, v32)`, now the tower's largest kernel at 84.34 ms/iter and 3.8× off bound | it is the *same question* §20.5 answered for QK^T — the epilogue writes 3.87 MB against a 305 MB read, so it is probably protecting nothing — and the microbench answers it with **no compile** |
 > | ~~**0l**~~ | ✅ **built, §19.1–§19.4 — and it refutes its own premise.** The mechanism works (`BLK_M=16` control: 1.00× where 0k cost 5–9%); the hypothesis it was built on does not | closed. pp128 is still −9.1% end-to-end, so no wider tile is Pareto and the defaults are unchanged |
 > | ~~**0m**~~ | ✅ **fixed, §19.5–§19.7** — two ops, both in the VL patch merger; the guard declines exactly those two matches | a default-`--opt` VL lib now compiles and gates **184/184** |
 > | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
@@ -1348,7 +1362,37 @@ still blocked (§8).
 §19.3 shows the mechanism everyone assumed is worth 0–3% of a 31–40% gap. Until this term is named,
 any further wide-tile work is guessing — which is precisely how items 0h, 0k and 0l were each costed.
 
-**0p. ⬅️ NEXT — stop materializing the vision tower's score matrix.**
+**0q. ⬅️ NEXT — price the P@V cast fusion, the way 0p priced the QK one.**
+
+*The question.* `matmul(attn_probs, v32)` then `astype(..., fp16)` fuses into one kernel,
+`fused_matmul9_cast17`, and at **84.34 ms/iter (7.03 ms/layer, 3.8× off bound)** it is now the
+tower's largest. cuBLAS never took it — in *both* §20.2 legs it stayed a generated kernel — and the
+`astype` epilogue is the likely reason. §20.5 asked exactly this about the QK matmul's `multiply`
+epilogue and the answer was **0.00 ms**, which is where the 70 ms came from. Nobody has asked it here.
+
+*Why it is probably the same answer.* The epilogue writes `(h, s, d)` fp16 = **3.87 MB** against a
+`(h, s, s)` fp32 = **305 MB** read of `attn_probs`. There is no arithmetic to rearrange — just a cast
+that could move after an unfused matmul. If the fusion is worth ~nothing, cuBLAS gets a bare fp32
+GEMM at roughly the QK one's 3.63 ms/layer against today's 7.03, i.e. **~41 ms/iter**, and
+`image_embed` goes 223 → ~182 ms.
+
+*How, and it costs nothing.* `scripts/vit_attn_bench.py` already builds this exact block. Add the
+split variant, time `matmul` and `cast` separately against the fused 7.04 ms, and the answer is one
+run — no compile. **Do that before building anything.** If it comes back non-zero, the fusion is real
+and the lane is closed; if it comes back ~zero, it is the same one-line graph change as §20.6.
+
+⚠️ Do not assume the QK result transfers. §20.5's null was measured, not reasoned, and the two
+epilogues differ: a scalar `multiply` reads and writes the same 305 MB, while this `astype` reads
+305 MB and writes 3.87 MB. The traffic argument that made prescaling free does not obviously apply.
+
+**0p. 🔶 HALF DONE, §20.5–§20.7 — two of three kernels closed, and the wall was wrong. Entry below.**
+The instrument (`vit_attn_bench.py`, 1.3% fidelity) and two hypotheses: symbolic shapes are worth
+6.5% not 4× (refuted), and prescaling is worth **0.00 ms on its own** — which is what proved the QK
+fusion protects nothing and unlocked cuBLAS for 70 ms. **The wall is 184.8 GB/s, not the 156 this
+entry assumed**; re-based, softmax is at 98.5% and closed. What remains of the original framing is
+P@V (now item 0q) and, behind it, flash attention.
+
+**0p (historic). Stop materializing the vision tower's score matrix.**
 
 *The shape of it.* At `lib_nofp32blas`, `image_embed` is 293 ms and **84% of it is three fp32 kernels
 that all move the same `(12, 2520, 2520)` fp32 = 305 MB score tensor**: `fused_NT_matmul8_multiply22`
@@ -1747,7 +1791,9 @@ Main repo:
 |---|---|
 | `python/mlc_llm/model/qwen35/qwen35_model.py` | **§16.6** `v_block` on the ksplit kernel + `_gdn_v_block()` (`MLC_QWEN35_GDN_VBLOCK`, **default 0 = inert**): grid becomes `(n_vh × V/v_block, batch)`, block `v_block × k_split` threads. Bit-exact with `v_block=V` by construction. **§16.5** `create_gated_delta_net_func_with_history_inplace_ksplit` + `_gdn_k_split()` (`MLC_QWEN35_GDN_KSPLIT`, **default 4**) and the two-way selection at the `forward_with_history` call site. Uses `T.tvm_warp_shuffle` — there is no `_xor` variant in this TVM, so the partner lane is computed as `(tid % 32) ^ d`; it lowers to a real `__shfl_sync` at sm_87 (the legacy `__shfl` compat macro is gated on `__CUDA_ARCH__ < 700`). **§15** `create_gated_delta_net_func_with_history_inplace` + the recurrent half of `forward_with_history` behind `state_io`. **§14** `create_causal_conv1d_func_with_history_inplace` + `state_io` threaded through `forward_with_history`; the per-model hoist block factored into `_maybe_hoist_state_io`. **§10–13:** `in_proj_qkvzab` + `_in_proj()` helper; **§11** `create_gated_delta_net_func_inplace`, `_GDNStateIO`, `_hoist_gdn_state_io`, `MLC_QWEN35_INPLACE_STATE` toggle; **§13** `create_causal_conv1d_func_inplace` + `conv_storages` on `_GDNStateIO` |
 | `python/mlc_llm/op/moe_matmul.py` | **§16.9/§16.10** — `MLC_MOE_GEMM_V2_BLKM` (A/B knob, inert at 16) and `MLC_MOE_GEMM_V2_SKIPPAD` (item 0f's padding-CTA skip, default `0` pending pp512). The skip is a post-schedule rewrite of the `k_o_o` loop *extent* to `Select(e_v >= 0, K/BLK_K, 0)` — **not** an `IfThenElse`, because `ThreadSync` refuses to put a barrier inside a condition |
-| `python/mlc_llm/compiler_pass/blas_dispatch.py` | **§19.6** `_region_needs_tir_vars` — decline a cuBLAS match that would need a `tir_vars` parameter (the VL merger matmuls; fixes a compile abort). **§20.3** `_region_is_fp32` + `MLC_BLAS_SKIP_FP32` (default `1`) — decline fp32 offloads, because on the VL tower cuBLAS's SGEMM wins the GEMM 2.6× and loses 47 ms of broken `matmul→multiply` fusion. Unreachable on the 35B/0.8B text models: `_cublas_gemm` only enables the pass for `q0f16`/`q0bf16`/`q0f32`/fp8, and those are `q4f16_1` |
+| `python/mlc_llm/compiler_pass/blas_dispatch.py` | **§19.6** `_region_needs_tir_vars` — decline a cuBLAS match that would need a `tir_vars` parameter (the VL merger matmuls; fixes a compile abort). **§20.3** `_region_is_fp32` + `MLC_BLAS_SKIP_FP32` — decline fp32 offloads. **§20.6 dropped its default to `0`**: superseded by prescaling, which removes the fusion it protected instead of working around it. Unreachable on the 35B/0.8B text models — `_cublas_gemm` only enables the pass for `q0f16`/`q0bf16`/`q0f32`/fp8, and those are `q4f16_1` |
+| `python/mlc_llm/model/vision/qwen3_vl_vit.py` | **§20.5** `MLC_QWEN35_VL_PRESCALE_Q` (default `1`) — apply the attention scale to `q` rather than to the scores, via `matmul(q,k^T)·c ≡ matmul(q·c,k^T)`. Worth 0 ms by itself; worth **70 ms** because it makes the QK matmul a bare GEMM cuBLAS can take. Coupled to `MLC_BLAS_SKIP_FP32` — see §20.6 |
+| `scripts/vit_attn_bench.py` | **§20.5 new** — the tower's attention block alone, same passes and dlight schedules, each PrimFunc timed separately. Reproduces the traced per-layer numbers to **1.3%**; `--static` and `--prescale` are the two hypothesis legs. This is the loop for item 0q, and it needs no compile |
 | `validate.py` | **§20.1** `--perf-vl5` — the first VL perf harness; times `image_embed`/`prefill`/`decode` as three separate VM calls with a sync each, both `max_history` rings. **§20.4** `--greedy-parity-vl5` hoists `image_embed` out of the per-prompt loop (was 5× a 337 ms call for one fixture) |
 | `python/mlc_llm/model/qwen3_5_moe/qwen3_5_moe_model.py` | **§11** same state_io wiring (the 35B's model file; VL reuses `Qwen35Model` and needed none). **§13**: it has its *own* `_hoist_gdn_state_io` call site — changing that helper's signature breaks the 35B compile while the 0.8B still builds |
 | `scripts/{prefix_cache_roundtrip,batch_decode_parity}.py` | **§11 new** — rollback and batch-slot gates; `batch_decode_parity` gained phase timing in **§12** |
@@ -5053,3 +5099,108 @@ which is what flash attention is for. Filed as **item 0p**.
 `--greedy-parity-vl5`'s per-prompt loop for a fixture that never changes (§20.1). Hoisted; the gate
 still scores **184/184 exact, margin PASS**, and now runs in **13.2 s**, saving 4 × `image_embed`
 (**1.17 s** on `lib_nofp32blas`, 1.35 s on `lib_cublas`).
+
+### 20.5 Item 0p, part 1 — the wall was wrong, and the fusion was worth nothing
+
+**First, an instrument.** `scripts/vit_attn_bench.py` rebuilds the attention block from
+[qwen3_vl_vit.py](python/mlc_llm/model/vision/qwen3_vl_vit.py)'s ops, runs the same passes and the
+same dlight schedules, and times each generated PrimFunc alone — because iterating on a kernel
+through a 3.5-minute whole-model compile is the wrong loop. It emits the same four PrimFuncs the
+real compile does and **reproduces §20.2's per-layer numbers to 1.3%**, which is the bar that makes
+anything built on it trustworthy:
+
+| | microbench | §20.2, traced | delta |
+|---|---:|---:|---|
+| QK^T + scale | 9.59 | 9.46 | +1.4% |
+| P@V + cast | 7.04 | 7.03 | +0.1% |
+| softmax | 3.97 | 4.04 | −1.7% |
+
+**⚠️ The bandwidth wall used in §20.2 was wrong for this access pattern: it is 184.8 GB/s, not
+156.** A static-shape softmax came in at 3.35 ms for 610 MB — 182 GB/s, which the 156 figure says is
+impossible. A device-to-device copy of exactly the score tensor (304.8 MB) settles it at **3.30 ms,
+184.8 GB/s**. Both numbers are real: 156 GB/s is what the *MoE GEMM's strided expert-weight* access
+achieves and is correct there; the tower streams contiguously and gets 184.8. This is the fifth time
+this document has been bitten by a figure quoted out of the shape it was measured on, and the rule
+from §15.2 applies unchanged — **renormalize against a measurement at the target shape.** Re-based:
+
+| | measured | bound @184.8 GB/s | off | effective |
+|---|---:|---:|---:|---:|
+| QK^T + scale | 9.46 | 1.83 (compute) | **4.9×** | 35.9 GB/s |
+| softmax | 4.04 → **3.35** static | 3.30 (BW) | **1.0×** | 182.0 GB/s |
+| P@V + cast | 7.03 | 1.83 (compute) | **3.8×** | 45.1 GB/s |
+
+**So softmax is finished.** At 98.5% of a measured copy of the same bytes there is nothing in it —
+item 0p's step (a) is answered, and the only way to improve it is to stop producing its input.
+
+**Hypothesis 1, symbolic shapes: largely refuted.** `--static` pins `seq_len` to a literal instead of
+`num_patches`. Worth **6.5%** overall (QK^T 9.59 → 8.93, softmax 3.97 → 3.35, P@V unmoved) — real,
+but not a 4× gap. dlight tiling blind is not the problem.
+
+**Hypothesis 2, prescaling: worth nothing, and that is the whole point.**
+`matmul(q, k^T) · c ≡ matmul(q · c, k^T)`, which moves the scale off a 305 MB tensor onto a 7.7 MB
+one. Measured, it buys **nothing**: `NT_matmul` alone is **8.93 ms**, to the digit what
+`fused_NT_matmul_multiply` costs. The multiply was already free inside the fusion.
+
+**That null result is the finding.** If the fusion buys nothing, then the fusion is not worth
+protecting — and protecting it is exactly what §20.3's guard does. The QK matmul becomes a *bare*
+GEMM with nothing to displace, so cuBLAS can have it at the 3.63 ms §20.2 already measured, against
+the generated kernel's 8.93.
+
+### 20.6 …which retires §20.3's guard one section after it landed
+
+`MLC_QWEN35_VL_PRESCALE_Q` (default **`1`**) moves the scale onto `q`;
+`MLC_BLAS_SKIP_FP32` therefore drops to default **`0`**. Measured with no environment variables set
+at all — `lib_vl2.so`, plain `--opt`, which is the configuration that actually ships:
+
+| | `lib_cublas` (§20 start) | `lib_nofp32blas` (§20.3) | **`lib_vl2`** (§20.6) |
+|---|---:|---:|---:|
+| `image_embed` | 337.28 | 293.33 | **223.33** |
+| `prefill` | 149.37 | 149.87 | 149.54 |
+| `decode` | 11.36 | 11.38 | 11.38 |
+| **ttft** | 486.65 | 443.20 | **372.88** |
+
+**`image_embed` −33.8% and ttft −23.4% against where this session started**, decode and prefill
+untouched. Gate: **184/184 exact, margin PASS** — prescaling changes fp32 rounding by ~1 ulp and the
+gate is unmoved. `lib_prescale.so` (built with both variables set explicitly) and `lib_vl2.so` agree
+to **0.07%**, which is the check that the defaults are what they claim to be.
+
+*The trace closes the accounting.* `ampere_sgemm_128x128_tn` is back at **43.55 ms/iter — identical
+to §20.2's cuBLAS leg** — while *both* the 113.53 ms fused kernel and the 117.34 ms standalone
+`multiply22` are gone. Kernel delta 70.0 ms against a measured `image_embed` drop of 70.15 ms: **0.2%**.
+
+**§20.3 was right about the mechanism and wrong about the fix, and it is worth being precise about
+which.** Its diagnosis — cuBLAS cannot pay back a fusion it destroys over a 305 MB tensor — is
+confirmed, and its 3.91-vs-3.94 ms/layer prediction still stands. But it treated the fusion as
+something to protect, when the fusion was worth **0.00 ms**. Declining the offload bought 3.0 ms/iter
+and gave up 70. *One graph-level identity beat the compiler-pass fix by 23×*, and the two knobs are
+now coupled: set `MLC_QWEN35_VL_PRESCALE_Q=0` and `MLC_BLAS_SKIP_FP32` is worth `1` again, because
+that configuration pays §20.2's 47 ms.
+
+**The pattern, and it is the one §16 and §19 both closed on.** §20.3 measured a real mechanism and
+then optimised *around* it instead of asking whether the thing it was protecting had any value. The
+question that cracked it — "what does the fusion actually buy?" — cost one microbench run and
+returned **zero**. Both sessions' biggest wins came from measuring a premise nobody had priced,
+not from a cleverer kernel.
+
+### 20.7 Where the tower stands now
+
+`image_embed` is 223 ms, and the three-kernel picture has changed shape:
+
+| kernel | ms/iter | ms/layer | bound | off | status |
+|---|---:|---:|---:|---:|---|
+| `fused_matmul9_cast17` (P@V + cast) | 84.34 | 7.03 | 1.83 | **3.8×** | ⬅️ now the largest, and untouched |
+| `softmax` | 48.57 | 4.05 | 3.30 | 1.0× | at the wall, closed |
+| `ampere_sgemm` (QK^T) | 43.55 | 3.63 | 1.83 | 2.0× | cuBLAS; 51% of fp32 peak |
+
+**P@V is now the biggest single kernel in the tower** and is the one thing here nobody has attacked.
+It is `matmul(attn_probs, v32)` with an `astype` epilogue, and that epilogue is why cuBLAS never took
+it — the same fusion question §20.5 just answered for QK^T, and it has *not* been asked here. The
+cast writes fp16 (3.87 MB) against reading a 305 MB fp32 `attn_probs`, so the fusion is protecting
+almost nothing, and the identity is even simpler: there is no algebra to rearrange, just a cast that
+could move. **That is the next measurement, and the microbench answers it without a compile.**
+
+Beyond it, the tower's floor is set by materializing the score matrix at all: 305 MB written by QK^T,
+read+written by softmax, read by P@V. Flash attention removes all three — the compute floor is
+2 × 1.83 = 3.67 ms/layer against today's 14.7 — but it is a real build, in fp32, with no HF kernel to
+copy (the reference runs eager attention). Price P@V first; it may be most of the remaining gap for a
+fraction of the risk.

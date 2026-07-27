@@ -31,6 +31,7 @@ Shapes for the 0.8B + cat fixture (image_grid_thw=(1,42,60)):
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import List, Optional, Tuple  # noqa: UP035
 
 import numpy as np
@@ -161,10 +162,25 @@ class Qwen3VLVisionAttention(nn.Module):
         k32 = op.add(op.multiply(k32, cos32), op.multiply(_rotate_half(k32), sin32))
 
         k_t = op.permute_dims(k32, axes=[0, 2, 1])  # (h, d, s)
-        attn_scores = op.matmul(q32, k_t)
-        attn_scores = op.multiply(
-            attn_scores, nn.Tensor.from_const(np.array(self.scaling, dtype="float32"))
-        )
+        scale = nn.Tensor.from_const(np.array(self.scaling, dtype="float32"))
+        if os.environ.get("MLC_QWEN35_VL_PRESCALE_Q", "1") == "1":
+            # `matmul(q, k^T) * c` == `matmul(q * c, k^T)`, and which side the scale
+            # sits on decides how much memory the model touches. On the scores it is
+            # an elementwise pass over `(h, s, s)` = **305 MB**; on `q` it is the same
+            # arithmetic over `(h, s, d)` = 7.7 MB, 40x less (§20.5).
+            #
+            # The saving is not the pass itself — dlight fuses `matmul + multiply`
+            # into one kernel, so on this path the multiply is already free. It is
+            # that the fusion is what made the matmul *ineligible* for cuBLAS:
+            # §20.2 measured offloading it as a net **47 ms loss**, entirely from the
+            # DRAM round trip the broken fusion forced. Move the scale here and the
+            # QK matmul becomes a bare GEMM with nothing to displace, so cuBLAS's
+            # 3.63 ms SGEMM replaces a 9.46 ms generated kernel at no cost.
+            q32 = op.multiply(q32, scale)
+            attn_scores = op.matmul(q32, k_t)
+        else:
+            attn_scores = op.matmul(q32, k_t)
+            attn_scores = op.multiply(attn_scores, scale)
         attn_probs = op.softmax(attn_scores, axis=-1)
         attn_out = op.matmul(attn_probs, v32)  # (h, s, d) fp32
         attn_out = op.astype(attn_out, in_dtype)
