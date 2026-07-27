@@ -988,6 +988,12 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `1e07a3f9`, `7109a39d` | commit-table backfill; workplan brought current for a fresh session — open work consolidated and ranked, VL serving filed as an item, three retractions made where asserted, P@V's bound corrected to compute |
 | `f4d98e99` | **§20.8–§20.9** item **0q** refuted — the cast fusion *is* free but never blocked cuBLAS; the blocker is a **symbolic reduction axis** (`cublas.py:77`). Worth 5.7% behind a static-shape project, cuBLAS still 3.4× off. Item **0r** (flash attention) filed as the only lever left |
 | `0e285ea7` | **§20.5–§20.7** item **0p** half done — `vit_attn_bench.py` (1.3% fidelity); **the wall is 184.8 GB/s, not 156**, so softmax is at 98.5% and closed; symbolic shapes refuted (6.5%); prescaling worth **0.00 ms alone**, which retires §20.3's guard and unlocks 70 ms via cuBLAS. `image_embed` 293 → **223**, ttft → **372.88**, gate 184/184 exact. Item **0q** filed |
+| `63f7b734` | **§21** item **0n** answered — the wide tile's cost is registers → occupancy (a minority) plus padding-row operand traffic; candidate (a) worth 1.00×; `moe_occupancy_ab.py`. Two instrument findings: CC 8.x's 1 kB per-block shared reservation, and ptxas scheduling as a ±8% lottery at fixed occupancy |
+| `d3080c31` | **§21.7** item **0s** built — `MLC_MOE_GEMM_V2_OPSPEC` (default `0`); `a` is a Pareto gain on the wide tile, `x` loses 25–32% while emitting strictly less work; bit-exact 40/40; `moe_opspec_ab.py` |
+| `74d147f4`, `7a24635a`, `49a20f05` | **§22** item **0r** re-priced three times, each by one measurement on the matching leg: ~89 → ~44 → **~43–51 ms/iter**. `vit_flash_probe.cu` (hand-written ceiling) and `vit_flash_tir.py` (TIR at 0.99× of it). The 0.8B prose prefill number; the first VL shape-coverage answer |
+| `965716e7` | **§22.5** the two TIR traps audited against the shipped kernels — neither is live |
+| `c1a65407` | **§22.6** item **0s** end to end — `lib_opspec_a64` pp128 −6.0% / pp512 +3.5% / pp2048 +12.8%; the baseline reproduces §19.4 to 0.2%; state gate 139/139 both modes. Still not Pareto, defaults unchanged |
+| `e973210a`, `8c14d702` | §9 brought current; final handoff — every remaining item is a build, not a measurement |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
