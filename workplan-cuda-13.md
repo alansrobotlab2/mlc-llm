@@ -1247,7 +1247,7 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > | ~~**0m**~~ | ✅ **fixed, §19.5–§19.7** — two ops, both in the VL patch merger; the guard declines exactly those two matches | a default-`--opt` VL lib now compiles and gates **184/184** |
 > | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
 > | ~~**VL re-gate**~~ | ✅ **cleared, §18.14** — margin scoring added; 0 wide-margin divergences | the five inherited state-path changes are gated on VL for the first time since `f667b07e` |
-> | **0h** | re-costed by §18.9; the runtime branch is the **wrong shape of fix** (§18.11) | the frontier's upper envelope, ≤ +12.5% at pp2048 only. **0l may make it unnecessary** |
+> | **0h** | re-costed by §18.9; the runtime branch is the **wrong shape of fix** (§18.11). 0l did *not* make it unnecessary (§19.4) | the frontier's upper envelope, ≤ +12.5% at pp2048 only — and `lib_rowspec64` now reaches it without a branch, at the same pp128 cost |
 > | **0c.2** | de-prioritised; changes the arithmetic, so bit-exactness is off the table | ≤ +12.5% by Amdahl |
 >
 > **What §18 changed about how to read the rest of this document.** §17 believed it had closed the
@@ -4374,6 +4374,12 @@ diagnosis:
 | % of the bandwidth wall | 85–87% (§17.7) | **45%** |
 | best known pp2048 | 945 tps | **1063 tps** (`lib_hoist64`, +12.5%) |
 | whether any `BLK_M` is Pareto | "no" (§17.10), from one A/B pair | **no**, from a mapped 4×3 frontier |
+
+> ⚠️ **Retracted by §19.3.** Everything from here to the end of this section rests on "what stops a
+> wide tile winning everywhere is padding-row compute". Item 0l built the fix this paragraph asks
+> for, it works as a mechanism, and it recovered **2 points of a 31-point gap** — so the premise is
+> wrong. Read §19.3 and item 0n before acting on any of it. The last paragraph, on mixed tiles,
+> stands: it was never about padding-row compute.
 
 **The next lever is to stop a wide tile paying for its own padding — filed as item 0l, and it is
 the first MoE idea in three sessions that is not a point on the frontier §18.9 just mapped.**

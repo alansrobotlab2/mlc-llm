@@ -1089,10 +1089,12 @@ def _dequantize_group_gemm_v2(
         reduction still runs over all `BLK_M/MICRO` fragments and two of the four here are
         entirely zeros.
 
-        **This is the whole reason widening `BLK_M` has a short-prompt cost.** §17.10 found
-        `BLK_M=64` losing 10.4% at pp128 and concluded no compile-time width is Pareto; the
-        loss is padding-row compute, and padding rows are exactly what a wider tile creates
-        when experts are small. Removing it is what could make a wide tile safe everywhere.
+        ⚠️ **This docstring used to claim this is "the whole reason" widening `BLK_M` has a
+        short-prompt cost. §19.3 refutes that.** Item 0l removed this compute without 0k's
+        overhead and recovered 2 points of a 31-point gap at B=1024, so padding-fragment
+        reduction is a real cost worth 0-3% and not the one that matters. What survives is
+        per-CTA and sits *above* this loop -- the `X_shared` cooperative store and the
+        `A_mat` fragment loads both run `BLK_M`-wide unconditionally. See item 0n.
 
         Mechanism is item 0f's, for item 0f's reason: an `if` cannot wrap these loops
         because the cooperative loads carry `__syncthreads()` and ThreadSync refuses to
