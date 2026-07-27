@@ -5763,13 +5763,12 @@ source, cost 2.25× together, and neither produces a warning — the only way ei
 reading the emitted CUDA. **Any hand-written TIR kernel in this repo should be checked for both**,
 and `scripts/moe_dump_cuda.py` already does exactly that job for the MoE.
 
-### 22.4 …and the baseline it should be measured against, which is not 14.71
+### 22.4 …and the baseline, which took two attempts to get right
 
-Measured this session at three patch counts, `vit_attn_bench.py --static --prescale --cublas`
-(the shipped configuration), end-to-end on the VM — the only number comparable across a cuBLAS
-offload:
+Measured this session at three patch counts, `vit_attn_bench.py --cublas --prescale`, end-to-end on
+the VM — the only number comparable across a cuBLAS offload:
 
-| seq | the block today | **TIR flash** | ratio |
+| seq | the block today (`--static`) | **TIR flash** | ratio |
 |---:|---:|---:|---:|
 | 1260 | 3.61 | **2.86** | 0.79× |
 | **2520** | **13.46** | **11.13** | **0.83×** |
@@ -5779,17 +5778,36 @@ The ratio is flat across a 4× range of patch counts, and flash's cost is exactl
 (2.86 → 11.13 → 44.19 is 3.9× and 4.0×), so **§20's reliance on the cat fixture's one shape does not
 bias this item** — the first shape-coverage answer the VL work has had.
 
-⚠️ **But the baseline is 13.46 here and §20.9's traced sum is 14.71, an unexplained 8.5%.** Unpinned
-clocks would make this session *slower*, not faster, so it is not that. Taking the like-for-like pair
-— both measured in one session, one clock state — the honest value of item 0r is:
+⚠️ **That table's baseline column is the wrong leg, and the error is this document's own house
+speciality.** It was taken with `--static`, and §20.5 measured static shapes worth 6.5% — but the
+shipped model's sequence length is symbolic, and *so is the TIR flash kernel*. Comparing a pinned
+baseline against a symbolic candidate charges the candidate for a difference it does not have. It
+also explains the 8.5% gap against §20.9's traced 14.71 that the first version of this section
+recorded as unexplained. Re-measured on the leg that matches the model:
 
-| | §20.9 filed | §22.2 | **§22.4, like-for-like** |
+| seq=2520, symbolic (as shipped) | ms/layer |
+|---|---:|
+| the block today, `--cublas --prescale` | **15.35** |
+| §20.9, traced on the real model | 14.71 |
+| **TIR flash** | **11.13** |
+
+**So item 0r is worth ~43–51 ms/iter** — 43 against §20.9's trace, which is the authority for ttft
+because it is the only number taken on the real model, and 51 against this session's like-for-like
+bench leg:
+
+| | §20.9 filed | §22.2 | **corrected** |
 |---|---:|---:|---:|
-| saving | ~89 ms/iter | ~44 | **~28 ms/iter** |
-| `image_embed` | 223 → ~135 | → ~180 | → **~195** |
-| ttft | 373 → ~285 | → ~329 | → **~345 (−7.5%)** |
+| saving | ~89 ms/iter | ~44 | **~43–51 ms/iter** |
+| `image_embed` | 223 → ~135 | → ~180 | → **~172–180** |
+| ttft | 373 → ~285 | → ~329 | → **~322–330 (−12 to −14%)** |
 
-**Resolve the 8.5% with a trace before costing the integration**, because that gap is now larger than
-a third of the prize. The item is still worth doing and is still the largest open VL lever; it is
-worth a third of what it was filed at, and the three re-pricings all moved the same direction for the
-same reason — an estimate built on a rate that was never measured at the shape it was quoted for.
+And the comparison is **conservative on two axes**: the TIR kernel reads fp32 Q/K/V, where a real
+integration would read fp16 and convert on load (halving the K/V streaming, which is a real term at
+this tile size), and it is being charged against a baseline whose fp16→fp32 casts it would also
+absorb. §22.2's estimate stands corrected upward; §20.9's stands corrected down by roughly half.
+
+**The pattern across all three re-pricings of this item is the same one**, and it is worth naming
+because it has now cost three separate estimates: **a rate quoted at a shape or configuration it was
+not measured at.** §20.9 quoted cuBLAS's 51% of peak for a kernel nobody had written; §22.2 quoted a
+traced baseline against a bench candidate; §22.4's first version quoted a `--static` baseline against
+a symbolic one. The fix each time was one measurement on the matching leg.
