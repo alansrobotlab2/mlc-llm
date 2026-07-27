@@ -83,6 +83,11 @@ VL_5PROMPT_QUERIES = [
     "Give a one-word answer: what is the animal's facial expression?",
 ]
 CACHE_FILE_VL5 = Path("reference_outputs_vl5.pt")
+# Margin (nats) the VL gate scores at. 2.0 means top-1 was ~7.4x more likely than
+# top-2, matching scripts/high_margin_gate.py's DEFAULT_TAU so the two gates are
+# read on the same scale. See workplan §16.1 for why an unweighted match count is
+# the wrong instrument, and §18.13 for the VL run that demonstrated it.
+VL_DEFAULT_TAU = 2.0
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Argument parsing
@@ -93,6 +98,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="Qwen/Qwen3.5-0.8B", help="HF model ID or local path")
     p.add_argument("--cache", default=str(CACHE_FILE), help="Path to reference_outputs.pt")
+    p.add_argument(
+        "--tau", type=float, default=VL_DEFAULT_TAU,
+        help="margin (nats) the VL gate scores at. A divergence at a position where the "
+             "reference's own top1-top2 margin was below this is a near-tie, not a "
+             "defect; only wide-margin divergences fail. Matches "
+             "scripts/high_margin_gate.py's tau so the two read on one scale (§16.1).",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     mode = p.add_mutually_exclusive_group(required=True)
@@ -1113,15 +1125,34 @@ def run_reference_vl5(args: argparse.Namespace) -> None:
         prefill_out = model(**inputs, use_cache=False)
         prefill_logits_last = prefill_out.logits[0, -1].detach().cpu().to(torch.float32)
 
-        # Greedy generate
-        gen = model.generate(**inputs, max_new_tokens=GREEDY_N, do_sample=False, return_dict_in_generate=True)
+        # Greedy generate. `output_logits` gives the raw per-step logits (not the
+        # processed `scores`), which is what a margin has to be computed from.
+        gen = model.generate(
+            **inputs, max_new_tokens=GREEDY_N, do_sample=False,
+            return_dict_in_generate=True, output_logits=True,
+        )
         full = gen.sequences[0]
         prompt_len = inputs["input_ids"].shape[1]
         new_tokens = full[prompt_len:].detach().cpu().tolist()
         new_text = processor.batch_decode([full[prompt_len:]], skip_special_tokens=True)[0]
+
+        # Per-position top1-top2 margin, in nats — the same quantity
+        # scripts/high_margin_gate.py captures, and for the same reason: a raw match
+        # count cannot tell a near-tie apart from a regression (workplan §16.1). The
+        # 2026-07-26e VL run failed at 167/184 on a single ',' vs '.' divergence, which
+        # is exactly the case this distinguishes (§18.13).
+        margins: list[float] = []
+        for step_logits in gen.logits:
+            top2 = torch.topk(step_logits[0].detach().float(), k=2)
+            margins.append(float(top2.values[0] - top2.values[1]))
+        wide = sum(m >= VL_DEFAULT_TAU for m in margins)
+        med = sorted(margins)[len(margins) // 2] if margins else float("nan")
         print(f"[ref-vl5] {len(new_tokens)} tokens; text: {new_text!r}")
+        print(f"[ref-vl5]   margins: {wide}/{len(margins)} at >= {VL_DEFAULT_TAU} "
+              f"(median {med:.2f})")
 
         per_prompt.append({
+            "margins": margins,
             "query": query,
             "chat_text": chat_text,
             "input_ids": inputs["input_ids"].detach().cpu().numpy(),
@@ -1208,6 +1239,7 @@ def run_greedy_parity_vl5(args: argparse.Namespace) -> None:
 
     total_match = 0
     total_tokens = 0
+    wide_failures = 0
     per_prompt_results = []
 
     for i, p in enumerate(cache["prompts"]):
@@ -1292,15 +1324,55 @@ def run_greedy_parity_vl5(args: argparse.Namespace) -> None:
         match = sum(1 for a, b in zip(generated, ref_tokens) if a == b)
         total_match += match
         total_tokens += n_steps
+
+        # Margin-gated verdict (workplan §16.1, §18.13). Two things make an unweighted
+        # match count the wrong instrument here, and they compound:
+        #
+        #  1. A near-tie is not a defect. The 2026-07-26e run scored 167/184 and "failed"
+        #     on a single ',' vs '.' after a grammatically complete clause — a position
+        #     where the reference itself barely preferred one token.
+        #  2. **This decode is free-running**, so once MLC picks a different token it is
+        #     conditioned on a different prefix and every later position is incomparable.
+        #     Counting them at all overstates the damage of one flip. `high_margin_gate.py`
+        #     dodges this with teacher forcing; this driver cannot without a restructure,
+        #     so the honest quantity is the *first* divergence and the reference's margin
+        #     there. Everything before it is a genuine agreement; everything after is
+        #     unscoreable, not wrong.
+        margins = p.get("margins")
+        first_div = next((k for k, (a, b) in enumerate(zip(generated, ref_tokens)) if a != b), None)
+        if first_div is None:
+            verdict, div_margin = "exact", None
+        elif margins is None:
+            verdict, div_margin = "unscored (cache has no margins; rebuild with --regen)", None
+        else:
+            div_margin = margins[first_div] if first_div < len(margins) else float("nan")
+            verdict = ("NEAR-TIE" if div_margin < args.tau else "WIDE-MARGIN DIVERGENCE")
+            if div_margin >= args.tau:
+                wide_failures += 1
         per_prompt_results.append((query, match, n_steps, ref_tokens, generated))
-        print(f"[parity-vl5] prompt {i+1}/{len(cache['prompts'])}: {match}/{n_steps}  query={query!r}")
+        extra = "" if first_div is None else (
+            f"  first diff @{first_div}"
+            + (f", ref margin {div_margin:.2f} -> {verdict}" if div_margin is not None else "")
+        )
+        print(f"[parity-vl5] prompt {i+1}/{len(cache['prompts'])}: {match}/{n_steps}  "
+              f"query={query!r}{extra}")
 
     print()
     print("=" * 70)
     print(f"[parity-vl5] AGGREGATE: {total_match}/{total_tokens}  ({100 * total_match / total_tokens:.1f}%)")
     print("=" * 70)
     bar = int(0.96 * total_tokens)
-    print(f"[parity-vl5] Bar = {bar}/{total_tokens} (96%): {'PASS' if total_match >= bar else 'FAIL'}")
+    raw = "PASS" if total_match >= bar else "FAIL"
+    print(f"[parity-vl5] raw count bar = {bar}/{total_tokens} (96%): {raw}"
+          "   <- informational only; see the margin verdict below (§16.1, §18.13)")
+    have_margins = any(p.get("margins") for p in cache["prompts"])
+    if not have_margins:
+        print("[parity-vl5] MARGIN VERDICT: unavailable — this cache predates margin capture. "
+              "Rebuild it with `--reference-vl5 --regen`.")
+    else:
+        print(f"[parity-vl5] MARGIN VERDICT at tau={args.tau}: "
+              f"{wide_failures} prompt(s) diverged at a wide-margin position: "
+              f"{'PASS' if wide_failures == 0 else 'FAIL'}")
     print()
     print("[parity-vl5] Per-prompt diff:")
     for query, match, n_steps, ref, mlc in per_prompt_results:

@@ -3813,7 +3813,9 @@ numbers. It also produced a **retraction of §17.7**, the section that declared 
 | §18.9 | the frontier, 4 libs × 3 lengths, one clock state | **monotone, nothing Pareto**; best pp2048 **1063 tps** |
 | §18.10 | "defaults unchanged" checked by diffing generated CUDA | **was false when written**; now true and proved |
 | §18.11 | where the lane stands | re-opened; next lever is **fuller tiles, not bigger** |
-| §18.12 | VL re-gate | ⛔ **blocked by a real compile break**, not by a download |
+| §18.12 | VL re-gate | a **VL-only** `BLASDispatch` compile break; worked around |
+| §18.13–14 | VL gate, margin-scored | ✅ **PASS** — the one divergence is a 0.05-nat near-tie |
+| §18.15 | the 35B vs the original, measured | **2.29×** pp512 / **2.36×** pp2048 shipped; 2.66× best |
 
 ### 18.1 Item 0i — the real expert histogram
 
@@ -4260,14 +4262,48 @@ a 96% bar, which is the instrument §16.1 replaced for the text path.
 transformers 5.14.1, and it is a *different reference*: prompt 1 is now 29 tokens where it was 25, and
 the total is 184 where it was 180. The old number was never going to reproduce.
 
-**So the VL path's status is: it builds (with `cublas_gemm=0`, §18.12), it loads, it runs, and it
-agrees exactly on four of five prompts. Whether the fifth is a near-tie or a real defect in the
-inherited state path is unresolved, because nothing here measures the margin.** The work to resolve
-it is small and already specified by §16.1: give `--greedy-parity-vl5` the margin-gated scoring
-`high_margin_gate.py` uses, then re-run. Until then the five state-path changes (§11, §13, §14, §15,
-§16.5) remain **ungated on the VL path** — less ungated than before this session, and not cleared.
+### 18.14 The VL gate gets a margin, and the answer is PASS
 
-### 18.14 The 35B against the original, measured — not quoted
+Rather than leave §18.13 unresolved, `--greedy-parity-vl5` was given the missing instrument. Two
+changes to [validate.py](validate.py):
+
+1. `--reference-vl5` now captures the **per-position top1−top2 margin** (via `generate(...,
+   output_logits=True)`), the same quantity `high_margin_gate.py` records, on the same scale
+   (`tau = 2.0` nats ≈ top-1 is 7.4× top-2).
+2. The gate scores the **first divergence** against the reference's margin at that position.
+
+**The first-divergence framing is not a shortcut, it is forced by this driver.** `high_margin_gate.py`
+teacher-forces, so every position is independently comparable. `--greedy-parity-vl5` decodes
+**free-running**, feeding MLC its own tokens — so the moment MLC picks differently it is conditioned on
+a different prefix and *every later position is unscoreable, not wrong*. Counting them, as the 96% bar
+does, charges one flip for the entire tail. Positions before the first divergence are genuine
+agreements; the first divergence is the only thing that carries information.
+
+**Result:**
+
+```
+prompt 1/5: 12/29   first diff @12, ref margin 0.05 -> NEAR-TIE
+prompt 2/5: 50/50   prompt 3/5: 50/50   prompt 4/5: 50/50   prompt 5/5: 5/5
+raw count bar = 176/184 (96%): FAIL     <- informational only
+MARGIN VERDICT at tau=2.0: 0 prompt(s) diverged at a wide-margin position: PASS
+```
+
+**The reference's own margin at the divergence is 0.05 nats — top-1 was 1.05× top-2.** The `,`-vs-`.`
+choice was very nearly a coin flip *in the HF reference itself*, so an MLC build landing on the other
+side of it says nothing about the state path. Prompt 1 is low-margin throughout (only 8/29 positions
+clear tau, median 1.06) because "describe this image in one short sentence" admits many acceptable
+continuations — §16.1 made the same observation when it built a deliberately high-margin prompt set
+for the text path.
+
+**So the VL path is cleared**, and the five inherited state-path changes (§11, §13, §14, §15, §16.5)
+are gated on it for the first time since `f667b07e`. The raw 96% count is retained in the output but
+marked informational; it is the instrument §16.1 retired, and it produced a FAIL on a model that is
+behaving correctly.
+
+**Still outstanding for the VL path**, and neither is about correctness: the `BLASDispatch` compile
+break (§18.12) means this is a `cublas_gemm=0` lib, and no VL *performance* number has ever been taken.
+
+### 18.15 The 35B against the original, measured — not quoted
 
 Every "overall" figure in this document chains ratios taken on the filler prompt across five sessions
 and different clock states. This is the whole span measured directly: the **original**

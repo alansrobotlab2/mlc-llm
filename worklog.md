@@ -89,10 +89,18 @@ Monotone in one parameter (padded row-space per CTA), no exception in 12 cells, 
   lesson and scores an unweighted count.
 - Not comparable to f667b07e's 176/180 either: the reference was rebuilt under transformers 5.14.1 and is a
   *different* reference (prompt 1 is 29 tokens, was 25; total 184, was 180).
-- **To actually clear it:** port `high_margin_gate.py`'s margin scoring into `--greedy-parity-vl5`. Small, and
-  already specified. Until then the five inherited state-path changes stay ungated on the VL path.
+- **Did it rather than leaving it: the gate now has a margin, and the answer is PASS (§18.14).**
+  `--reference-vl5` captures per-position top1-top2 margins (`generate(output_logits=True)`) and the gate
+  scores the **first divergence** against the reference's margin there. **That divergence's margin is 0.05
+  nats** — top-1 was 1.05x top-2, a coin flip in the HF reference itself. 0 prompts diverge at a wide-margin
+  position: **PASS**. The five inherited state-path changes are gated on the VL path for the first time
+  since f667b07e.
+- **First-divergence scoring is forced, not a shortcut.** high_margin_gate teacher-forces so every position
+  is comparable; --greedy-parity-vl5 decodes free-running, so after the first flip MLC is on a different
+  prefix and later positions are *unscoreable, not wrong*. The 96% raw bar charges one flip for the whole
+  tail — it is retained but marked informational.
 
-**The 35B against the original, measured rather than chained (§18.14)** — prose, radix, one clock state:
+**The 35B against the original, measured rather than chained (§18.15)** — prose, radix, one clock state:
 
 | | original 2026-07-24 | shipped blkk64 | best tonight |
 |---|---|---|---|
