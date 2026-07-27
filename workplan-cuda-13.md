@@ -998,9 +998,22 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > 85%/87%) and was the session's win. The padding lane is closed (§17.2): §16.10's "20% residue" is
 > **CTA launch overhead**, not the store tail, and only ~a sixth of it was recoverable.
 >
-> ### Where to start: one well-costed item
+> ### Where to start: item 0i, and do it before ranking anything else
 >
-> **Item 0h needs a runtime branch, and that is the best-costed work on the list.** The hoist is
+> **Dump the real expert histogram (item 0i).** Every ranking decision in this kernel rests on an
+> assumed routing distribution, and §17.9 showed *both* instruments in use are unrepresentative — the
+> bench prompt concentrates the router, and the microbench's synthetic routings predicted item 0h's
+> **wrong sign**. §16.8 and §16.11 both filed this as "worth having" and skipped it; §17.9 is what
+> that cost.
+>
+> It needs **no compile and no MLC instrumentation**: the routers are
+> `model.language_model.layers.{i}.mlp.gate`, plain `Linear(2048, 256)` kept in bf16 by the fp8
+> checkpoint, so forward hooks under the existing fp8 HF path (`fp8_software_dequant.py`, §6.1) give
+> top-8 assignments per token per layer. Produce `sum_e ceildiv(count_e, BLK_M)` for
+> `BLK_M` ∈ {16, 32, 64}, the padding share and the hit-expert count, at pp512 **and** pp2048; then
+> feed the real `indptr` into `moe_blkm_check.py` in place of its synthetic routing. ~Half a day.
+>
+> **Then item 0h**, whose numbers 0i will move. The hoist is
 > built and bit-exact (`MLC_MOE_GEMM_V2_HOIST=1`, inert at `BLK_M=16`). Measured on prose:
 > `BLK_M=64`+hoist is **+12.6% pp2048 / −10.4% pp128**, `BLK_M=32` is +7.8% / −5.5%; crossover
 > ≈ pp450. **No compile-time `BLK_M` is Pareto**, so defaults are unchanged. Shipping it means
@@ -1142,7 +1155,8 @@ that §7 said to commit was still ignored; the exception now covers both names a
 >
 > | item | state | worth |
 > |---|---|---|
-> | **0h** | built, bit-exact, parked — needs a runtime branch on `B` near 3600 | **+12.6% on ≥2048-token prefill, no short-prompt cost** (§17.10) |
+> | **0i — START HERE** | not started; ~half a day, no compile needed | **unblocks ranking of everything else in the MoE.** Both instruments currently in use misrepresent real routing badly enough to have inverted a sign (§17.9) |
+> | **0h** | built, bit-exact, parked — needs a runtime branch on `B` near 3600 | **+12.6% on ≥2048-token prefill, no short-prompt cost** (§17.10) — but the figure rests on one prose corpus, which is what 0i fixes |
 > | **VL re-gate** | **not blocked** — checkpoint is local, only a compile is missing | correctness, not perf: five state-path changes never gated on that path |
 > | **0c.2** | de-prioritised; changes the arithmetic, so bit-exactness is off the table | ≤ +12.5% by Amdahl |
 >
@@ -1153,10 +1167,36 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > Items 0b, 1 and 5 closed 2026-07-26a; **0c.1** landed in §16.5, **0d** landed opt-in in §16.6,
 > **0e/0f** closed 2026-07-26c.
 >
-> ⚠️ **Before ranking anything new in this kernel, read §17.9.** The bench prompt and the microbench's
-> synthetic routings both misrepresent real expert routing — badly enough to invert a sign. A direct
-> **indptr histogram from a real prefill** is still the one measurement that would make ranking here
-> trustworthy, and it is now the prerequisite for further MoE work rather than a nice-to-have.
+> ⚠️ **Before ranking anything new in this kernel, read §17.9** — then do **item 0i**, which is the
+> fix for what §17.9 found. It was listed as "worth having" by §16.8 and §16.11 and skipped both
+> times; §17.9 is what it cost to keep skipping it.
+
+**0i. ⬅️ NEXT — dump the real expert histogram, because both current instruments are wrong.**
+Every ranking decision in this kernel rests on an assumed routing distribution, and §17.9 showed
+both available proxies are unrepresentative: the bench prompt has **11 distinct tokens per 512** and
+concentrates the router, while `moe_blkm_check.py`'s synthetic `even` / uniform-`random` routings
+bracket nothing real — they predicted item 0h's **wrong sign**, not merely the wrong magnitude.
+§16.8 and §16.11 both filed this as "worth having" and it was skipped twice.
+
+*What to produce:* per-layer expert counts from a real prefill, and from them the only numbers this
+kernel's cost actually depends on — `sum_e ceildiv(count_e, BLK_M)` for `BLK_M` ∈ {16, 32, 64}, the
+padding share, and the number of experts actually hit. §16.11 *inferred* ~40% padding from an
+end-to-end ratio; this measures it.
+
+*How, without touching MLC:* the routers are `model.language_model.layers.{i}.mlp.gate` — 41 of them
+(40 layers + the MTP draft), plain `Linear(2048, 256)` kept in bf16 by the fp8 checkpoint's
+`modules_to_not_convert`. So a forward hook on each `mlp.gate` under the **existing** fp8 HF path
+(`fp8_software_dequant.py`, §6.1 — already runs on this box at 37.5 GB) yields top-8 assignments per
+token per layer with no MLC instrumentation and no compile. Prompts should be real prose
+(`scripts/make_prose_corpus.py`) at pp512 **and** pp2048, since B differs 4× between them.
+
+*Then:* feed the real `indptr` into `moe_blkm_check.py` / `moe_skippad_ab.py` in place of
+`make_inputs`'s synthetic routing, and re-derive item 0h's crossover and §17.2's padding share from
+it. Expect the 0h numbers to move — the question is by how much, and whether pp ≈ 450 survives.
+
+*Watch for:* routing may differ by layer depth and between prefill and decode; report the spread, not
+just a mean. And the MTP draft layer's router is in that list — exclude it, it is not on the decode
+path measured here.
 
 **0c. The GDN recurrence is parallelism-starved — still the biggest prefill item after §16.5.**
 §15.6 measured it on the **0.8B**: `gdn_func_history_inplace` is **95.6 ms against 19.3 ms for the
@@ -3420,7 +3460,7 @@ figures are ~4% optimistic.
 | §17.3 | `BLK_K` 32 → 64 | **landed, +14.1% pp512** — the session's win |
 | §17.7 | real CTAs at 85–87% of the wall | on balanced routing this kernel is done |
 | §17.8 | retraction + cost model | predicted 0h shape-split |
-| §17.9 | the bench prompt picks winners | **the largest finding; changes how to bench** |
+| §17.9 | the bench prompt picks winners | **the largest finding; changes how to bench → filed as item 0i, the next task** |
 | §17.10 | 0h built and measured | works, but no compile-time `BLK_M` is Pareto — parked |
 
 ### 17.1 Candidate 1 (register-blocking `BLK_M`) — refuted, and not for the reason §16.9 gave
@@ -3685,6 +3725,11 @@ prompts — §14.1's bug class, one layer down.
 > be run with `--prompt-file`.** The filler is fine for decode, for dense kernels, and for anything
 > whose cost is routing-independent — `BLK_K` (§17.3) is in that category, which is why its win
 > reproduced on both synthetic routings and does not need re-measuring.
+
+**`--prompt-file` is a mitigation, not the fix.** One prose corpus is still one sample of a routing
+distribution nobody has measured, and the microbench's synthetic routings remain wrong regardless of
+what the end-to-end harness does. The fix is **item 0i** — dump the real expert histogram and drive
+both instruments from it. It is the next task.
 
 ### 17.10 Item 0h measured end-to-end — the hoist works, and no compile-time `BLK_M` is Pareto
 

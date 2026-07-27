@@ -118,9 +118,15 @@ The previous handoff left three uncosted candidates and no queued item. All thre
   libs different prompts silently. Used `zlib.crc32`.
 
 **Next**
-- The open list is **0c.2** (chunked recurrence, de-prioritised at a +12.5% Amdahl ceiling), **0h**
-  (built and parked; needs a runtime branch on B near 3600 for +12.6% long-prompt prefill at no
-  short-prompt cost — the best-costed item on the list), plus the VL re-gate — which is **not** blocked: `Qwen/Qwen3.5-0.8B` is itself
+- **Item 0i first: dump the real expert histogram.** Both instruments used to rank MoE work are
+  unrepresentative (§17.9) — the bench prompt concentrates the router, and the microbench's synthetic
+  routings got 0h's *sign* wrong. §16.8 and §16.11 both filed this as "worth having" and skipped it
+  twice; §17.9 is what that cost. No compile, no MLC instrumentation: forward hooks on the 40
+  `mlp.gate` routers under the existing fp8 HF path give top-8 per token per layer. Produce
+  `sum_e ceildiv(count_e, BLK_M)` for BLK_M 16/32/64, the padding share and the hit-expert count, at
+  pp512 and pp2048; then feed the real indptr into `moe_blkm_check.py`. Expect 0h's crossover to move.
+- Then **0h** (built and parked; needs a runtime branch on B near 3600 for +12.6% long-prompt prefill
+  at no short-prompt cost), plus the VL re-gate — which is **not** blocked: `Qwen/Qwen3.5-0.8B` is itself
   the VL checkpoint (153 of 488 tensors are `model.visual.*`) and has been cached since day one. All
   three `dist/` builds were just compiled `--model-type qwen3_5`, dropping the vision tower. A VL
   build is a local compile, not a download. Earlier entries claiming otherwise are corrected.
