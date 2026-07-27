@@ -1167,24 +1167,110 @@ that §7 said to commit was still ignored; the exception now covers both names a
 >
 > | item | state | worth |
 > |---|---|---|
+> | **0l — START HERE** | **new, and the only untried mechanism**; needs a build, no new measurement to justify it | the tile-count win `BLK_M=64` already demonstrates (**1.90× fewer tiles at pp512, 2.84× at pp2048**) without the padding-compute it currently pays for |
+> | **0m** | new; a **VL-only compile break**, diagnosed to one pass, not yet to one op | unblocks a default-`O2` VL build. Correctness is already gated (§18.14); this is about not shipping a hobbled lib |
 > | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
-> | **0h** | re-costed by §18.9; the runtime branch is the **wrong shape of fix** (§18.11) | the frontier's upper envelope, ≤ +12.5% at pp2048 only |
-> | **fuller tiles, not bigger** | **new, uncosted — the first non-frontier idea in three sessions** | attacks fragmentation directly instead of trading it (§18.11) |
-> | **VL re-gate** | ran, §18.13 — **not cleared**: 4/5 prompts token-identical, the 5th is a near-tie the harness cannot score. Needs `high_margin_gate`'s margin scoring ported into `--greedy-parity-vl5` | correctness. Also surfaced a **VL-only `BLASDispatch` compile break** (§18.12) |
+> | ~~**VL re-gate**~~ | ✅ **cleared, §18.14** — margin scoring added; 0 wide-margin divergences | the five inherited state-path changes are gated on VL for the first time since `f667b07e` |
+> | **0h** | re-costed by §18.9; the runtime branch is the **wrong shape of fix** (§18.11) | the frontier's upper envelope, ≤ +12.5% at pp2048 only. **0l may make it unnecessary** |
 > | **0c.2** | de-prioritised; changes the arithmetic, so bit-exactness is off the table | ≤ +12.5% by Amdahl |
 >
-> §17 largely closed the MoE lane: **0g (`BLK_K`) landed at +14.1% pp512**, §17.7 rooflined the real
-> CTAs at **85–87% of the wall** on balanced routing (§5's tier-1 band), and the padding lane is shut
-> (§17.2). Of §16.11's two ranked candidates, one was small (0f's tail) and one turned out
-> shape-split rather than refuted (0h — §17.1 said refuted, §17.8 retracted that, §17.10 measured it).
-> Items 0b, 1 and 5 closed 2026-07-26a; **0c.1** landed in §16.5, **0d** landed opt-in in §16.6,
-> **0e/0f** closed 2026-07-26c.
+> **What §18 changed about how to read the rest of this document.** §17 believed it had closed the
+> MoE lane — §17.7 put the real CTAs at 85–87% of the bandwidth wall and concluded "there is no
+> bandwidth story left in this kernel". **§18.4 retracted that**: measured on real routing the figure
+> is **45%**, and the gap is tile fragmentation. Items 0b, 1, 5 closed 2026-07-26a; **0c.1** landed in
+> §16.5, **0d** opt-in in §16.6, **0e/0f** closed 2026-07-26c, **0g** (`BLK_K`) landed at +14.1%.
 >
-> ⚠️ **Before ranking anything new in this kernel, read §17.9** — then do **item 0i**, which is the
-> fix for what §17.9 found. It was listed as "worth having" by §16.8 and §16.11 and skipped both
-> times; §17.9 is what it cost to keep skipping it.
+> ⚠️ **Two traps before ranking anything new in this kernel.** Read **§17.9** (the bench prompt
+> concentrates the router — use `--prompt-file`) and **§18.2** (the microbench's synthetic routings
+> are wrong at B=4096 specifically — use `--indptr-file tuning/expert_hist_35b.npz`). Both are now
+> fixed in the tooling; neither is fixed by default.
 
-**0i. ⬅️ NEXT — dump the real expert histogram, because both current instruments are wrong.**
+**0l. ⬅️ NEXT — statically specialise the row-fragment count, so a wide `BLK_M` stops paying for
+its own padding.**
+
+*The one-line version:* `BLK_M=64` already cuts tiles **1.90× at pp512 and 2.84× at pp2048** (§18.1),
+and tile count is what sets weight traffic — but it pays that back in padding-row compute, and item
+0k's fix for the padding costs more than it saves *because it made a constant loop extent dynamic*.
+Make the trip count static again by specialising on it, and the win should survive.
+
+*Why this is the lever.* §18.4 established the kernel is at **45% of the bandwidth wall** with issued
+bytes **2.9× unique** — it is fragmentation-bound, not bandwidth-bound. With the hoist, a CTA loads
+one `BLK_N × K` weight tile, so total weight traffic is proportional to
+`n_real = sum_e ceildiv(count_e, BLK_M) · tiles_per_n`. Cutting tiles cuts weight traffic
+proportionally, and that is exactly why `BLK_M=64` wins 1.56× at pp2048 (§18.3). §18.9 then showed
+every wider tile also *loses* at short prompts, monotonically, because a real prefill puts only
+**~24 rows on each hit expert** (§18.1) so a 64-row tile is mostly padding.
+
+*Why item 0k did not already solve it.* 0k gives the row-fragment loop a runtime extent
+`min(ceildiv(rows, 16), BLK_M/16)`, which is correct and bit-exact — and measured **0.91× at
+`BLK_M=64`** (§18.7). The tell is `BLK_M=16`, where the guard is logically inert (extent 1) and still
+costs **5–9%**: the loss is not the skipping, it is that a runtime extent blocks the unroll. 0k pays
+that on every CTA and only recovers it where padding dominates, which is why it nets out at `BLK_M=32`
+and nowhere else.
+
+*The change.* At `BLK_M=64` there are only **four** possible active-fragment counts (1, 2, 3, 4). Emit
+four statically-unrolled bodies and select with a `Select` on the loop extent the same way item 0f
+selects between 1 and 0 — or, if that is unwieldy, hoist the choice into four `T.serial` nests under
+a CTA-uniform branch. Every fragment count keeps its unroll; empty fragments cost nothing. The
+uniformity and bit-exactness arguments are unchanged from 0f and 0k: the trip count depends only on
+`tm[bx]` and `indptr`, so it is CTA-uniform, and a skipped fragment's global store is predicated off
+by `m_offset + i < row_end` regardless of what its accumulator holds.
+
+*What success looks like, and what refutes it.* The prediction is that `BLK_M=64` + hoist + static
+fragment specialisation beats `BLK_M=16` **at every prompt length**, i.e. it crosses the frontier
+§18.9 mapped rather than sliding along it. Concretely: recover most of 0k's `BLK_M=64` loss (0.91× →
+≥1.0× on the kernel) while keeping the 1.59×/1.51× that plain `M=64`+hoist already has at pp2048.
+**It is refuted if the pp128 end-to-end leg still loses** — that is the cell that has killed every
+wide tile so far, and it is the first thing to measure, not the last. Gate with
+`scripts/moe_skiprows_ab.py` (bit-exactness) then `scripts/moe_blkm_check.py --indptr-file` before
+compiling anything.
+
+*Also considered and probably dead: mixed tiles.* The obvious way to eliminate the remainder entirely
+is to let one CTA cover rows from two experts, since the dispatch table already stores a per-CTA row
+offset. **The weight tile is per-expert**, so a mixed tile needs two `BLK_N × K` weight loads — which
+doubles the dominant cost to save one tile. Recorded so the next session does not re-derive it.
+
+*If 0l works, item 0h's runtime branch is moot* — the whole point of the branch was to get the wide
+tile's long-prompt win without its short-prompt cost.
+
+**0m. The VL-only `BLASDispatch` compile break — diagnosed to one pass, not yet to one op.**
+
+*Symptom.* Compiling `--model-type qwen3_5_vl` at default `--opt` dies in
+[compiler_pass/blas_dispatch.py:40](python/mlc_llm/compiler_pass/blas_dispatch.py#L40), inside
+`FuseOpsByPattern` / `RunCodegen`:
+
+```
+tvm.error.InternalError: Check failed: (tensor_sinfo) is false:
+    Expect TensorStructInfo, but received: relax.ShapeStructInfo
+```
+
+*What is already established (§18.12), so it need not be redone.* It is **VL-specific**: the
+text-only `dist/qwen3_5-0.8B-q0f16` config compiles cleanly through the *same* default pipeline with
+cuBLAS enabled. And it has been invisible until now because `_cublas_gemm`
+([compiler_flags.py:103](python/mlc_llm/interface/compiler_flags.py#L103)) enables the pass **only for
+unquantized weights** — `q0f16`/`q0bf16`/`q0f32`/fp8 — so every `q4f16_1` build in this document
+skipped it entirely. The VL build is the first `q0f16` compile since the box moved to CUDA 13.2.
+
+*Where to look.* Something in the vision tower hands a cuBLAS matmul pattern an argument whose
+struct-info is a `ShapeStructInfo` rather than a tensor — most likely an op whose operand is a
+`ShapeExpr` (a reshape target, or a `strided_slice` bound) sitting inside the matched region.
+`python/mlc_llm/model/qwen3_5_vl/qwen3_5_vl_model.py` (`image_embed`) and
+`python/mlc_llm/model/vision/qwen3_vl_vit.py` are the two files that produce it. Bisecting by
+`entry_functions` — `BLASDispatch` already filters which functions it enters — should localise it to
+one Relax function in minutes.
+
+*Workaround in use.* `--opt "flashinfer=1;cublas_gemm=0;cudagraph=1"` compiles and is what
+`dist/qwen3_5-0.8B-vl-q0f16/lib.so` was built with. **Correctness is not at stake** — §18.14 gates
+that lib and it passes — so this is about not shipping a VL build with a compiler pass switched off,
+and about the fact that **no VL performance number has ever been taken on this box**, with or
+without cuBLAS.
+
+*Worth noting for scope:* if a VL build is only ever wanted quantized, `cublas_gemm` never turns on
+and this never fires. The bug is real either way, but its priority depends on whether a `q0f16` VL
+lib is a deliverable or only a gating vehicle.
+
+**0i. ✅ DONE, §18.1 — dump the real expert histogram, because both current instruments are wrong.**
+Historic entry below; the results and what they overturned are in §18.1–§18.4.
 Every ranking decision in this kernel rests on an assumed routing distribution, and §17.9 showed
 both available proxies are unrepresentative: the bench prompt has **11 distinct tokens per 512** and
 concentrates the router, while `moe_blkm_check.py`'s synthetic `even` / uniform-`random` routings
@@ -4168,15 +4254,24 @@ diagnosis:
 | best known pp2048 | 945 tps | **1063 tps** (`lib_hoist64`, +12.5%) |
 | whether any `BLK_M` is Pareto | "no" (§17.10), from one A/B pair | **no**, from a mapped 4×3 frontier |
 
-**The next lever is the one nothing this session tried: make the tiles fuller instead of bigger.**
-Every configuration measured here picks a single compile-time tile height and lives with whatever
-padding the routing produces. The histogram says the *distribution* is the problem — 171 experts
-holding a median 24 rows each, with one expert holding 396. A dispatch table that packed short
-experts together, or that chose a per-expert tile height from `indptr` at dispatch time (the table
-already stores a row offset per CTA, so a height column is not a structural change), would attack
-fragmentation directly instead of trading it against X and O traffic. That is speculative and
-uncosted — but it is the first MoE idea in three sessions that is not a point on the frontier
-§18.9 just mapped.
+**The next lever is to stop a wide tile paying for its own padding — filed as item 0l, and it is
+the first MoE idea in three sessions that is not a point on the frontier §18.9 just mapped.**
+
+The reasoning is short. Weight traffic is proportional to tile count, `BLK_M=64` cuts tiles 1.90× at
+pp512 and 2.84× at pp2048, and that is exactly why it wins 1.56× at pp2048. What stops it winning
+everywhere is padding-row compute — 24 real rows in a 64-row tile. Item 0k removed that compute and
+*still* lost at `BLK_M=64` (0.91×), but §18.7 isolated why: at `BLK_M=16`, where 0k's guard is
+logically inert, it **still costs 5–9%**. The loss is not the skipping, it is that a runtime loop
+extent blocks the unroll — and 0k pays that on every CTA.
+
+At `BLK_M=64` there are only **four** possible active-fragment counts. Specialising them statically
+keeps the unroll and still skips the empty work. **The first thing to measure is the pp128 leg**,
+because that is the cell that has killed every wide tile so far.
+
+One idea recorded as probably dead so it is not re-derived: letting a single CTA cover rows from two
+experts would eliminate the remainder entirely, and the dispatch table already carries a per-CTA row
+offset — but **the weight tile is per-expert**, so a mixed tile needs two `BLK_N × K` weight loads,
+doubling the dominant cost to save one tile.
 
 **And item 0h's runtime branch is now clearly the wrong shape of fix.** §17.10 costed it as
 "emit both `BLK_M=16` and `BLK_M=64` pairs, branch on `x.shape[0]` near 3600". §18.9's frontier says

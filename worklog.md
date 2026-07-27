@@ -112,11 +112,24 @@ Monotone in one parameter (padded row-space per CTA), no exception in 12 cells, 
 Decode was never the target of any of this work and picked up ~11% anyway. The headline table's
 "+147%" is a chain of filler ratios; measured end to end it is **+129%** for the shipped lib.
 
-**Next**
-- **The next MoE lever is fuller tiles, not bigger ones** (§18.11). Every config measured picks one
-  compile-time tile height and accepts the routing's padding. A per-expert tile height chosen from `indptr`
-  at dispatch time would attack fragmentation directly. Uncosted, but the first idea in three sessions that
-  is not a point on the frontier §18.9 mapped.
+**Next — both leads are now filed as items with cold-start detail**
+- **Item 0l (START HERE): statically specialise the row-fragment count.** BLK_M=64 already cuts tiles 1.90x
+  at pp512 / 2.84x at pp2048, and tile count sets weight traffic — that is why it wins 1.56x at pp2048. What
+  stops it winning everywhere is padding-row compute. Item 0k removed that compute and still lost at M=64
+  (0.91x), and §18.7 isolated why: at M=16, where 0k's guard is logically *inert*, it still costs 5-9%. The
+  loss is the runtime loop extent blocking the unroll, paid on every CTA. At M=64 there are only four
+  possible active-fragment counts — specialise them statically and the unroll survives. **Measure the pp128
+  leg first**; it is the cell that has killed every wide tile so far. If 0l works, item 0h's runtime branch
+  is moot.
+  - Recorded as probably dead so it is not re-derived: mixed tiles (one CTA spanning two experts) would kill
+    the remainder outright, but the weight tile is per-expert, so it doubles the dominant cost to save one tile.
+- **Item 0m: the VL-only BLASDispatch break.** Diagnosed to one pass, not one op. Established already: it is
+  VL-specific (text-only q0f16 compiles fine through the same pipeline) and invisible until now because
+  cublas_gemm enables only for unquantized weights, so no q4f16_1 build ever entered the pass. Look in
+  qwen3_5_vl_model.py's image_embed and vision/qwen3_vl_vit.py for an op whose operand is a ShapeExpr inside
+  a matched matmul region; BLASDispatch already filters by entry_functions, so bisecting localises it fast.
+  Correctness is *not* at stake — §18.14 gates the cublas_gemm=0 lib and it passes — but no VL perf number
+  has ever been taken on this box.
 - Item 0h's runtime branch is the **wrong shape of fix**: `LowBatchGemvSpecialize` branches inside one
   PrimFunc, so the narrow path would inherit the wide path's shared-memory footprint — the exact cost the
   branch exists to avoid. A Relax `If` avoids it and there is **no `relax.If` anywhere in mlc_llm**.
