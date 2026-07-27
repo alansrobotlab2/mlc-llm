@@ -5597,3 +5597,82 @@ envelope: any future wide-tile leg should be built with `OPSPEC=a`, and `x` shou
 all. `lib_rowspec64` (§19.4) is now superseded as the best-known wide configuration by
 `BLK_M=64 + HOIST + ROWSPEC + OPSPEC=a`, which has never been compiled end to end — that is the one
 loose end this item leaves, and §19.4's pp128 −9.1% is the number it would have to beat.
+
+---
+
+## 22. Session 2026-07-27c (cont.) — item 0r re-priced by measurement, and the last unmeasured row filled
+
+### 22.1 The 0.8B text model finally has a prose prefill number
+
+The one headline figure in §21's model table that had never been re-taken on real prose (§17.9's
+trap), closed for the cost of two bench runs. `dist/qwen3_5-0.8B-q0f16_fused/lib_ksplit4.so`,
+`--prefix-cache-mode radix`, `--prompt-file`, 3 runs after 1 warmup:
+
+| 0.8B text | filler (the old headline) | **prose** | Δ |
+|---|---:|---:|---:|
+| pp512 | 4888 | **4787** | −2.1% |
+| pp2048 | — | **5073** | — |
+| tg512 | ~90 | **90.8** | — |
+
+§17.9 predicted filler runs ~4% optimistic; on this model it is **2.1%**, and that is the expected
+shape of the result — the mechanism §17.9 identified is *router concentration*, and the 0.8B has no
+MoE for the filler to concentrate. The trap is real and model-specific, not a blanket 4%.
+
+### 22.2 Item 0r — flash attention is a win, at half the price it was filed at
+
+§20.9 priced flash attention at ~7.3 ms/layer against the 14.71 the three score-matrix kernels cost,
+and got that from **"cuBLAS's demonstrated 51% of fp32 peak"**. A hand-written kernel is not cuBLAS.
+The same section records the *generated* fp32 matmul at 1.03 TFLOP/s — 19% of peak — and at that rate
+the same 19.5 GFLOP/layer takes 18.9 ms and the whole item is a regression. The item turned on a rate
+nobody had measured.
+
+[scripts/vit_flash_probe.cu](scripts/vit_flash_probe.cu) measures it — a real fp32 flash attention
+with online softmax at the tower's exact shape, plus a plain hand-tiled GEMM as the control that says
+whether a disappointing result is flash's fault or the GPU's. It is a *probe* in the sense
+`gdn_recurrence_probe.cu` is: it decides whether a TIR kernel is worth writing, and nothing in it
+ships. Verified against a CPU reference at two sequence lengths that exercise the partial-tile paths
+(max abs diff 8.2e-8 / 5.8e-8) before any timing is believed.
+
+**The control first, because it re-prices everything else.** Hand-tiled fp32 GEMM at the QK^T shape:
+
+| | ms/layer | TFLOP/s | % of the 5.32 TFLOP/s peak |
+|---|---:|---:|---:|
+| dlight, generated (§20.5) | 9.46 | 1.03 | 19% |
+| **hand-written, this probe** | **6.23** | **1.57** | **29%** |
+| cuBLAS (§20.5) | 3.63 | 2.69 | 51% |
+
+**A hand-written kernel lands between the two, and closer to dlight.** §20.9's estimate assumed the
+top row of that table was reachable by writing a kernel. It is not.
+
+**Flash attention itself**, one layer = 12 heads, swept over six tile configurations:
+
+| config | shared | CTAs/SM | ms/layer | TFLOP/s | vs 14.71 |
+|---|---:|---:|---:|---:|---:|
+| **BM64 BN32 16×16** | 41.4 kB | 3 | **11.04** | 1.77 | **0.75×** |
+| BM32 BN32 16×8 | 28.8 kB | 5 | 11.56 | 1.69 | 0.79× |
+| BM64 BN16 16×16 | 29.3 kB | 5 | 11.98 | 1.63 | 0.81× |
+| BM32 BN16 16×8 | 18.7 kB | 8 | 12.32 | 1.58 | 0.84× |
+| BM64 BN32 8×32 | 41.4 kB | 3 | 16.23 | 1.20 | 1.10× |
+| BM32 BN32 8×16 | 28.8 kB | 5 | 16.73 | 1.17 | 1.14× |
+
+**Occupancy is not the lever here either** — the 8-CTA config is *slower* than the 3-CTA one, and the
+two worst configs differ from the best only by moving work from threads-per-row to registers-per-thread.
+That is the third independent time this session that an occupancy model gets the sign wrong (§21.3,
+§21.7, here).
+
+**Verdict: flash attention is worth ~44 ms/iter, not ~89.** 14.71 → 11.04 ms/layer over 12 layers;
+`image_embed` **223.3 → ~180 ms** and ttft **372.9 → ~329 ms (−12%)**, against §20.9's projected
+~135 ms / ~285 ms.
+
+⚠️ **And 11.04 is a ceiling the TIR build has to come close to, not a target it starts from.**
+Break-even against 14.71 ms/layer needs **1.33 TFLOP/s**; the probe's hand-written CUDA gets 1.77 and
+dlight's generated matmul gets 1.03. So the TIR implementation must beat dlight's default schedule by
+**29% just to break even**, and by 71% to collect the full 44 ms. That is a hand-written TIR schedule
+against a hand-written CUDA one and it is achievable — the MoE GEMM is exactly that — but it is a
+different risk profile from what §20.9's "~89 ms, the only lever left" implied, and it should be
+queued as such.
+
+**Two smaller notes from the probe.** CUDA 13 removed `clockRate` from `cudaDeviceProp`
+(`cudaDeviceGetAttribute(cudaDevAttrClockRate)` still works) — one more entry for §3's landmine list.
+And every number here is at the cat fixture's 2520 patches, which §20's handoff already flags as the
+one shape the whole VL roofline rests on.
