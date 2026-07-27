@@ -70,6 +70,7 @@ class VisionAttnMath(nn.Module):
     """
 
     prescale = False
+    pv_cast = True
 
     def forward(self, q, k, v):
         q32 = op.astype(q, "float32")
@@ -88,15 +89,28 @@ class VisionAttnMath(nn.Module):
             attn_scores = op.multiply(attn_scores, scale)
         attn_probs = op.softmax(attn_scores, axis=-1)
         attn_out = op.matmul(attn_probs, v32)
+        if not self.pv_cast:
+            # Item 0q: price the `astype` epilogue by removing it. Dropping the cast
+            # leaves `matmul` bare, so the delta against the fused `matmul_cast1` is
+            # exactly what the fusion buys -- the same question §20.5 asked of the QK
+            # matmul's `multiply`, where the answer was 0.00 ms.
+            #
+            # NOT an equivalent graph (the output stays fp32), and not a candidate
+            # change on its own. It is a measurement of the fusion's value; the real
+            # change, if this comes back ~free, is to move the cast later so cuBLAS
+            # can take the matmul.
+            return attn_out
         return op.astype(attn_out, "float16")
 
 
-def build(target, seq, static: bool, prescale: bool = False):
+def build(target, seq, static: bool, prescale: bool = False, pv_cast: bool = True,
+          cublas: bool = False):
     from mlc_llm.compiler_pass.fuse_transpose_matmul import FuseTransposeMatmul
 
     s = seq if static else "num_patches"
     m = VisionAttnMath()
     m.prescale = prescale
+    m.pv_cast = pv_cast
     mod, _ = m.export_tvm(
         spec={
             "forward": {
@@ -107,6 +121,10 @@ def build(target, seq, static: bool, prescale: bool = False):
         }
     )
     with target:
+        if cublas:
+            # Same position as the real pipeline (pipeline.py:126, before FuseOps).
+            from mlc_llm.compiler_pass.blas_dispatch import BLASDispatch
+            mod = BLASDispatch(target)(mod)
         mod = FuseTransposeMatmul()(mod)
         mod = relax.transform.LegalizeOps()(mod)
         mod = relax.transform.AnnotateTIROpPattern()(mod)
@@ -118,6 +136,11 @@ def build(target, seq, static: bool, prescale: bool = False):
             dl.gpu.GeneralReduction(), dl.gpu.Fallback(),
         )(mod)
     return mod
+
+
+def _alloc_shape(dev, shape, dtype):
+    arr = (np.random.rand(*shape).astype(dtype) - 0.5) * 0.1
+    return tvm.runtime.tensor(arr, device=dev)
 
 
 def _alloc(dev, buf, seq):
@@ -137,17 +160,19 @@ def main() -> None:
     p.add_argument("--seq", type=int, default=SEQ)
     p.add_argument("--static", action="store_true", help="pin seq_len to a literal")
     p.add_argument("--prescale", action="store_true", help="scale q before the matmul, not the scores after")
+    p.add_argument("--no-pv-cast", action="store_true", help="item 0q: drop the astype epilogue on P@V to price its fusion")
+    p.add_argument("--cublas", action="store_true", help="run BLASDispatch, then time end-to-end on the VM")
     p.add_argument("--dump-cuda", default=None)
     p.add_argument("--repeat", type=int, default=20)
     cli = p.parse_args()
 
     dev = tvm.cuda(0)
     target = tvm.target.Target.from_device(dev)
-    mod = build(target, cli.seq, cli.static, cli.prescale)
+    mod = build(target, cli.seq, cli.static, cli.prescale, not cli.no_pv_cast, cli.cublas)
 
     prim = {gv.name_hint: f for gv, f in mod.functions.items()
             if isinstance(f, tvm.tirx.PrimFunc)}
-    leg = ("static" if cli.static else "symbolic") + (" +prescale" if cli.prescale else "")
+    leg = ("static" if cli.static else "symbolic") + (" +prescale" if cli.prescale else "") + (" -pvcast" if cli.no_pv_cast else "") + (" +cublas" if cli.cublas else "")
     print(f"[vit-attn] seq={cli.seq}  {leg}  target={target.kind.name}")
     print(f"[vit-attn] {len(prim)} PrimFuncs: {', '.join(sorted(prim))}")
     print()
@@ -196,6 +221,19 @@ def main() -> None:
         print(f"{name:42s} {ms:9.2f} {ms * LAYERS:8.1f}")
     print("-" * 62)
     print(f"{'TOTAL':42s} {total:9.2f} {total * LAYERS:8.1f} ms/image_embed")
+    print()
+    # End-to-end on the VM. PrimFunc-by-PrimFunc timing cannot see a cuBLAS offload
+    # (it is a Codegen extern, not a PrimFunc), so this is the only comparable number
+    # across the --cublas legs.
+    ex = relax.build(mod, target=target)
+    vm = relax.VirtualMachine(ex, device=dev)
+    args = [_alloc_shape(dev, [HEADS, cli.seq, HEAD_DIM], "float16") for _ in range(3)]
+    for _ in range(3):
+        vm["forward"](*args)
+    dev.sync()
+    vms = vm.module.time_evaluator("forward", dev, number=1, repeat=cli.repeat)(
+        *args).median * 1e3
+    print(f"{'end-to-end (VM)':42s} {vms:9.2f} {vms * LAYERS:8.1f} ms/image_embed")
     print()
     print("§20.2 measured, for comparison:  QK^T 9.46 + softmax 4.04 + P@V 7.03 "
           f"= 20.53 ms/layer, 246.3 ms/iter")

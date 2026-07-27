@@ -1041,10 +1041,18 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > score tensor's exact size. 156 is the MoE's *strided* figure and is correct there; the tower streams
 > contiguously. Quoting either out of its shape is how §20.2's roofline came out wrong.
 >
-> **Next: §20.7 — price the P@V fusion, which is now the tower's largest kernel** (84.34 ms/iter,
-> 3.8× off bound). It is the identical question §20.5 just answered for QK^T and it has not been
-> asked here; `scripts/vit_attn_bench.py` answers it with no compile. Item **0n** (the MoE per-CTA
-> cost) is still open and still a measurement, not a build.
+> **Item 0q is refuted (§20.8) and every cheap lever in the tower is now spent.** The P@V cast fusion
+> *is* free, as predicted — but it was never what blocked cuBLAS. The blocker is
+> [cublas.py:77](3rdparty/tvm/python/tvm/relax/backend/cuda/cublas.py#L77), *"reduction axis must be
+> constant"*: P@V reduces over the symbolic sequence length, QK^T over `head_dim=64`. Unblocking it
+> needs static shapes and is worth **5.7%**, with cuBLAS still 3.4× off bound.
+>
+> **Next: item 0r — flash attention for the tower**, the only lever left. `QK^T` + `softmax` + `P@V`
+> are 14.71 ms/layer against a 3.67 ms compute floor, and all three exist to move the same 305 MB
+> fp32 score matrix; not materializing it is worth **~89 ms/iter**. ⚠️ a real build — fp32 (fp16
+> collapses tower parity), no HF kernel to copy, online softmax in TIR. Do **not** start the
+> static-shape specialization instead: §20.8 prices it at 9.4% and flash attention subsumes most of
+> it. Item **0n** (the MoE per-CTA cost) is still open and still a measurement, not a build.
 >
 > ✅ **The submodule loose end is closed** (not by me — pushed interactively this session).
 > `dff702c` is on the remote and `3281f97f` advances the parent pointer, so the three-session
@@ -1316,7 +1324,8 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > | **0n** | **(§19.8)**; a measurement, not a build. Why is `BLK_M=64` 30–40% slower at B=1024 when it launches the *same* CTAs over the *same* rows? | it is the only unexplained term left in the MoE GEMM, and every wide-tile idea has died on it |
 > | **0o** | ✅ **DONE (§20)** — first VL numbers taken; cuBLAS was net-negative and `MLC_BLAS_SKIP_FP32` fixes it, ttft −8.9%, gate 184/184 | — |
 > | **0p** | 🔶 **half done (§20.5–§20.7)** — softmax is closed (98.5% of the *measured* 184.8 GB/s wall), QK^T is closed (cuBLAS, after prescaling made it eligible), `image_embed` 293 → **223 ms**. `scripts/vit_attn_bench.py` built, 1.3% fidelity | — |
-> | **0q — START HERE** | **new (§20.7)**; price the `astype` fusion on `matmul(attn_probs, v32)`, now the tower's largest kernel at 84.34 ms/iter and 3.8× off bound | it is the *same question* §20.5 answered for QK^T — the epilogue writes 3.87 MB against a 305 MB read, so it is probably protecting nothing — and the microbench answers it with **no compile** |
+> | **0q** | ❌ **refuted (§20.8)** — the fusion is free (as predicted) but was never the blocker. cuBLAS rejects P@V because its *reduction axis is symbolic*; unblocking it needs static shapes and is worth only 5.7% | — |
+> | **0r — START HERE** | **new (§20.9)**; flash attention for the vision tower — stop materializing the 305 MB fp32 score matrix | it is the only lever left. Three kernels totalling 14.71 ms/layer exist solely to move that tensor, against a 3.67 ms compute floor; ~89 ms/iter. ⚠️ a real build: fp32, no HF kernel to copy, online softmax in TIR |
 > | ~~**0l**~~ | ✅ **built, §19.1–§19.4 — and it refutes its own premise.** The mechanism works (`BLK_M=16` control: 1.00× where 0k cost 5–9%); the hypothesis it was built on does not | closed. pp128 is still −9.1% end-to-end, so no wider tile is Pareto and the defaults are unchanged |
 > | ~~**0m**~~ | ✅ **fixed, §19.5–§19.7** — two ops, both in the VL patch merger; the guard declines exactly those two matches | a default-`--opt` VL lib now compiles and gates **184/184** |
 > | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
@@ -1364,7 +1373,41 @@ still blocked (§8).
 §19.3 shows the mechanism everyone assumed is worth 0–3% of a 31–40% gap. Until this term is named,
 any further wide-tile work is guessing — which is precisely how items 0h, 0k and 0l were each costed.
 
-**0q. ⬅️ NEXT — price the P@V cast fusion, the way 0p priced the QK one.**
+**0r. ⬅️ NEXT — flash attention for the vision tower, which is the only lever left.**
+
+*Why it is the only one.* §20.5–§20.8 measured every kernel in the block and spent every cheap lever.
+What remains is structural: `QK^T` (3.63 ms/layer), `softmax` (4.05) and `P@V` (7.03) exist to write,
+re-read and read the same `(12, 2520, 2520)` fp32 = **305 MB** score matrix. Together **14.71
+ms/layer** against a compute floor of 2 × 1.83 = **3.67**. Tiling the attention so the scores stay in
+shared memory drops the traffic to 27 MB and makes the block compute-bound; at cuBLAS's demonstrated
+51% of fp32 peak that is ~7.3 ms/layer — **~89 ms/iter**, `image_embed` toward ~135 ms.
+
+*What makes it a real build, not a port.* (a) **fp32 throughout** —
+[qwen3_vl_vit.py:151](python/mlc_llm/model/vision/qwen3_vl_vit.py#L151) records that fp16 collapses
+tower parity at max diff 2.03 / rel 39%, so the fp16 tensor-core path every reference implementation
+uses is off the table. (b) **No kernel to copy** — HF runs this tower with eager attention. (c) The
+online-softmax rescaling has to be written in TIR against a `seq_len` that is symbolic.
+
+*Where to start.* `scripts/vit_attn_bench.py` is the loop — no compile, 1.3% fidelity against the
+traced kernels, and it already builds this exact block. Before writing a kernel, use it to answer:
+what does a single fused QK+softmax+PV tile actually achieve at `d=64`? The generated fp32 matmul
+runs at 1.03 TFLOP/s and cuBLAS at 2.69 (§20.5); a hand-written tiled kernel has to beat the *sum* of
+what it replaces, not the peak, and §20.8 is a standing reminder that this shape defeats cuBLAS too.
+
+⚠️ **Do not start the static-shape specialization instead.** §20.8 priced it at ~22 ms/iter (9.4%)
+for a shape-specialization project across a variable patch count — worse ratio, and flash attention
+subsumes most of it.
+
+**0q. ❌ REFUTED, §20.8 — the fusion is free, and it was never the blocker. Historic entry below.**
+The cast fusion is worth **0.00 ms** (−0.02 generated, +0.16 cuBLAS), as this entry predicted. But
+the reasoning built on it was wrong: cuBLAS rejects P@V at
+[cublas.py:77](3rdparty/tvm/python/tvm/relax/backend/cuda/cublas.py#L77) — *"Reduction axis must be
+constant"* — because P@V reduces over the **symbolic** sequence length while QK^T reduces over
+`head_dim=64`. `BLASDispatch` also runs *before* `FuseOps`, so the epilogue could not have been the
+reason. Unblocked by static shapes, cuBLAS is worth **1.06 ms/layer (5.7%)** and is *still* 3.4× off
+bound, because `(2520×2520) @ (2520×64)` has no reuse to give.
+
+**0q (historic). Price the P@V cast fusion, the way 0p priced the QK one.**
 
 *The question.* `matmul(attn_probs, v32)` then `astype(..., fp16)` fuses into one kernel,
 `fused_matmul9_cast17`, and at **84.34 ms/iter (7.03 ms/layer, 3.8× off bound)** it is now the
@@ -5206,3 +5249,72 @@ read+written by softmax, read by P@V. Flash attention removes all three — the 
 2 × 1.83 = 3.67 ms/layer against today's 14.7 — but it is a real build, in fp32, with no HF kernel to
 copy (the reference runs eager attention). Price P@V first; it may be most of the remaining gap for a
 fraction of the risk.
+
+### 20.8 Item 0q — the fusion is free, and it was never the blocker
+
+**The sub-question, answered as predicted.** Dropping the `astype` epilogue leaves `matmul` bare at
+**7.04 ms** against the fused `fused_matmul_cast1` at **7.02** — and measured on P@V alone,
+`−0.02 ms` generated / `+0.16 ms` under cuBLAS. **The cast fusion is worth nothing**, exactly as the
+QK `multiply` was.
+
+**And the premise built on it is refuted.** Item 0q reasoned that the epilogue is *why* cuBLAS never
+took this matmul. It is not. Instrumenting every cuBLAS pattern check on the real graph:
+
+| | `cublas.matmul_transposed` (QK^T) | `cublas.matmul` (P@V) |
+|---|---|---|
+| symbolic `num_patches` (ships today) | **MATCH** | **REJECT** |
+| static `seq=2520` | **MATCH** | **MATCH** |
+
+The rejection is [cublas.py:77](3rdparty/tvm/python/tvm/relax/backend/cuda/cublas.py#L77) —
+`if not isinstance(lhs_shape[-1], IntImm | int): return False`, commented *"Reduction axis must be
+constant"*. **QK^T reduces over `head_dim=64`; P@V reduces over the sequence length.** One is a
+literal and the other is `num_patches`, and that single difference is the whole story. Note this also
+means §20.2's fusion mechanism was never in play here: `BLASDispatch` runs at
+[pipeline.py:126](python/mlc_llm/compiler_pass/pipeline.py#L126), *before* `FuseOps` at 141, so at
+match time nothing is fused yet — the epilogue could not have been the reason.
+
+**What it would be worth, if the blocker were removed.** Measured directly rather than by subtracting
+an assumed QK cost — P@V alone, static shape, generated vs cuBLAS:
+
+| | ms/layer | ×12 | vs bound |
+|---|---:|---:|---:|
+| generated (ships today) | 7.19 | 86.3 | 3.9× off |
+| cuBLAS | **6.14** | 73.6 | **3.4× off** |
+
+**+12.7 ms/`image_embed`, or 5.7%** — and cuBLAS is *still* 3.4× off the 1.71 ms read-bound. This
+shape is simply bad for a GEMM: `(2520×2520) @ (2520×64)` has N=64, so there is almost no reuse of
+the 305 MB `attn_probs` tile, and neither library nor codegen can fix that.
+
+**So item 0q is refuted as a cheap win.** Collecting the 12.7 ms requires making `num_patches` a
+compile-time constant in the vision tower — shape specialization for a model whose patch count varies
+with image size. Static shapes would also take softmax 4.05 → 3.31 (§20.5), so the whole project is
+worth **~22 ms/iter, 9.4% of `image_embed`**. That is a poor ratio next to the 70 ms §20.6 got from a
+one-line identity, and it should not be started before the item below.
+
+**Two things this session got right that are worth keeping.** The 0q entry warned *"do not assume the
+QK null transfers"* — and the null did transfer while the *conclusion* did not, which is the exact
+failure the warning was for. And the entry insisted the question was answerable without a compile: it
+was, in four microbench runs and one pattern probe.
+
+### 20.9 What is actually left in the tower
+
+`image_embed` is 223 ms. After §20.5–§20.8 the attention block is understood end to end, and every
+cheap lever is spent:
+
+| kernel | ms/layer | bound | off | status |
+|---|---:|---:|---:|---|
+| `matmul` P@V + cast | 7.03 | 1.71 (BW) | 4.1× | cuBLAS blocked by a symbolic reduction axis; worth only 1.06 ms if unblocked (§20.8) |
+| `softmax` | 4.05 | 3.30 (BW) | 1.2× | at the wall; 0.74 ms available from static shapes alone |
+| `ampere_sgemm` QK^T | 3.63 | 1.83 (compute) | 2.0× | cuBLAS, 51% of fp32 peak — done |
+
+**The floor is set by materializing the score matrix, and nothing short of not doing that moves it.**
+All three kernels exist to write, re-read, or read a `(12, 2520, 2520)` fp32 = **305 MB** tensor;
+together they are 14.71 ms/layer against a compute floor of 2 × 1.83 = **3.67**. Flash attention
+removes the tensor entirely — the traffic becomes 27 MB, so the block goes compute-bound — and even
+at cuBLAS's demonstrated 51% of peak that is ~7.3 ms/layer, i.e. **~89 ms/iter** and `image_embed`
+toward ~135 ms.
+
+That is the remaining prize and it is a real build: fp32 (fp16 collapses tower parity), no HF kernel
+to copy (the reference runs eager attention), and a tiled online softmax to write in TIR. Filed as
+item **0r**. `scripts/vit_attn_bench.py` is the loop for it — it takes no compile and has a 1.3%
+fidelity bar against the traced kernels.
