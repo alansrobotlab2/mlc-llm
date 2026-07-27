@@ -1023,51 +1023,70 @@ that §7 said to commit was still ignored; the exception now covers both names a
 ### Start here next session
 
 > **Handoff, end of 2026-07-27c.** Branch `qwen3_5`, **no uncommitted work** — `git status` is
-> `?? COLCON_IGNORE` alone. Three commits: `63f7b734` (§21, item **0n** answered), `d3080c31`
-> (§21.7, item **0s** built), `74d147f4` (§22, item **0r** re-priced + the 0.8B prose number).
-> **Defaults are unchanged on every model**; no lib was rebuilt. 35B `lib_blkk64.so`, VL `lib_vl2.so`,
-> 0.8B text `lib_ksplit4.so`.
+> `?? COLCON_IGNORE` alone. **Defaults are unchanged on every model**; the shipping libs are the same
+> three as yesterday: 35B `lib_blkk64.so`, VL `lib_vl2.so`, 0.8B text `lib_ksplit4.so`.
 >
-> **The session in one line: three separate occupancy models were checked against measurement and all
-> three got the sign wrong.** Shared memory was ranked first as the wide tile's cost and is worth
-> 1.00×; a guard that removes work cost 24% by collapsing memory-level parallelism while *raising*
-> occupancy; and flash attention's 8-CTA tile is slower than its 3-CTA one. The one thing that did
-> predict correctly was the register file — and only because it was read out of `ptxas`, not modelled.
+> **The session in one line: four occupancy models were checked against measurement and all four got
+> the sign wrong.** Shared memory was ranked first as the wide tile's cost and is worth 1.00×; a guard
+> that removes work cost 24% while *raising* occupancy; flash attention's 8-CTA tile is slower than
+> its 3-CTA one; and the winning MoE guard gains 10% while *losing* a resident CTA. The only resource
+> model that predicted correctly was the register file — and only because it was read out of `ptxas`
+> rather than reasoned about.
 >
 > ### What closed
 >
 > | item | verdict |
 > |---|---|
-> | **0n** | ✅ **answered (§21).** The wide tile's per-CTA cost is **registers → occupancy (minority, 11 of 28 points) + padding-row operand traffic (majority)**. §19.8's candidate (a), the shared footprint, is worth **1.00×** and its proposed narrower-`BLK_N` follow-up is refuted without a build. No wide tile can be occupancy-neutral on sm_87: full occupancy needs ≤40 registers and `BLK_M=16` sits exactly there |
-> | **0s** | ✅ **built (§21.7).** `MLC_MOE_GEMM_V2_OPSPEC`, default `0`. Half **`a`** is a Pareto gain on the wide tile (0.99–1.10× everywhere, largest where padding is largest); half **`x`** loses 25–32% *while emitting strictly less work*. Bit-exact 40/40. Does not make any wide tile Pareto — the register floor is untouched |
-> | **0r** | 🔶 **re-priced (§22.2), not built.** Worth **~44 ms/iter**, not §20.9's ~89: `image_embed` 223 → ~180, ttft 373 → ~329 (−12%). The old number assumed cuBLAS's 51% of fp32 peak was reachable by writing a kernel; a hand-written one gets **29%** |
-> | 0.8B prose | ✅ **taken (§22.1).** pp512 **4787** (was 4888 on filler, −2.1%), pp2048 **5073**, tg512 **90.8** |
+> | **0n** | ✅ **answered (§21).** The wide tile's per-CTA cost is **registers → occupancy (a minority, 11 of 28 points) + padding-row operand traffic (the majority)**. §19.8's candidate (a), the shared footprint, is worth **1.00×**, and its proposed narrower-`BLK_N` follow-up is refuted without a build. **No wide tile can be occupancy-neutral on sm_87**: full occupancy needs ≤40 registers/thread and `BLK_M=16` sits exactly on that cliff |
+> | **0s** | ✅ **built and measured end to end (§21.7, §22.6).** `MLC_MOE_GEMM_V2_OPSPEC`, default `0`. Half **`a`** improves the wide tile at every prompt length (pp128 −9.1% → **−6.0%**, pp2048 +12.2% → **+12.8%**); half **`x`** loses 25–32% *while emitting strictly less work*. Bit-exact 40/40, state gate 139/139 in both modes. **Still not Pareto** — the register floor is untouched |
+> | **0r** | 🔶 **feasibility closed, not built (§22.2–§22.4).** Worth **~43–51 ms/iter** (ttft 373 → ~322–330, −12 to −14%), not §20.9's ~89. A verified TIR kernel exists and reaches **0.99× of hand-written CUDA**, 32% clear of break-even |
+> | 0.8B prose | ✅ **taken (§22.1).** pp512 **4787**, pp2048 **5073**, tg512 **90.8**. Every model row is now a prose number |
+> | VL shape coverage | ✅ **first answer (§22.4).** The flash/baseline ratio is flat (0.79–0.84×) across a 4× range of patch counts, so §20's reliance on the cat fixture's one shape does not bias item 0r |
 >
 > ### Everything still open, in the order it is worth doing
 >
 > | # | item | model | worth | cost / risk |
 > |---|---|---|---|---|
-> | 1 | **0r** — flash attention for the VL tower (§22.2) | VL | **~44 ms/iter**, ttft −12% | **large build**, and now with a known break-even bar: the TIR kernel needs **1.33 TFLOP/s** where dlight's default schedule gets 1.03 and hand-written CUDA gets 1.77. `scripts/vit_flash_probe.cu` is the working reference to port |
-> | 2 | **`lib_rowspec64` + `OPSPEC=a` end to end** (§21.7) | 35B | unknown; kernel-level it is the best wide config ever measured | **one compile + one bench.** The cheapest open thing. §19.4's pp128 −9.1% is the bar it has to beat, and it will not — but the pp2048 +12.2% end may move |
-> | 3 | **VL serving** — `MLCEngine` cannot drive this vision tower (§20, item 0o trap 3) | VL | the model is measurable but **not servable** | medium-large, and *not* a perf task |
-> | 4 | **0h** — dual-tile dispatch (§17.10, §18.11, and now §21.4) | 35B | the frontier's upper envelope | §21.4 sharpened why the single-PrimFunc form is wrong: the narrow path inherits the wide path's **registers**, so it drops 6 → 4 CTAs |
-> | 5 | **0c.2** — chunked GDN recurrence | 35B | ≤ +12.5% by Amdahl | changes the arithmetic, so bit-exactness is off the table |
-> | ~~6~~ | ~~VL static-shape specialization~~ | VL | ~22 ms/iter | ⚠️ **do not start** — 0r subsumes it at a better ratio |
+> | 1 | **0r integration** — wire `scripts/vit_flash_tir.py` into `qwen3_vl_vit.py` | VL | **~43–51 ms/iter**, ttft −12 to −14% | **medium now, not large.** The kernel is written, verified and fast; what remains is fp16 I/O so it absorbs the casts, the `qwen3_vl_vit.py` swap, a compile, and the 184/184 gate. ⚠️ Resolve §22.4's 8.5% baseline gap with a trace first — it is worth a third of the prize |
+> | 2 | **VL serving** — `MLCEngine` cannot drive this vision tower (§20, item 0o trap 3) | VL | the model is measurable but **not servable** | medium-large, and *not* a perf task |
+> | 3 | **0h** — dual-tile dispatch | 35B | ⬇️ **re-costed down by §22.6**: the frontier's envelope is now one branchless kernel, so 0h can only buy the **pp128 cell, 6.0% at one prompt length** | §21.4 also sharpened why the single-PrimFunc form is wrong — the narrow path inherits the wide path's **registers**, dropping 6 → 4 CTAs |
+> | 4 | **0c.2** — chunked GDN recurrence | 35B | ≤ +12.5% by Amdahl | changes the arithmetic, so bit-exactness is off the table |
+> | ~~5~~ | ~~VL static-shape specialization~~ | VL | ~22 ms/iter | ⚠️ **do not start** — 0r subsumes it at a better ratio |
+>
+> **There is no cheap unmeasured surface left.** Every item above is a build, not a measurement — the
+> first session that has been true.
 >
 > ### Read before touching the MoE GEMM again
 >
 > 1. **The register file is the binding budget, not shared memory** (§21.1). Anything that adds a wmma
 >    accumulator costs 4 registers/thread and `BLK_M=16` is at the 40-register cliff.
-> 2. **ptxas scheduling is a reproducible ±8% lottery at fixed occupancy and fixed register count**
+> 2. **ptxas scheduling is a reproducible ±8% lottery at fixed occupancy *and* fixed register count**
 >    (§21.5). Any A/B whose legs differ only in schedule carries that much compiler variance.
-> 3. **CC 8.x reserves 1 kB of shared per block** (§21.2). Leaving it out of an occupancy model
->    mis-attributes L1-carveout effects to occupancy; 256 bytes of shared can cost 21%.
-> 4. The two older traps still stand: the bench prompt concentrates the router (§17.9 — use
+> 3. **CC 8.x reserves 1 kB of shared per block** (§21.2). Omit it from an occupancy model and
+>    L1-carveout effects get mis-attributed to occupancy; 256 bytes of shared can cost 21%.
+> 4. **A guard that removes work can still lose 30%** by collapsing memory-level parallelism (§21.7's
+>    `x` half). Check the register count, not just the instruction count.
+> 5. The two older traps still stand: the bench prompt concentrates the router (§17.9 — use
 >    `--prompt-file`) and the microbench's synthetic routings are wrong at B=4096 (§18.2 — use
 >    `--indptr-file tuning/expert_hist_35b.npz`).
 >
+> ### Read before writing any hand-written TIR kernel
+>
+> Both cost 2.25× together on the flash kernel, both are invisible in the TIR source, and neither
+> warns (§22.3). §22.5 audited the tree — neither is live today, but nothing prevents them recurring.
+>
+> 1. **A `scope="local"` buffer indexed by a loop variable is local *memory*, not registers.** Use
+>    `T.unroll` on every register-tile loop so the indices are literals.
+> 2. **`CompactBufferAllocation` shrinks a buffer to the region actually touched**, so bank-conflict
+>    padding that is never written does not exist. Write the pad column once, or set the stride with
+>    `sch.storage_align` (which is what keeps the MoE GEMM's 72-half stride).
+>
+> Both were found by reading the emitted CUDA, which is the only way either is visible.
+> `scripts/moe_dump_cuda.py` already does that job for the MoE.
+>
 > ⚠️ **`jetson_clocks` needs an interactive sudo**, so absolutes this session sit ~1–3% under a pinned
-> one. Every A/B here re-measures its reference leg last as a drift control; all came back 0.99–1.01×.
+> one. Every kernel A/B re-measures its reference leg last as a drift control (all came back
+> 0.99–1.01×), and the end-to-end §22.6 leg reproduces §19.4's across a session boundary to 0.2%.
 >
 > <details><summary>Handoff, end of 2026-07-27b (superseded)</summary>
 >
