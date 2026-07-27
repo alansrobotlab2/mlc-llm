@@ -496,7 +496,12 @@ regardless, because §4.6 shows 30% of the budget is kernels that do not stream 
 | 0.8B `q0f16` high-margin gate vs HF fp16, radix **and** disable (§16.1) | ✅ **400/400 positions, every margin** — including all 39 near-ties |
 | 0.8B `q4f16_g16e` high-margin gate vs HF fp16 (calibration, §16.1) | ✅ 361/361 at τ=2.0; 11 flips total, **all at margin ≤ 1.031** |
 | high-margin gate **negative control** (`stale1`, state one step stale) (§16.1) | ✅ **fails 342/361** on a lib that otherwise scores 361/361 — the gate is not vacuous |
+| **0.8B VL `q0f16`** multimodal greedy parity vs HF, 5 prompts (§18.14) | ✅ **184/184, 0 wide-margin divergences at τ=2.0** — the first VL gate with a pass/fail bar. Clears five state-path changes (§11, §13, §14, §15, §16.5) inherited ungated since `f667b07e` |
+| 0.8B VL after the **default-`--opt` cuBLAS build** (§19.7) | ✅ **184/184 exact**, and §18.14's lone near-tie flips to agreement |
+| 0.8B VL after the **fp32-offload guard** (§20.3) | ✅ **184/184 exact**, identical to `lib_cublas` — not merely passing |
+| 0.8B VL after **prescaling `q`** (§20.6, ships as `lib_vl2.so`) | ✅ **184/184 exact** — the identity moves fp32 rounding by ~1 ulp and the gate is unmoved |
 | 0.8B `q4f16_g16e` vs HF fp16 | 1/5 — **quantization divergence, not a bug** |
+| **0.8B VL served through `MLCEngine`** | ⛔ **not possible** — llava `image_embed` signature + hardcoded `ImageData` embed size (§20, open item 4). Every VL number here came from the raw VM |
 | 35B-A3B greedy parity | ❌ **not reproducible on this box — see §6.1, neither leg fits** |
 | 35B-A3B concurrent decode | ⛔ **blocked by design, not by a bug** — `batch_decode` is compiled with batch pinned to 1 (§12) |
 
@@ -683,7 +688,7 @@ top of them.
 
 | file | purpose |
 |---|---|
-| [scripts/bw_probe.cu](scripts/bw_probe.cu) | achievable read-BW probe, native sm_87. Reproduces **156.2 GB/s** |
+| [scripts/bw_probe.cu](scripts/bw_probe.cu) | achievable read-BW probe, native sm_87. Reproduces **156.2 GB/s**. ⚠️ **That is this probe's access pattern, not "the wall".** §20.5 measured **184.8 GB/s** by D2D copy at 305 MB, and the VL tower's softmax hits 182 of it. Using 156 for the tower made §20.2 call a kernel "1.03× off" that was at 98.5% of its own wall — **measure a copy at the target size and dtype before rooflining anything new** |
 | [scripts/active_params.py](scripts/active_params.py) | exact active-param/roofline calc from safetensors headers. Now takes `--snapshot/--bits/--tps` |
 | [scripts/profile_decode_35b.py](scripts/profile_decode_35b.py) | parameterized nsys/ncu decode harness (explicit `--model-lib`) |
 | [scripts/analyze_decode_trace.py](scripts/analyze_decode_trace.py) | **new** — the §4.6 breakdown: step-segmented per-token ms, in-trace idle, kernel→weight map |
@@ -698,6 +703,8 @@ top of them.
 | [scripts/make_prose_corpus.py](scripts/make_prose_corpus.py) | **new (§17.9)** — builds a natural-language corpus for `--prompt-file`. Exists because the harness' built-in filler is one sentence repeated, which concentrates MoE routing and can flip which kernel config wins |
 | [scripts/moe_skippad_ab.py](scripts/moe_skippad_ab.py) | **new (§17.2)** — three-way A/B of item 0f: no guard / §16.10's k_o_o guard / §17's whole-body guard, all required byte-identical. Inverting its three timings is what showed §16.10's "20% residue" to be CTA launch overhead rather than the store tail |
 | [scripts/moe_rowspec_ab.py](scripts/moe_rowspec_ab.py) | **new (§19.2)** — three-way A/B of items 0k and 0l against no guard at all, in one process off identical inputs, so the two mechanisms are ranked under one clock state. Its `BLK_M=16` leg is the point: there both guards are logically inert, so any delta is the *mechanism's* overhead and nothing else. That cell is what turned §18.11's inference into a measurement (0k 0.91×, 0l 1.00×) |
+| [scripts/vit_attn_bench.py](scripts/vit_attn_bench.py) | **new (§20.5)** — the VL vision tower's attention block alone: same ops, same passes, same dlight schedules, each PrimFunc timed separately, plus an end-to-end VM leg. **Reproduces the traced per-layer numbers to 1.3%**, which is the bar that makes it usable. `--static` (literal `seq_len`), `--prescale` (scale on `q`), `--no-pv-cast`, `--cublas` (runs `BLASDispatch` at its real pipeline position). This is the loop for item **0r** and it needs **no compile** — §20.5's 70 ms win and §20.8's refutation both came out of it before anything was built |
+| [validate.py](validate.py) `--perf-vl5` | **new (§20.1)** — the only VL performance harness. Times `image_embed` / `prefill` / `decode` as three separate VM calls with a sync on each, over both `max_history` rings. ⚠️ Never time the enclosing loop: it merges image embeddings on the **host** (numpy scatter + re-upload). And `MLCEngine` cannot drive this vision tower at all — see the open-items note |
 | [fp8_software_dequant.py](fp8_software_dequant.py) | **new** — software W8A16 fp8 path so the 37.5 GB fp8 checkpoint can be an HF reference on sm_87 (§6.1) |
 
 Build/run:
@@ -1014,11 +1021,17 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 ### Start here next session
 
-> **Handoff, end of 2026-07-27b.** Branch `qwen3_5`. **Item 0o closed, item 0p half closed, and the
-> VL model is 23% faster to first token.** The first VL performance number ever taken on this box was
-> also the thing that overturned §19.6 — and then §20.5 overturned §20.3 one section later. 35B lib
+> **Handoff, end of 2026-07-27b.** Branch `qwen3_5`, **no uncommitted work** — `git status` is
+> `?? COLCON_IGNORE` alone. Six commits: `0a563a09` (§20, item 0o), `0e285ea7` (§20.5–§20.7, item
+> 0p), `f4d98e99` (§20.8–§20.9, item 0q refuted) and three docs. **Item 0o closed, 0p half closed,
+> 0q refuted, and the VL model is 23% faster to first token.** The first VL performance number ever
+> taken on this box overturned §19.6 — and then §20.5 overturned §20.3 one section later. 35B lib
 > unchanged (**`lib_blkk64.so`**); current VL lib is **`lib_vl2.so`**, built at plain `--opt` with no
 > environment variables set.
+>
+> **This session's whole arc, in one line:** every win came from measuring a premise nobody had
+> priced — the "cheap" `image_embed` (337 ms), the bandwidth wall (184.8, not 156), and the fusion
+> two separate items were built to protect (0.00 ms). No new kernel was written.
 >
 > | VL 0.8B, cat fixture, `radix` | `lib_cublas` (was default) | `lib_nofp32blas` (§20.3) | **`lib_vl2`** |
 > |---|---:|---:|---:|
@@ -1048,12 +1061,38 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > constant"*: P@V reduces over the symbolic sequence length, QK^T over `head_dim=64`. Unblocking it
 > needs static shapes and is worth **5.7%**, with cuBLAS still 3.4× off bound.
 >
-> **Next: item 0r — flash attention for the tower**, the only lever left. `QK^T` + `softmax` + `P@V`
-> are 14.71 ms/layer against a 3.67 ms compute floor, and all three exist to move the same 305 MB
-> fp32 score matrix; not materializing it is worth **~89 ms/iter**. ⚠️ a real build — fp32 (fp16
-> collapses tower parity), no HF kernel to copy, online softmax in TIR. Do **not** start the
-> static-shape specialization instead: §20.8 prices it at 9.4% and flash attention subsumes most of
-> it. Item **0n** (the MoE per-CTA cost) is still open and still a measurement, not a build.
+> ### Where all three models stand
+>
+> | | decode | prefill / ttft | current lib (there are three 0.8B dirs — take the path, not the name) |
+> |---|---:|---:|---|
+> | **35B-A3B** | **59–60** tps tg512 (from 54.13) | pp512 **836.6**, pp2048 **946.3** (prose, `radix`) | `dist/qwen3_6-35B-A3B-q4f16_1_fused/lib_blkk64.so` |
+> | **0.8B text** | ~90 tps | pp512 **4888** (filler; no prose number taken) | `dist/qwen3_5-0.8B-q0f16_fused/lib_ksplit4.so` |
+> | **0.8B VL** | 88.1 tps | ttft **372.9 ms** = 223.3 embed + 149.5 prefill | `dist/qwen3_5-0.8B-vl-q0f16/lib_vl2.so` |
+>
+> ⚠️ The 0.8B text pp512 is a **filler-prompt** number and §17.9 says those run ~4% optimistic. It is
+> the one headline figure in this table that has never been re-taken on prose.
+>
+> ### Everything still open, in the order it is worth doing
+>
+> | # | item | model | worth | cost / risk |
+> |---|---|---|---|---|
+> | 1 | **0n** — why is `BLK_M=64` 30–40% slower at B=1024 on the *same* CTAs and rows? (§19.8) | 35B | unblocks the whole wide-tile lane, which has killed 0h, 0k and 0l in turn | **one measurement**, no build. Start here if you want the cheapest open thing |
+> | 2 | **0r** — flash attention for the VL tower (§20.9) | VL | ~89 ms/iter; `image_embed` 223 → ~135, ttft → ~285 | **large build.** fp32 only, no HF kernel to copy, online softmax in TIR |
+> | 3 | **0h** — dual-tile dispatch, branch on `x.shape[0]` (§17.10, §18.11) | 35B | ≤ +12.5% pp2048 *only*; no Pareto `BLK_M` | medium, and **gated on 0n** — do not start it first |
+> | 4 | **VL serving** — `MLCEngine` cannot drive this vision tower at all (§20, item 0o trap 3) | VL | the model is measurable but **not servable**; every throughput number here came from the raw VM | medium-large, and *not* a perf task. See the note below |
+> | 5 | **0c.2** — chunked GDN recurrence | 35B | ≤ +12.5% by Amdahl | changes the arithmetic, so bit-exactness is off the table |
+> | 6 | VL static-shape specialization (§20.8) | VL | ~22 ms/iter (9.4%) | ⚠️ **do not start** — 0r subsumes most of it at a far better ratio |
+>
+> **On #4, because it is the one item that is not an optimization.**
+> [cpp/serve/model.cc:144](cpp/serve/model.cc#L144) calls `image_embed(image, resize_h, resize_w,
+> crop_h, crop_w, params)` — the llava signature — while Qwen3.5-VL's takes `(pixel_values,
+> pos_embeds, rotary_cos, rotary_sin, params)`; and `ImageData` hardcodes `embed_size` to 576/1921
+> ([serve/data.py:107](python/mlc_llm/serve/data.py#L107)). None of the engine tooling that produced
+> every 35B/0.8B number in this document transfers to the VL model. Treat it as its own project.
+>
+> **Also unmeasured, and cheap:** the 0.8B *text* model has never had a prose-prompt prefill number
+> (row 2 above), and no VL number exists at any image size other than the cat fixture's 2520 patches
+> — §20's whole roofline is built on that one shape.
 >
 > ✅ **The submodule loose end is closed** (not by me — pushed interactively this session).
 > `dff702c` is on the remote and `3281f97f` advances the parent pointer, so the three-session
@@ -5070,10 +5109,16 @@ cores*, and fp32 is where it does not.
 
 ### 20.3 The fix — decline the fp32 offload, keep the fp16 ones
 
+> ⚠️ **Superseded by §20.6, and the default below is no longer `1`.** Everything measured here
+> stands, including the mechanism and the 3.91-vs-3.94 ms/layer prediction. What does not stand is
+> the *fix*: the fusion this guard protects turned out to be worth **0.00 ms** (§20.5), so declining
+> the offload bought 3.0 ms/iter and gave up 70. `MLC_BLAS_SKIP_FP32` now defaults to **`0`**. Read
+> §20.5–§20.6 before acting on anything in this subsection.
+
 Same "decline the match" mechanism §19.6 built, one more predicate:
 [blas_dispatch.py](python/mlc_llm/compiler_pass/blas_dispatch.py) `_region_is_fp32` returns True when
 any tensor in the matched region is fp32, and the wrapped `check` declines it. Gated by
-**`MLC_BLAS_SKIP_FP32`, default `1`**.
+**`MLC_BLAS_SKIP_FP32`, default `1`** *(at the time of writing; now `0` — see the note above)*.
 
 `dist/qwen3_5-0.8B-vl-q0f16/lib_nofp32blas.so`, measured identically:
 
@@ -5239,17 +5284,24 @@ not from a cleverer kernel.
 | `ampere_sgemm` (QK^T) | 43.55 | 3.63 | 1.83 | 2.0× | cuBLAS; 51% of fp32 peak |
 
 **P@V is now the biggest single kernel in the tower** and is the one thing here nobody has attacked.
-It is `matmul(attn_probs, v32)` with an `astype` epilogue, and that epilogue is why cuBLAS never took
-it — the same fusion question §20.5 just answered for QK^T, and it has *not* been asked here. The
-cast writes fp16 (3.87 MB) against reading a 305 MB fp32 `attn_probs`, so the fusion is protecting
-almost nothing, and the identity is even simpler: there is no algebra to rearrange, just a cast that
-could move. **That is the next measurement, and the microbench answers it without a compile.**
+It is `matmul(attn_probs, v32)` with an `astype` epilogue.
+
+> ⚠️ **The next sentence of this paragraph was wrong, and §20.8 measured it.** It read: *"that
+> epilogue is why cuBLAS never took it"*. It is not — the fusion **is** free, as predicted, but
+> cuBLAS rejects P@V because its **reduction axis is symbolic**
+> ([cublas.py:77](3rdparty/tvm/python/tvm/relax/backend/cuda/cublas.py#L77), *"reduction axis must
+> be constant"*): P@V reduces over the sequence length, QK^T over `head_dim=64`. `BLASDispatch` also
+> runs *before* `FuseOps`, so no epilogue is fused at match time and it could not have been the
+> reason. Unblocking it needs static shapes and is worth **5.7%**. Read §20.8.
+
+The cast writes fp16 (3.87 MB) against reading a 305 MB fp32 `attn_probs`, so the fusion is
+protecting almost nothing — and that part held up. **That was the next measurement, and the
+microbench answered it without a compile.**
 
 Beyond it, the tower's floor is set by materializing the score matrix at all: 305 MB written by QK^T,
 read+written by softmax, read by P@V. Flash attention removes all three — the compute floor is
 2 × 1.83 = 3.67 ms/layer against today's 14.7 — but it is a real build, in fp32, with no HF kernel to
-copy (the reference runs eager attention). Price P@V first; it may be most of the remaining gap for a
-fraction of the risk.
+copy (the reference runs eager attention).
 
 ### 20.8 Item 0q — the fusion is free, and it was never the blocker
 
@@ -5282,9 +5334,10 @@ an assumed QK cost — P@V alone, static shape, generated vs cuBLAS:
 | generated (ships today) | 7.19 | 86.3 | 3.9× off |
 | cuBLAS | **6.14** | 73.6 | **3.4× off** |
 
-**+12.7 ms/`image_embed`, or 5.7%** — and cuBLAS is *still* 3.4× off the 1.71 ms read-bound. This
-shape is simply bad for a GEMM: `(2520×2520) @ (2520×64)` has N=64, so there is almost no reuse of
-the 305 MB `attn_probs` tile, and neither library nor codegen can fix that.
+**+12.7 ms/`image_embed`, or 5.7%** — and cuBLAS is *still* **3.4× off the 1.83 ms bound** (compute;
+the traffic bound is 1.71 ms, and reading `attn_probs` alone is 1.65). This shape is simply bad for a
+GEMM: `(2520×2520) @ (2520×64)` has N=64, so there is almost no reuse of the 305 MB `attn_probs`
+tile, and neither library nor codegen can fix that.
 
 **So item 0q is refuted as a cheap win.** Collecting the 12.7 ms requires making `num_patches` a
 compile-time constant in the vision tower — shape specialization for a model whose patch count varies
@@ -5304,7 +5357,7 @@ cheap lever is spent:
 
 | kernel | ms/layer | bound | off | status |
 |---|---:|---:|---:|---|
-| `matmul` P@V + cast | 7.03 | 1.71 (BW) | 4.1× | cuBLAS blocked by a symbolic reduction axis; worth only 1.06 ms if unblocked (§20.8) |
+| `matmul` P@V + cast | 7.03 | 1.83 (compute) | 3.8× | cuBLAS blocked by a symbolic reduction axis; worth only 1.06 ms if unblocked (§20.8) |
 | `softmax` | 4.05 | 3.30 (BW) | 1.2× | at the wall; 0.74 ms available from static shapes alone |
 | `ampere_sgemm` QK^T | 3.63 | 1.83 (compute) | 2.0× | cuBLAS, 51% of fp32 peak — done |
 
