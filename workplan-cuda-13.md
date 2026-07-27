@@ -656,6 +656,7 @@ footgun, and §3's note that `profile_decode.py` still trips it). Always pass `-
 
 | lib | what it is |
 |---|---|
+| `lib_rowspec64.so` | **§19.4 — item 0l.** `BLK_M=64` + hoist + `ROWSPEC`. **Not shipped**: −9.1% pp128 / +2.3% pp512 / +12.2% pp2048, i.e. `lib_hoist64` plus 2.4 points at pp512 and nothing at either end. It is the evidence that padding-row compute was never the wide tile's problem |
 | `lib_hoist64.so` | §17.10 — `lib_blkk64` + `BLK_M=64` + the hoist. **Not shipped**: +12.6% pp2048 but −10.4% pp128. Keep as the A/B leg for the runtime-specialisation work |
 | `lib_hoist32.so` | §17.10 — same with `BLK_M=32`. +7.8% / −5.5%; proves 32 is not a safe middle, only a smaller version of the same trade |
 | `lib_blkk64.so` | **§17 — the current 35B build.** `lib_skippad` plus `BLK_K=64` (item 0g) and the whole-body padding guard. pp512 **875.37**, decode 59.97, state gate identical to `lib_skippad` in both modes. Bench and gate against this |
@@ -696,6 +697,7 @@ top of them.
 | [scripts/moe_gemm_roofline.py](scripts/moe_gemm_roofline.py) | **new (§17.7)** — rooflines the v2 GEMM's *real* CTAs separately from its padding ones, by **fitting** `n_real*c_real + n_pad*c_skip` rather than assuming a padding ratio (§16.10's 0.933 does not carry to guarded CTAs). Reports issued *and* unique bytes; only the unique column carries information, since issued/time is constant by construction |
 | [scripts/make_prose_corpus.py](scripts/make_prose_corpus.py) | **new (§17.9)** — builds a natural-language corpus for `--prompt-file`. Exists because the harness' built-in filler is one sentence repeated, which concentrates MoE routing and can flip which kernel config wins |
 | [scripts/moe_skippad_ab.py](scripts/moe_skippad_ab.py) | **new (§17.2)** — three-way A/B of item 0f: no guard / §16.10's k_o_o guard / §17's whole-body guard, all required byte-identical. Inverting its three timings is what showed §16.10's "20% residue" to be CTA launch overhead rather than the store tail |
+| [scripts/moe_rowspec_ab.py](scripts/moe_rowspec_ab.py) | **new (§19.2)** — three-way A/B of items 0k and 0l against no guard at all, in one process off identical inputs, so the two mechanisms are ranked under one clock state. Its `BLK_M=16` leg is the point: there both guards are logically inert, so any delta is the *mechanism's* overhead and nothing else. That cell is what turned §18.11's inference into a measurement (0k 0.91×, 0l 1.00×) |
 | [fp8_software_dequant.py](fp8_software_dequant.py) | **new** — software W8A16 fp8 path so the 37.5 GB fp8 checkpoint can be an HF reference on sm_87 (§6.1) |
 
 Build/run:
@@ -757,6 +759,24 @@ python validate.py --reference-only --model Qwen/Qwen3.5-0.8B --device cuda:0 \
 python validate.py --greedy-parity --model Qwen/Qwen3.5-0.8B --device cuda:0 \
     --mlc-model-dir dist/qwen3_5-0.8B-q0f16 \
     --mlc-lib dist/qwen3_5-0.8B-q0f16/lib.so --cache reference_outputs.pt
+
+# MoE GEMM row-fragment guards (items 0k and 0l). Bit-exactness first, always, then rank.
+# The BLK_M=16 leg is the control that separates a mechanism's cost from its benefit (§19.2).
+python scripts/moe_rowspec_ab.py --indptr-file tuning/expert_hist_35b.npz --indptr-key prose_len512
+python scripts/moe_rowspec_ab.py --batches 1024      # pp128 scale; only synthetic routings exist here
+
+# item 0l end to end — compile-time env vars, all three needed together
+MLC_MOE_GEMM_V2=1 MLC_MOE_GEMM_V2_BLKM=64 MLC_MOE_GEMM_V2_HOIST=1 MLC_MOE_GEMM_V2_ROWSPEC=1 \
+  python -m mlc_llm compile dist/qwen3_6-35B-A3B-q4f16_1_fused/mlc-chat-config.json \
+  --device cuda --opt "flashinfer=1;cudagraph=1" \
+  -o dist/qwen3_6-35B-A3B-q4f16_1_fused/lib_rowspec64.so
+
+# VL — cuBLAS is on at default --opt again as of §19.6; the cublas_gemm=0 workaround is retired
+python -m mlc_llm compile dist/qwen3_5-0.8B-vl-q0f16/mlc-chat-config.json \
+  --device cuda --opt "flashinfer=1;cublas_gemm=1;cudagraph=1" \
+  -o dist/qwen3_5-0.8B-vl-q0f16/lib_cublas.so
+python validate.py --greedy-parity-vl5 --mlc-model-dir dist/qwen3_5-0.8B-vl-q0f16 \
+  --mlc-lib dist/qwen3_5-0.8B-vl-q0f16/lib_cublas.so --device cuda:0
 
 # kernel unit gates — no model, no engine. Run these FIRST on any state change.
 python scripts/gdn_kernel_check.py                     # §15, recurrent, ~51 s; --seq-lens narrows
@@ -935,6 +955,13 @@ All work from the 2026-07-25 and 2026-07-26 sessions is in git on branch `qwen3_
 | `08997dd6` | **§17.7–§17.8** real CTAs rooflined (85–87% of the wall); **§17.1's claim about the hoist retracted**; `moe_gemm_roofline.py` |
 | `0a4fd1e4` | VL entry corrected — never blocked, no download; `Qwen/Qwen3.5-0.8B` *is* the VL checkpoint |
 | `1100cb18` | **§17.9–§17.10** item **0h** built and measured end-to-end, parked (no Pareto `BLK_M`); **the bench prompt was picking winners**; `--prompt-file` + `make_prose_corpus.py` |
+| `61b5e055` | workplan brought current for a fresh session |
+| `5a9873d9` | the real expert histogram filed as item **0i** and queued |
+| `9422dff2` | **§18.1–§18.11** item **0i** lands; **§17.7's roofline retracted** — 45% of the wall, not 85–87%; items **0j** refuted and **0k** measured; the 4×3 frontier mapped |
+| `83061601` | **§18.12–§18.13** the VL re-gate runs; "not cleared" rather than passed |
+| `7c6789ff` | **§18.15** the 35B against the original, measured end to end rather than chained |
+| `7f71e2ab` | **§18.14** the VL gate gets a margin — the one divergence is a 0.05-nat near-tie, PASS |
+| `8da5f2fc` | both remaining leads filed as items **0l** and **0m** |
 
 ✅ **The TVM submodule commit that §11–§15 depend on IS pushed.** The parent's `3rdparty/tvm`
 pointer is `4624d97` (branch `qwen35-inplace-rnn-state` on the `alansrobotlab2/relax` fork),
@@ -974,6 +1001,44 @@ that §7 said to commit was still ignored; the exception now covers both names a
 
 ### Start here next session
 
+> **Handoff, end of 2026-07-27.** Branch `qwen3_5`. **Both items §18 left open are closed, and
+> neither changed a default.** Item **0l** is refuted — the mechanism works and the premise behind it
+> does not (§19.1–§19.4). Item **0m** is fixed — a VL-only compile break, down to two ops and a
+> pattern check (§19.5–§19.7). Current 35B lib is still **`lib_blkk64.so`**.
+>
+> | 35B-A3B, prose, `radix`, one clock state | `lib_blkk64` (shipped) | `lib_rowspec64` (item 0l) |
+> |---|---:|---:|
+> | pp128 | **550.51** | 500.17 (−9.1%) |
+> | pp512 | 836.56 | **855.89** (+2.3%) |
+> | pp2048 | 946.32 | **1061.53** (+12.2%) |
+>
+> Decode neutral (59.0–60.1 both legs). ⚠️ `jetson_clocks` needs an interactive sudo, so absolutes sit
+> ~1–3% under §18.9's; the A/B is unaffected and `lib_blkk64` at pp2048 reproduces §18.9's 945.00 to
+> **0.14%**, which is the control that makes the sessions comparable.
+>
+> ### Read this before touching the MoE again
+>
+> **The reason a wide `BLK_M` loses at short prompts is not padding-row compute.** §17.10, §18.7 and
+> §18.11 all say it is. §19.3 removed that compute entirely and recovered **2 points of a 31-point
+> gap**. What remains is per-CTA, and §19.8 names three surviving `BLK_M`-scaled terms straight off
+> the emitted CUDA — shared footprint 20.25 → 27.0 kB, and 4× (not 1×) `X_shared` stores and
+> `load_matrix_sync` per k-step, both of which sit *above* the loop 0k and 0l guarded. That is item
+> **0n**, and it is a measurement, not a build. Do not cost another wide-tile variant until it is
+> answered.
+>
+> §18's two instrument traps still stand: the bench prompt picks winners (§17.9 — use `--prompt-file`)
+> and the microbench's synthetic routings are wrong at B=4096 (§18.2 — use
+> `--indptr-file tuning/expert_hist_35b.npz`). Note that B=1024 is the one shape where synthetic
+> routings are all that exist; §19.3's short-prompt numbers use them and say so.
+>
+> ### The VL path
+>
+> `dist/qwen3_5-0.8B-vl-q0f16/lib_cublas.so` is the first VL lib at **default `--opt`** (cuBLAS on),
+> and it gates **184/184**. §18.12's workaround (`cublas_gemm=0`) is no longer needed. Still true:
+> **no VL performance number has ever been taken on this box.**
+>
+> <details><summary>Handoff, end of 2026-07-26d (superseded)</summary>
+>
 > **Handoff, end of 2026-07-26d.** Branch `qwen3_5`, five commits, **no uncommitted work**.
 > `git status` shows exactly `M 3rdparty/tvm` and `?? COLCON_IGNORE`, both deliberate (see the end).
 > Current 35B lib is **`lib_blkk64.so`**.
@@ -1140,14 +1205,24 @@ that §7 said to commit was still ignored; the exception now covers both names a
 >
 > </details>
 >
-> **A sixth trap, added 2026-07-26d — it is the same one as #1 and it caught us again.**
+> </details>
+>
+> ### Environment traps that still bite, carried forward
+>
+> **`source .envrc.local` before anything** — nothing is pip-installed, so a bare `python` fails on
+> `import tvm`. GPU clocks are pinned at max already; `jetson_clocks` itself needs an interactive
+> sudo this box does not have non-interactively.
+>
+> **Never run two benchmarks at once, and do not conclude one has died because it is quiet.**
 > `pgrep -f "mlc_llm compile"` **matches the polling shell itself**, because that string is in the
-> poll loop's own command line. A finished 35B compile therefore looked like it was still running for
-> ~20 minutes. Trap #1's lesson was "`ps -C python` does not find it"; the general form is
-> **`pgrep -f` over a pattern you just typed into the same shell is self-matching** — check for the
-> output artifact (`ls -la <lib>.so`) rather than for the absence of a process. Relatedly, a
-> `nohup ... &` inside a background tool call reports "completed" the instant the wrapper exits,
-> which is not the same thing as the compile finishing. **The 35B compile takes ~14 min** on this box.
+> poll loop's own command line — a finished 35B compile looked like it was still running for ~20
+> minutes. Check for the output artifact (`ls -la <lib>.so`), not for the absence of a process.
+> **The 35B compile takes ~14 min**; a full `mlc_llm compile` of the 0.8B VL model takes ~3 min; one
+> `scratch_mlc_tg_sweep.py` leg on the 35B is ~2 min including load.
+>
+> **Two non-code loose ends, unchanged.** `3rdparty/tvm` commit `dff702c` is still unpushed (needs an
+> interactive shell or an SSH remote), so `M 3rdparty/tvm` is deliberate; `COLCON_IGNORE` is an
+> untracked ROS artifact predating this work.
 
 > **Item IDs are stable, not sequential.** They are referenced from §12–§16 and from the Done
 > sections above, so closed items keep their number rather than being renumbered away. Ordering
@@ -1167,8 +1242,9 @@ that §7 said to commit was still ignored; the exception now covers both names a
 >
 > | item | state | worth |
 > |---|---|---|
-> | **0l — START HERE** | **new, and the only untried mechanism**; needs a build, no new measurement to justify it | the tile-count win `BLK_M=64` already demonstrates (**1.90× fewer tiles at pp512, 2.84× at pp2048**) without the padding-compute it currently pays for |
-> | **0m** | new; a **VL-only compile break**, diagnosed to one pass, not yet to one op | unblocks a default-`O2` VL build. Correctness is already gated (§18.14); this is about not shipping a hobbled lib |
+> | **0n — START HERE** | **new (§19.8)**; a measurement, not a build. Why is `BLK_M=64` 30–40% slower at B=1024 when it launches the *same* CTAs over the *same* rows? | it is the only unexplained term left in the MoE GEMM, and every wide-tile idea has died on it |
+> | ~~**0l**~~ | ✅ **built, §19.1–§19.4 — and it refutes its own premise.** The mechanism works (`BLK_M=16` control: 1.00× where 0k cost 5–9%); the hypothesis it was built on does not | closed. pp128 is still −9.1% end-to-end, so no wider tile is Pareto and the defaults are unchanged |
+> | ~~**0m**~~ | ✅ **fixed, §19.5–§19.7** — two ops, both in the VL patch merger; the guard declines exactly those two matches | a default-`--opt` VL lib now compiles and gates **184/184** |
 > | ~~**0i**~~ | ✅ **done, §18.1** | did what it was for — see §18.11's before/after table |
 > | ~~**VL re-gate**~~ | ✅ **cleared, §18.14** — margin scoring added; 0 wide-margin divergences | the five inherited state-path changes are gated on VL for the first time since `f667b07e` |
 > | **0h** | re-costed by §18.9; the runtime branch is the **wrong shape of fix** (§18.11) | the frontier's upper envelope, ≤ +12.5% at pp2048 only. **0l may make it unnecessary** |
@@ -1185,7 +1261,44 @@ that §7 said to commit was still ignored; the exception now covers both names a
 > are wrong at B=4096 specifically — use `--indptr-file tuning/expert_hist_35b.npz`). Both are now
 > fixed in the tooling; neither is fixed by default.
 
-**0l. ⬅️ NEXT — statically specialise the row-fragment count, so a wide `BLK_M` stops paying for
+**0n. ⬅️ NEXT — find the wide tile's per-CTA cost, which is not what four sections said it was.**
+
+*The question, stated so it cannot be answered by argument.* At B=1024 (the pp128 scale) no expert
+holds more than 64 rows, so `BLK_M=16` and `BLK_M=64` launch **the same number of CTAs** over the
+**same real rows** and fetch the **same weight tiles**. `BLK_M=64` is nonetheless **30–40% slower**
+(§19.3). Everything that differs is per-CTA. Which term is it?
+
+*Three candidates, already read off the emitted CUDA* (§19.8 has the table; `scripts/moe_dump_cuda.py`
+at `BLK_M` 16 vs 64+hoist+`ROWSPEC`). All three live *above* the row-fragment loop that items 0k and
+0l guarded, which is why predicating that loop bought 0–3%:
+
+(a) **Shared-memory footprint** — 20.25 kB → 27.0 kB, so 8 resident CTAs become 6 on a 164 kB/SM
+budget. 1.33×, so probably not the whole 30–40% by itself. Same effect §17 blamed for the `BLK_K=128`
+regression. (b) **The `X_shared` cooperative store** — 4 fragments per k-step instead of 1. The load
+is predicated on `row_end` so padding rows cost no DRAM, but the shared store and the `condval` are
+paid anyway. (c) **`load_matrix_sync` of the X fragments** — 4 per k-step instead of 1, because
+`A_mat` is attached at `k_o_i`, outside the guarded loop.
+
+*How to settle it.* (b) and (c) are both testable by pushing the same predicate one level up — the
+`A_mat` cache-read loop is annotatable exactly as the fragment loop was, and the `X_shared` store's
+`ax0_ax1_fused_0` extent is a candidate for item 0k's *extent* trick (it carries no barrier of its
+own). If instead (a) dominates, the follow-up is not a wider tile at all but a **narrower `BLK_N`** at
+`BLK_M=64`, trading the same shared budget the other way. `ncu` would rank the three outright but is
+still blocked (§8).
+
+*Why it matters.* §18.9's frontier has killed every wide-tile idea at the short-prompt end, and
+§19.3 shows the mechanism everyone assumed is worth 0–3% of a 31–40% gap. Until this term is named,
+any further wide-tile work is guessing — which is precisely how items 0h, 0k and 0l were each costed.
+
+**0l. ✅ DONE, §19.1–§19.4 — the mechanism works and the premise does not. Historic entry below.**
+Built as `MLC_MOE_GEMM_V2_ROWSPEC=1`, though as a *predicate on a constant-extent loop* rather than
+the four-way static specialisation described here — same effect, a quarter of the code. The
+`BLK_M=16` control came in at **1.00×** against 0k's 0.91×, which confirms §18.11's diagnosis of 0k.
+But the prediction below — that this makes a wide tile beat `BLK_M=16` at every prompt length — is
+**refuted**: pp128 is still −9.1% end-to-end, and at the kernel level removing *all* padding-fragment
+reduction closes only 2 points of a 31-point gap. See item 0n for what the cost actually has to be.
+
+**0l (historic). Statically specialise the row-fragment count, so a wide `BLK_M` stops paying for
 its own padding.**
 
 *The one-line version:* `BLK_M=64` already cuts tiles **1.90× at pp512 and 2.84× at pp2048** (§18.1),
@@ -1233,7 +1346,15 @@ doubles the dominant cost to save one tile. Recorded so the next session does no
 *If 0l works, item 0h's runtime branch is moot* — the whole point of the branch was to get the wide
 tile's long-prompt win without its short-prompt cost.
 
-**0m. The VL-only `BLASDispatch` compile break — diagnosed to one pass, not yet to one op.**
+**0m. ✅ DONE, §19.5–§19.7 — it was two ops, both in the patch merger, and the fix is a pattern
+check.** `FuseOpsByPattern` appends a `tir_vars: R.Shape([...])` parameter to any lifted region with a
+free symbolic var, and the BYOC JSON serializer requires every parameter to be a tensor. The VL merger
+feeds `linear_fc1`/`linear_fc2` a `R.Tensor((num_patches // 4, 3072))`, which *uses* `num_patches`
+without *defining* it. `BLASDispatch` now declines exactly those matches (VL 22 → 20 offloads, text
+13 → 13), a default-`--opt` VL lib builds, and it gates 184/184. Historic entry below.
+
+**0m (historic). The VL-only `BLASDispatch` compile break — diagnosed to one pass, not yet to one
+op.**
 
 *Symptom.* Compiling `--model-type qwen3_5_vl` at default `--opt` dies in
 [compiler_pass/blas_dispatch.py:40](python/mlc_llm/compiler_pass/blas_dispatch.py#L40), inside
@@ -4421,3 +4542,220 @@ records for "start of 2026-07-25c" is a *filler* number, and the original lib me
 prose — so in this one case the filler was not optimistic and the two agree within 2%. And the
 overall multiplier there (+147%) is the pp512 chain; measured end-to-end it is **+129%** for the
 shipped lib. The chain was close, but it was a chain.
+
+---
+
+## 19. Session 2026-07-27 — the last two leads: 0l refutes the premise it was built on, 0m is two ops
+
+Both items §18 left open are closed, and **neither changes a default**. Item **0l** works exactly as
+designed and disproves the hypothesis it was designed to exploit. Item **0m** turns out to be two
+ops, and the fix is a pattern check.
+
+### 19.1 Item 0l — the guard is a predicate, not a loop extent
+
+§18.11's diagnosis of item 0k was that the loss is not the skipping but the *dynamic extent*: 0k
+replaced a compile-time `BLK_M/MICRO` trip count with `ceildiv(real rows, MICRO)`, and at `BLK_M=16`,
+where that expression can only ever be 1, it still cost 5–9%.
+
+Built as `MLC_MOE_GEMM_V2_ROWSPEC=1`, and simpler than the filed plan. Rather than emit four
+statically-unrolled bodies and select among them (10 fragment bodies at `BLK_M=64`), keep the loop
+exactly as it is — constant extent, constant fragment indices — and predicate its body:
+
+```
+for i_o in range(BLK_M // MICRO):        # unchanged, still a compile-time constant
+    if i_o * MICRO < row_end - m_offset: # CTA-uniform
+        <wmma fragment>
+```
+
+**A predicate is admissible here for the reason item 0f's was not.** §16.9 established that
+ThreadSync refuses `Cannot insert syncs inside condition`, which is why 0f had to move its guard into
+a loop *extent*. Under the hoist the fragment loop sits *below* `k_o_o`, where the cooperative loads
+and their barriers live, so the predicated region is barrier-free. Without the hoist `i_o` is the
+outermost loop and encloses them — so `ROWSPEC` asserts `HOIST=1` rather than failing in a pass 200
+lines downstream. The annotation lands on two loops (`a0_0_init` and `a0_0` — the accumulator init
+nest and the compute nest), and both are safe to predicate: a skipped fragment's global store is
+predicated off by `m_offset + i < row_end` regardless of what its accumulator holds. Same
+bit-exactness argument as 0f and 0k, one level down.
+
+### 19.2 The kernel A/B — and the `BLK_M=16` control that turns §18.11 into a measurement
+
+[scripts/moe_rowspec_ab.py](scripts/moe_rowspec_ab.py) runs three legs off identical inputs in one
+process — `base` (neither guard), `skiprows` (0k), `rowspec` (0l) — at `HOIST=1`, against the real
+routing in `tuning/expert_hist_35b.npz`. **24/24 cells bit-exact against `base`** (12 real-routing,
+12 synthetic).
+
+| vs `base` at the same `BLK_M`, gate_up / down | pp512, B=4096 | pp2048, B=16384 |
+|---|---:|---:|
+| M=16 `skiprows` (0k) | 0.91× / 0.95× | 0.96× / 0.97× |
+| **M=16 `rowspec` (0l)** | **1.00× / 1.00×** | **1.00× / 1.00×** |
+| M=32 `skiprows` | 1.06× / 1.07× | 1.03× / 1.01× |
+| M=32 `rowspec` | 1.01× / 1.02× | 1.01× / 1.04× |
+| M=64 `skiprows` | 0.90× / 0.91× | 0.91× / 0.92× |
+| **M=64 `rowspec`** | **1.03× / 1.00×** | **1.00× / 0.98×** |
+
+**The `BLK_M=16` row is the result.** There the guard is logically inert under *both* mechanisms, and
+0k costs 5–9% while 0l costs nothing at all, to three digits. §18.11 attributed 0k's loss to the
+runtime extent blocking the unroll; that is now measured rather than inferred, and the mechanism 0l
+was filed to build does what it was supposed to do. At `BLK_M=64` it converts 0k's 0.91× into
+1.00–1.03×.
+
+One thing it does *not* do is beat 0k at `BLK_M=32` (1.01–1.04× against 1.03–1.07×). Left unexplained
+rather than guessed at; it does not bear on the conclusion below, and §18's traps were all created by
+explaining a number without measuring it.
+
+### 19.3 …and that is exactly why item 0l is refuted
+
+The filed prediction was that `BLK_M=64` + hoist + static specialisation would beat `BLK_M=16` **at
+every prompt length**, crossing the frontier §18.9 mapped instead of sliding along it. The stated
+refutation criterion was the short-prompt leg, "the first thing to measure, not the last".
+
+At the pp128 scale — B=1024, both synthetic routings, since the histogram covers only 512 and 2048:
+
+| B=1024, gate_up / down | vs `base` M=64 | **vs shipped M=16** |
+|---|---:|---:|
+| M=64 + hoist (`base`) | — | 0.69× / 0.60× |
+| M=64 + hoist + `rowspec` | 1.03× / 0.99× | **0.71× / 0.60×** |
+
+**Removing every padding fragment's reduction closes 2 points of a 31-point gap on `gate_up` and
+nothing at all on `down`.** So the hypothesis four sections have carried — that padding-row wmma
+compute is why a wide tile loses at short prompts (§17.10, §18.7, §18.11) — is **wrong**. That compute
+is real and worth 0–3%; it is not the cost.
+
+The remaining cost has to be **per-CTA rather than per-tile**, because at B=1024 the tile count is
+*identical* at both widths: no expert holds more than 64 rows, so every hit expert gets exactly one
+m-tile either way. Same CTAs, same weight traffic, same live rows — and a 30–40% gap. Item **0n** is
+that question, and it is a measurement rather than another kernel variant.
+
+### 19.4 End-to-end, one session, one clock state
+
+`lib_rowspec64` = `BLK_M=64` + hoist + `ROWSPEC`. Benched against the shipped `lib_blkk64` on
+`--prompt-file` prose, `--prefix-cache-mode radix`, 3 runs after 1 warmup, both legs back to back.
+
+| pp | `lib_blkk64` (shipped) | `lib_rowspec64` | Δ | (§18.9's `lib_hoist64`) |
+|---:|---:|---:|---:|---:|
+| 128 | **550.51** | 500.17 | **−9.1%** | −9.0% |
+| 512 | 836.56 | **855.89** | **+2.3%** | −0.1% |
+| 2048 | 946.32 | **1061.53** | **+12.2%** | +12.5% |
+
+Decode neutral throughout (59.0–60.1 tps on both legs at every length).
+
+⚠️ `jetson_clocks` needs an interactive sudo, which this session did not have, so absolute figures sit
+~1–3% under §18.9's. **The cross-session control holds**: `lib_blkk64` at pp2048 reproduces §18.9's
+945.00 to **0.14%** (946.32), which is what makes the two sessions comparable at all.
+
+**Read against `lib_hoist64`, item 0l buys +2.4 points at pp512 and nothing at either end.** That is
+the same shape the kernel A/B predicted (1.03× at B=4096, 1.00×/0.98× at B=16384) and it is not
+enough to move the trade: **pp128 is −9.1%, so `BLK_M=64` is still on the wrong side of §18.9's
+frontier and the defaults are unchanged** (`BLK_M=16`, `HOIST=0`, `SKIPROWS=0`, `ROWSPEC=0`,
+`TILEORDER=m`). `ROWSPEC` ships off, exactly as `SKIPROWS` and `HOIST` do.
+
+### 19.5 Item 0m — it is two ops, and they are the patch merger
+
+§18.12 had it diagnosed to one pass. The localisation it proposed — bisect by `entry_functions` —
+**does not work**, and that is worth recording: `RunCodegen`'s `entry_functions` filter does not stop
+it serialising every `Codegen`-annotated function in the module, so **all 17 entry functions fail with
+the identical error**, `softmax_with_temperature` included. What localises it is asking the *fused*
+module a different question: which lifted function has a non-tensor parameter?
+
+**Mechanism, end to end.** When `FuseOpsByPattern` lifts a matched region into a composite function,
+any symbolic variable the region uses but that none of its parameters *defines* is appended as a
+`tir_vars: R.Shape([...])` parameter
+([fuse_ops.cc:567](3rdparty/tvm/src/relax/transform/fuse_ops.cc#L567)). The BYOC JSON serializer then
+walks **every** parameter and requires a `TensorStructInfo`
+([codegen_json.h:289](3rdparty/tvm/src/relax/backend/contrib/codegen_json/codegen_json.h#L289)). That
+`ICHECK` is the crash.
+
+A variable is *defined* by a parameter only when it appears as a bare `tir.Var` in that parameter's
+shape. `R.Tensor((seq_len, 2048))` defines `seq_len`; `R.Tensor((num_patches // 4, 3072))` defines
+nothing. The second form is the patch merger —
+[qwen3_vl_vit.py:200-202](python/mlc_llm/model/vision/qwen3_vl_vit.py#L200) reshapes `(n, hidden)` to
+`(n // merge_sq, merge_sq * hidden)` before `linear_fc1`. Exactly two regions are affected:
+
+| lifted function | what it is | appended param |
+|---|---|---|
+| `fused_relax_permute_dims_relax_matmul_relax_add_relax_nn_gelu_cublas` | `visual.merger.linear_fc1` + bias + gelu | `tir_vars: R.Shape([num_patches])` |
+| `fused_relax_permute_dims_relax_matmul_relax_add4_cublas` | `visual.merger.linear_fc2` + bias | `tir_vars: R.Shape([num_patches])` |
+
+Both are called from `image_embed`. Nothing in the text stack produces that shape, which is why the
+text-only `q0f16` build has always compiled — §18.12 was right that it is VL-specific, and this is
+why.
+
+### 19.6 The fix — decline the match, do not switch the pass off
+
+[blas_dispatch.py](python/mlc_llm/compiler_pass/blas_dispatch.py) now wraps every cuBLAS/hipBLAS
+fusion pattern's `check` with a predicate answering "would this match need a `tir_vars` parameter?",
+comparing the symbolic vars the region *uses* against the ones its parameters *define*
+(`relax.analysis.tir_vars_in_struct_info` vs `definable_tir_vars_in_struct_info`). `ShapeExpr` and
+`PrimValue` arguments are inlined rather than parameterised
+([fuse_ops.cc:644](3rdparty/tvm/src/relax/transform/fuse_ops.cc#L644)), so they are excluded from the
+*defining* side — the conservative direction, since counting them would let a match through that then
+kills the compile.
+
+Declining is the supported way for a BYOC pattern to say "not this one": the two merger matmuls fall
+back to the generated kernel and every other offload is kept. That is strictly narrower than the
+`cublas_gemm=0` workaround, which switched the pass off for the whole model.
+
+**Measured rather than argued** — `FuseOpsByPattern` run twice on the same module, raw patterns then
+guarded, diffing the set of `Codegen`-annotated functions:
+
+| model | offloads, raw | guarded | declined |
+|---|---:|---:|---|
+| `qwen3_5-0.8B-vl-q0f16` | 22 | **20** | exactly the two merger matmuls above |
+| `qwen3_5-0.8B-q0f16` (text) | 13 | **13** | none — the guard is inert off the vision tower |
+
+`dist/qwen3_5-0.8B-vl-q0f16/lib_cublas.so` is the first VL lib built at **default `--opt`** with
+`cublas_gemm=1`. The hipBLAS branch gets the identical guard: same serializer, same failure mode.
+
+### 19.7 The VL gate on the cuBLAS lib — 184/184, and §18.14's near-tie flips to agreement
+
+```
+prompt 1/5: 29/29   2/5: 50/50   3/5: 50/50   4/5: 50/50   5/5: 5/5
+AGGREGATE 184/184 (100.0%)   raw count bar: PASS   MARGIN VERDICT at tau=2.0: PASS
+```
+
+§18.14's lib diverged on prompt 1 at step 12 (12/29), at a position whose reference margin is
+**0.05 nats**; this one does not. **That is not evidence that cuBLAS is more correct.** A 1.05×
+top1/top2 gap is a coin flip and all that changed is the accumulation order of 20 matmuls. What it
+does confirm is §18.14's reading of that divergence as a numerical near-tie rather than a state-path
+fault — a perturbation this small moves it. The VL path is now gated on the lib a default `--opt`
+produces, which is the gap §18.12's scope note left open.
+
+### 19.8 Where this leaves the MoE lane
+
+§18.11 called 0l "the first MoE idea in three sessions that is not a point on the frontier §18.9
+mapped". It turned out to be a point on it after all — but it moved the *diagnosis*, and that is what
+the next item has to be built on:
+
+| | before §19 | after §19 |
+|---|---|---|
+| why 0k lost 5–9% where its guard is inert | inferred: a runtime extent blocks the unroll | **measured**: the predicated form costs 1.00× |
+| why a wide `BLK_M` loses at short prompts | padding-row wmma compute (§17.10, §18.7, §18.11) | **not that** — removing it recovers 0–3 of 31–40 points |
+| what the wide tile's short-prompt cost is | — | per-CTA, not per-tile, and **unidentified** |
+| best known pp2048 | 1063.48 (`hoist64`, §18.9) | 1061.53 (`rowspec64`) — the same number, and neither ships |
+
+**The open question is now sharp enough to be worth one measurement rather than a build**, and it is
+filed as item 0n. At B=1024 the two widths launch the same CTAs over the same rows; everything that
+differs is per-CTA. Diffing the emitted CUDA (`scripts/moe_dump_cuda.py` at `BLK_M` 16 vs
+64+hoist+`ROWSPEC`) already names three surviving `BLK_M`-scaled terms, none of which 0k or 0l
+touched — all of them sit *above* the fragment loop the two items guarded:
+
+| per-CTA term, from the emitted source | `BLK_M=16` | `BLK_M=64` |
+|---|---:|---:|
+| dynamic shared memory (`X_tile` 72-half rows + `W_tile`; `O_tile` aliases into `W_tile`) | 10368 halves, **20.25 kB** | 13824 halves, **27.0 kB** |
+| `X_shared` cooperative-store fragments per k-step (predicated on `row_end`, but *stored* regardless) | 1 | **4** |
+| `load_matrix_sync` of X fragments per k-step (`A_mat` sits at `k_o_i`, outside the guarded loop) | 1 | **4** |
+
+Shared memory alone is 1.33×, which on a 164 kB/SM budget is 8 resident CTAs against 6 — real, but
+probably not 30–40% on its own. The other two rows are 4× *unconditional* work at 64, and they are
+the reason predicating the reduction bought so little: **0l skipped the multiply, not the operand
+traffic feeding it.** That is where item 0n should start, and it suggests the fix — if any — is a
+narrower `BLK_N` at `BLK_M=64` (trading the same shared budget the other way) or predicating `A_mat`,
+not a wider tile.
+
+**And the pattern behind this session, which is the same one §16's closing note named.** Both leads
+came in as confident mechanisms: 0l's "the win should survive" rested on a cost model nobody had
+measured at the short-prompt shape, and 0m's "bisect by `entry_functions`" rested on reading a pass
+signature rather than running it. Both were wrong in the same way — an inference from the right
+neighbourhood, never checked against the thing itself. The half-day 0l cost bought a **retraction of
+four sections' worth of shared assumption**, which is worth more than the +2.3% at pp512 it also
+produced.

@@ -618,6 +618,30 @@ def _dequantize_group_gemm_v2(
     # See the comment at its use site in _dispatch_func. Bit-exact either way.
     TILE_N_MAJOR = os.environ.get("MLC_MOE_GEMM_V2_TILEORDER", "m") == "n"
     SKIPROWS = os.environ.get("MLC_MOE_GEMM_V2_SKIPROWS", "0") == "1"
+    # Item 0l: same goal as 0k -- do no wmma work for row fragments that hold no real
+    # rows -- but without making the loop extent dynamic. §18.7 isolated 0k's cost at
+    # BLK_M=16, where its guard is logically inert (extent 1) and it *still* lost 5-9%:
+    # replacing a constant extent with a runtime expression blocks the unroll, and 0k
+    # pays that on every CTA. Here the extent stays the compile-time BLK_M/MICRO and the
+    # per-fragment body is predicated instead, so every fragment index remains a
+    # constant. See `_specialise_row_fragments`.
+    ROWSPEC = os.environ.get("MLC_MOE_GEMM_V2_ROWSPEC", "0") == "1"
+    assert not (SKIPROWS and ROWSPEC), (
+        "MLC_MOE_GEMM_V2_SKIPROWS and _ROWSPEC are two mechanisms for the same thing; "
+        "pick one"
+    )
+    # ROWSPEC predicates the fragment body, and a predicate is only legal where no
+    # __syncthreads() lands inside it (§16.9). With the hoist the row-fragment loop sits
+    # *below* k_o_o, where the cooperative loads and their barriers live, so its body is
+    # barrier-free; without it, i_o is the outermost loop and wraps them, which is
+    # exactly the case ThreadSync refuses. Item 0k's dynamic extent had no such
+    # restriction -- an extent is not a condition -- which is why it could be swept over
+    # both. Fail here rather than in a pass 200 lines downstream.
+    assert not (ROWSPEC and not HOIST), (
+        "MLC_MOE_GEMM_V2_ROWSPEC requires _HOIST=1: without the hoist the row-fragment "
+        "loop encloses the cooperative loads' __syncthreads(), and ThreadSync refuses a "
+        "barrier inside a condition"
+    )
     assert BLK_M % 16 == 0, "BLK_M must be a multiple of the wmma M=16"
     BLK_N = 128
     # BLK_K sets the k-step of the cooperative fetch, and therefore how many bytes of
@@ -633,6 +657,12 @@ def _dequantize_group_gemm_v2(
         BLK_K //= 2
     assert BLK_K >= 16, f"K={K} is not a multiple of the wmma K=16"
     MICRO = 16
+    # At BLK_M=16 the row-fragment loop already has extent 1, so there is nothing to
+    # specialise and item 0f skips the only tile that could be empty (a padding CTA)
+    # whole. Staying inert there matters: §18.10 found that an `sch.annotate` alone
+    # stops TVM eliminating the unit loop, so an unconditional tag would change the
+    # generated code of the shipped default.
+    _rowspec_active = ROWSPEC and BLK_M // MICRO > 1
     tiles_per_n = (N + BLK_N - 1) // BLK_N
     assert N % BLK_N == 0, "v2 requires N % BLK_N == 0 (no col padding)"
 
@@ -854,7 +884,7 @@ def _dequantize_group_gemm_v2(
         # around the entire CTA body. nvcc would delete that, but "the shipped kernel is
         # unchanged" is a claim worth being able to prove by diffing the generated CUDA
         # (scripts/moe_dump_cuda.py) rather than by arguing about the optimiser.
-        if SKIPROWS:
+        if SKIPROWS or _rowspec_active:
             sch.annotate(i_o, "moe_row_guard", 1)
         # Tag k_o_o so item 0f can find it by name. It used to be located by matching
         # `extent == K // BLK_K`, which is not unique — at K=512, BLK_K=64 that extent
@@ -1023,6 +1053,31 @@ def _dequantize_group_gemm_v2(
                 )
         return func.with_body(body)
 
+    def _cta_row_bounds(func):
+        """The CTA block's `m_offset` and `row_end` vars, found by name over the body.
+
+        Both are bound near the top of the CTA block, but the schedule moves and re-nests
+        those bindings, so walking the leading let-chain does not find them. Duck-typed on
+        `.var` because the let-statement node is not exported under a stable name from
+        `tvm.tirx`. Shared by items 0k and 0l, which need the same two vars.
+        """
+        want = {"m_offset", "row_end"}
+        lets: dict = {}
+
+        def _collect(n):
+            var = getattr(n, "var", None)
+            if var is not None and getattr(var, "name", None) in want:
+                lets.setdefault(var.name, var)
+
+        tirx.stmt_functor.post_order_visit(func.body, _collect)
+        missing = want - set(lets)
+        if missing:
+            raise RuntimeError(
+                f"CTA block does not bind {missing} (found {sorted(lets)}); "
+                "source layout changed"
+            )
+        return lets["m_offset"], lets["row_end"]
+
     # ---------- item 0k: skip row fragments that hold no real rows ----------
     def _guard_padding_rows(func):
         """Shorten the row-fragment loop to `ceildiv(real rows in this tile, MICRO)`.
@@ -1049,26 +1104,7 @@ def _dequantize_group_gemm_v2(
         which is false for exactly those rows. Nothing skipped was ever observable, the
         same argument that gates item 0f.
         """
-        # `m_offset` and `row_end` are bound near the top of the CTA block, but the
-        # schedule moves and re-nests those bindings, so collect them by name over the
-        # whole body rather than by position. Duck-typed on `.var`: the let-statement node
-        # is not exported under a stable name from `tvm.tirx`.
-        want = {"m_offset", "row_end"}
-        lets: dict = {}
-
-        def _collect(n):
-            var = getattr(n, "var", None)
-            if var is not None and getattr(var, "name", None) in want:
-                lets.setdefault(var.name, var)
-
-        tirx.stmt_functor.post_order_visit(func.body, _collect)
-        missing = want - set(lets)
-        if missing:
-            raise RuntimeError(
-                f"CTA block does not bind {missing} (found {sorted(lets)}); "
-                "source layout changed"
-            )
-        m_off, row_end = lets["m_offset"], lets["row_end"]
+        m_off, row_end = _cta_row_bounds(func)
 
         hits = []
 
@@ -1104,7 +1140,77 @@ def _dequantize_group_gemm_v2(
                       f"body={str(h.body)[:120]!r}")
         return func.with_body(body)
 
+    # ---------- item 0l: predicate the row fragments, keeping a static trip count ----------
+    def _specialise_row_fragments(func):
+        """Skip empty row fragments *without* making the loop's trip count dynamic.
+
+        Item 0k (`_guard_padding_rows`) shortened the row-fragment loop's extent to
+        `ceildiv(real rows, MICRO)`. It is correct and bit-exact, and it loses: §18.7
+        measured 0.91x at `BLK_M=64`, and — the tell — 0.91-0.95x at `BLK_M=16`, where
+        the guard can only ever produce extent 1 and is therefore doing nothing. The
+        cost is not the skipping, it is that a runtime extent stops the fragment loop
+        being unrolled with constant fragment indices, and every CTA pays it whether or
+        not it has an empty fragment to skip.
+
+        So keep the extent at the compile-time `BLK_M // MICRO` and predicate the body:
+
+            for i_o in range(BLK_M // MICRO):      # unchanged, still constant
+                if i_o * MICRO < row_end - m_offset:
+                    <wmma fragment>
+
+        Every fragment index stays a literal after unrolling, and an empty fragment
+        costs a CTA-uniform branch instead of a full wmma reduction. The predicate is
+        uniform — it reads only `tm[bx]` and `indptr` — so no warp diverges on it.
+
+        Legality is the mirror image of item 0f's. 0f could not use a condition because
+        the region it wanted to skip contains `__syncthreads()` and ThreadSync refuses
+        `Cannot insert syncs inside condition`; it had to move the guard into a loop
+        *extent*. Here, under the hoist, the fragment loop sits below `k_o_o` and the
+        cooperative loads (with their barriers) sit above it, so the predicated region is
+        barrier-free and a plain `IfThenElse` is admissible. The `assert` at the top of
+        this function is what keeps that precondition true.
+
+        Bit-exact by the same argument as 0k: a skipped fragment's accumulator is left
+        untouched and its global store is predicated off by `m_offset + i < row_end`,
+        which is false for exactly the rows a skipped fragment covers.
+        """
+        m_off, row_end = _cta_row_bounds(func)
+
+        hits = []
+
+        def _rewrite(n):
+            if not isinstance(n, tirx.For) or n.thread_binding is not None:
+                return None
+            if "moe_row_guard" not in (n.annotations or {}):
+                return None
+            hits.append(n)
+            # `n.loop_var` counts fragments, so its first row is `loop_var * MICRO`.
+            # A fragment is live iff that row is still inside the expert's rows.
+            live = n.loop_var * tirx.IntImm(n.loop_var.dtype, MICRO) < (row_end - m_off)
+            return tirx.For(
+                n.loop_var, n.min, n.extent, n.kind,
+                tirx.IfThenElse(live, n.body, None),
+                n.thread_binding, n.annotations,
+            )
+
+        body = tirx.stmt_functor.ir_transform(func.body, None, _rewrite, ["tirx.For"])
+        # Same 1-or-2 shape as item 0k, for the same reason: `sch.blockize` leaves the
+        # row-fragment loop in the compute nest and `reverse_compute_at` re-materialises
+        # it in the accumulator -> O_tile store nest. Both are safe to predicate.
+        if not 1 <= len(hits) <= 2:
+            raise RuntimeError(
+                f"expected 1 or 2 `moe_row_guard` loops, found {len(hits)}; "
+                "the schedule dropped or duplicated it"
+            )
+        if os.environ.get("MLC_MOE_GEMM_V2_ROWSPEC_DEBUG"):
+            for i, h in enumerate(hits):
+                print(f"[0l] guard {i}: var={h.loop_var.name} extent={h.extent} "
+                      f"body={str(h.body)[:120]!r}")
+        return func.with_body(body)
+
     scheduled = _schedule_v2()
+    if _rowspec_active:
+        scheduled = _specialise_row_fragments(scheduled)
     # Item 0k, opt-in while it is being measured. Inert at BLK_M=16, where the row loop
     # has extent 1 and the only tile it can shorten is a padding CTA that item 0f already
     # skips whole.
