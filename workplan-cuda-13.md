@@ -5834,3 +5834,44 @@ overwritten during the 256-expert scan before it is read — and it is **not on 
 `gating_topk` is called by `deepseek_v2` and `llama4`, while qwen3-MoE routes through
 `gating_softmax_topk` → `_get_topk_softmax_norm_func_v2` (this project's own `535403c3`). Left alone
 because there is no model here to gate a change to it with, which is the same rule §19 used.
+
+### 22.6 Item 0s end to end — the best wide configuration ever measured, and still not Pareto
+
+`lib_opspec_a64` = `BLK_M=64` + `HOIST` + `ROWSPEC` + **`OPSPEC=a`**, benched against the shipped
+`lib_blkk64` on `--prompt-file` prose, `--prefix-cache-mode radix`, 3 runs after 1 warmup, both legs
+back to back in one session.
+
+| 35B-A3B, prose, `radix` | `lib_blkk64` (shipped) | `lib_rowspec64` (§19.4) | **`lib_opspec_a64`** |
+|---|---:|---:|---:|
+| pp128 | **549.66** | 500.17 (−9.1%) | 516.61 (**−6.0%**) |
+| pp512 | 839.44 | 855.89 (+2.3%) | **868.86 (+3.5%)** |
+| pp2048 | 945.09 | 1061.53 (+12.2%) | **1066.01 (+12.8%)** |
+| tg512 | 59.2–60.1 | neutral | 59.1–60.0 (neutral) |
+
+**The control that makes the two sessions comparable:** the `lib_blkk64` leg reproduces §19.4's
+numbers to **0.2%** at all three lengths (549.66 vs 550.51, 839.44 vs 836.56, 945.09 vs 946.32),
+across a session boundary and an unpinned clock state.
+
+**Item 0s's `a` half improves the wide tile at every prompt length, and most where the kernel A/B
+said it would.** §21.7 measured `+a` largest at high padding share, which is the short-prompt end —
+and pp128 is where it recovers the most: **3.1 of `lib_rowspec64`'s 9.1 lost points**, against 1.2 at
+pp512 and 0.6 at pp2048. The kernel-level prediction and the end-to-end result agree on both
+magnitude and ordering, which is the first time in this document a wide-tile prediction has done that.
+
+**And it is still not Pareto, exactly as §21.7 said it would not be.** pp128 is −6.0%; §21.1's
+register floor is untouched, because item 0s removes traffic and the floor is accumulators.
+**Defaults are unchanged: `BLK_M=16`, `OPSPEC=0`, `lib_blkk64` still ships.** What this closes is the
+question §18.9's frontier left open — the upper envelope is now `lib_opspec_a64` and it is a single
+kernel with no runtime branch, so **item 0h can only be worth the pp128 cell**, which is 6.0%
+of one prompt length. That is a materially worse case for 0h than §18.9's table implied.
+
+**Gated, in both prefix-cache modes**, against the §6.1 fp8 reference:
+
+```
+radix:    139/139 wide-margin positions agree at tau=2.0   PASS   (near-ties 3/5, informational)
+disable:  139/139 wide-margin positions agree at tau=2.0   PASS   (near-ties 2/5, informational)
+```
+
+The near-tie counts differ between modes on the *same* lib, which is the reminder §18.14 filed:
+near-ties are where q4 quantization legitimately differs and they carry no signal about a state path.
+The wide-margin count is the bar and it is 139/139 both ways.
